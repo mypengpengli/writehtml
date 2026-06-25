@@ -7,6 +7,7 @@ __pycache__/
 writehtml.db
 data/
 .env
+.smoke_tmp/
 
 # 系统
 .DS_Store

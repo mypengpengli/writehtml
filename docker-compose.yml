@@ -1,13 +1,21 @@
 services:
   write:
     build: .
+    container_name: writehtml
     restart: unless-stopped
     ports:
       - "9123:9123"   # 改端口就改这两个数（左=宿主机，右=容器）
-    env_file:
-      - .env
     environment:
       # 数据库放在挂载卷里，容器重建不丢稿
       - DB_PATH=/data/writehtml.db
+      # 开放注册、无需邀请码：每个人注册后自己在「设置」里填自己的 key
+      - ALLOW_SIGNUP=true
+      # 想改成凭邀请码注册（防陌生人建号占盘），把下面两行取消注释：
+      # - ALLOW_SIGNUP=false
+      # - SIGNUP_CODE=你定一串码
+      # 想给所有用户兜底一个默认 key（用户没填自己的时用这个），取消下面注释：
+      # - LLM_BASE_URL=https://api.deepseek.com/v1
+      # - LLM_API_KEY=sk-xxx
+      # - LLM_MODEL=deepseek-chat
     volumes:
       - ./data:/data

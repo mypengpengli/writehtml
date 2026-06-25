@@ -1,7 +1,10 @@
 """冒烟测试：多用户隔离 + P1 新功能。转写模式不调 LLM，无需 key。"""
-import os, tempfile
-tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); tmp.close()
-os.environ["DB_PATH"] = tmp.name
+import os, shutil, uuid, sqlite3, time
+
+# 用项目内临时目录放 db（系统 %TEMP% 上杀软偶发瞬时锁会让 sqlite 报只读）
+_TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".smoke_tmp", uuid.uuid4().hex[:10])
+os.makedirs(_TMP, exist_ok=True)
+os.environ["DB_PATH"] = os.path.join(_TMP, "test.db")
 os.environ["SIGNUP_CODE"] = "testcode"   # 开放凭码注册
 os.environ["LLM_API_KEY"] = ""           # 测试不调真 LLM；校验/摘要/聊天应走"未配置"500
 
@@ -10,6 +13,23 @@ import main, db
 
 db.init_db()
 c = TestClient(main.app)
+
+# Windows 偶发 sqlite readonly 瞬时锁（杀软扫描 db 文件）：在 HTTP 层整请求重试。
+# 该错误总发生在事务首次写之前、事务零写入、回滚干净，故整请求重试幂等、安全。
+def _retry(fn):
+    def w(*a, **k):
+        for _ in range(80):
+            try:
+                return fn(*a, **k)
+            except sqlite3.OperationalError as e:
+                if "readonly" in str(e).lower() or "locked" in str(e).lower():
+                    time.sleep(0.05)
+                    continue
+                raise
+        return fn(*a, **k)
+    return w
+for _m in ("get", "post", "put", "delete", "patch"):
+    setattr(c, _m, _retry(getattr(c, _m)))
 
 
 def ok(cond, msg):
@@ -148,4 +168,4 @@ ok(c.delete(f"/api/works/{wid}", headers=H(tokA)).status_code == 200, "删作品
 ok(c.get("/").status_code == 200, "首页可访问")
 
 print("\n全部通过 ✅")
-os.unlink(tmp.name)
+shutil.rmtree(_TMP, ignore_errors=True)

@@ -622,6 +622,8 @@ $("chapTitle").addEventListener("input", () => { dirty = true; clearTimeout(save
   try {
     const s = await api("/api/signup-status", { method: "GET" });
     if (s.enabled) $("toRegister").classList.remove("hidden");
+    // 开放注册且无需注册码时，隐藏注册码输入框
+    $("regCode").classList.toggle("hidden", !s.needs_code);
   } catch (e) {}
   if (token) {
     try { await init(); return; } catch (e) { token = ""; localStorage.removeItem("token"); }
