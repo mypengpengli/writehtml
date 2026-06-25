@@ -426,6 +426,34 @@ async function exportChap(fmt) {
   } catch (e) { alert(e.message); }
 }
 
+/* ---------- 大模型设置 ---------- */
+
+async function openSettings() {
+  try {
+    const s = await api("/api/settings", { method: "GET" });
+    $("setBaseUrl").value = s.base_url || "";
+    $("setModel").value = s.model || "";
+    // key 不回传明文：已填则用掩码占位提示，留空表示不改
+    $("setApiKey").value = s.api_key_masked || "";
+    $("setApiKey").placeholder = s.has_key ? `${s.api_key_masked}（留空=不改）` : "sk-…";
+    $("setMsg").textContent = "";
+  } catch (e) { $("setMsg").textContent = e.message; }
+  $("setOverlay").classList.remove("hidden");
+}
+function closeSettings() { $("setOverlay").classList.add("hidden"); }
+async function saveSettings() {
+  const base_url = $("setBaseUrl").value.trim();
+  const model = $("setModel").value.trim();
+  let api_key = $("setApiKey").value.trim();
+  // 若用户没动 key 输入框（仍是掩码占位），传空让后端保留旧值
+  if (api_key.startsWith("****")) api_key = "";
+  try {
+    await api("/api/settings", { body: { base_url, api_key, model } });
+    $("setMsg").textContent = "已保存";
+    setTimeout(closeSettings, 600);
+  } catch (e) { $("setMsg").textContent = e.message; }
+}
+
 /* ---------- 阅读视图 ---------- */
 
 let readerFontPx = +localStorage.getItem("rFont") || 19;

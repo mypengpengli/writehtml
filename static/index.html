@@ -52,6 +52,7 @@
         <button class="ic" onclick="showRevisions()" title="历史版本">🕘历史</button>
         <button class="ic" onclick="toggleFocus()" title="专注">⊚</button>
         <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
+        <button class="ic" onclick="openSettings()" title="大模型设置">⚙</button>
         <button class="ic" onclick="doLogout()" title="退出">⏻</button>
       </header>
 
@@ -114,6 +115,27 @@
     <div class="overlay-card">
       <div class="overlay-head"><span>历史版本</span><button class="ic" onclick="closeRevisions()">✕</button></div>
       <div id="revList" class="rev-list"></div>
+    </div>
+  </div>
+
+  <!-- 大模型设置 -->
+  <div id="setOverlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-head"><span>大模型设置</span><button class="ic" onclick="closeSettings()">✕</button></div>
+      <div class="set-form">
+        <p class="set-hint">填好你的 OpenAI 兼容接口，润色/扩写/续写才会生效。每人用自己的 key，互不影响。</p>
+        <label>Base URL</label>
+        <input id="setBaseUrl" placeholder="https://api.deepseek.com/v1">
+        <label>API Key</label>
+        <input id="setApiKey" type="password" placeholder="sk-…（已设置则显示 ****，留空=不改）">
+        <label>模型 ID</label>
+        <input id="setModel" placeholder="deepseek-chat">
+        <div class="set-actions">
+          <button onclick="saveSettings()">保存</button>
+          <button class="ic" onclick="closeSettings()">取消</button>
+        </div>
+        <p id="setMsg" class="msg"></p>
+      </div>
     </div>
   </div>
 

@@ -75,6 +75,36 @@ async def me(request: Request):
     return {"username": db.get_username(uid)}
 
 
+# ---------- 每用户大模型设置 ----------
+
+@app.get("/api/settings")
+async def get_settings(request: Request):
+    uid = _auth(request)
+    s = db.get_settings(uid) or {}
+    key = s.get("llm_api_key") or ""
+    # 明文 key 不回传，只给掩码提示是否已填
+    masked = ("****" + key[-4:]) if key else ""
+    return {
+        "base_url": s.get("llm_base_url") or config.LLM_BASE_URL,
+        "api_key_masked": masked,
+        "has_key": bool(key),
+        "model": s.get("llm_model") or config.LLM_MODEL,
+    }
+
+
+@app.post("/api/settings")
+async def save_settings(request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    db.save_settings(
+        uid,
+        (body.get("base_url") or "").strip(),
+        (body.get("api_key") or "").strip(),
+        (body.get("model") or "").strip(),
+    )
+    return {"ok": True}
+
+
 # ---------- 作品 ----------
 
 @app.get("/api/works")
@@ -247,9 +277,14 @@ async def do_process(request: Request):
     if mode == "转写":
         result = text
     elif mode in ("润色", "扩写", "续写"):
-        if not config.LLM_API_KEY:
-            raise HTTPException(500, "未配置 LLM_API_KEY，请在 .env 填 base_url/key/model")
-        result = llm.process(mode, text, context, notes)
+        s = db.get_settings(uid) or {}
+        base_url = s.get("llm_base_url") or config.LLM_BASE_URL
+        api_key = s.get("llm_api_key") or config.LLM_API_KEY
+        model = s.get("llm_model") or config.LLM_MODEL
+        if not api_key:
+            raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
+        result = llm.process(mode, text, context, notes,
+                             base_url=base_url, api_key=api_key, model=model)
     else:
         raise HTTPException(400, "未知模式")
 

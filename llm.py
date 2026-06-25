@@ -2,14 +2,17 @@
 from openai import OpenAI
 import config
 
-_client = None
+# 按配置缓存客户端：(base_url, api_key) -> OpenAI
+_clients = {}
 
 
-def _get_client():
-    global _client
-    if _client is None:
-        _client = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY)
-    return _client
+def _get_client(base_url, api_key):
+    k = (base_url, api_key)
+    c = _clients.get(k)
+    if c is None:
+        c = OpenAI(base_url=base_url, api_key=api_key)
+        _clients[k] = c
+    return c
 
 
 # 每种模式的系统指令
@@ -30,8 +33,12 @@ PROMPTS = {
 }
 
 
-def process(mode, text, context="", notes=""):
-    """按模式调用 LLM，返回生成文本。notes 为本章备注/设定，喂给 AI 保持一致。"""
+def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None):
+    """按模式调用 LLM，返回生成文本。notes 为本章备注/设定，喂给 AI 保持一致。
+    base_url/api_key/model 优先用调用方传入的（来自用户设置），缺省回落到 .env。"""
+    base_url = base_url or config.LLM_BASE_URL
+    api_key = api_key or config.LLM_API_KEY
+    model = model or config.LLM_MODEL
     messages = []
     if notes:
         messages.append({
@@ -46,8 +53,8 @@ def process(mode, text, context="", notes=""):
     messages.append({"role": "system", "content": PROMPTS[mode]})
     messages.append({"role": "user", "content": text})
 
-    resp = _get_client().chat.completions.create(
-        model=config.LLM_MODEL,
+    resp = _get_client(base_url, api_key).chat.completions.create(
+        model=model,
         messages=messages,
         temperature=0.7,
     )

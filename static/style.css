@@ -139,6 +139,14 @@ input, textarea, select {
 .rev-list { overflow-y: auto; padding: 6px; }
 .rev { display: flex; align-items: center; justify-content: space-between; padding: 9px 10px; border-bottom: 1px solid var(--line); font-size: 14px; }
 
+/* 设置表单 */
+.set-form { padding: 14px; display: flex; flex-direction: column; gap: 4px; }
+.set-form label { font-size: 13px; color: var(--mic); margin-top: 6px; }
+.set-form input { width: 100%; box-sizing: border-box; }
+.set-hint { font-size: 13px; color: var(--mic); margin: 0 0 4px; line-height: 1.5; }
+.set-actions { display: flex; gap: 8px; margin-top: 14px; }
+.set-actions button { flex: 1; }
+
 /* 阅读视图 */
 .reader { position: fixed; inset: 0; z-index: 40; background: var(--bg); overflow: auto; }
 .reader-top {

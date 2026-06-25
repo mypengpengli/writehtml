@@ -78,6 +78,13 @@ def init_db():
                 created_at REAL,
                 FOREIGN KEY(chapter_id) REFERENCES chapters(id)
             );
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                llm_base_url TEXT,
+                llm_api_key TEXT,
+                llm_model TEXT,
+                updated_at REAL
+            );
             """
         )
         _add_col(conn, "chapters", "notes", "TEXT DEFAULT ''")
@@ -120,6 +127,38 @@ def get_username(user_id):
     with get_conn() as conn:
         r = conn.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
         return r["username"] if r else ""
+
+
+# ---------- 每个用户自己的大模型设置 ----------
+
+def get_settings(user_id):
+    """返回该用户的 LLM 设置；没存过返回 None（调用方用 .env 兜底）。"""
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT llm_base_url, llm_api_key, llm_model FROM user_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        return dict(r) if r else None
+
+
+def save_settings(user_id, base_url, api_key, model):
+    """保存设置。api_key 为空或为掩码占位时保留旧值，避免清空已填的 key。"""
+    now = time.time()
+    with get_conn() as conn:
+        old = conn.execute(
+            "SELECT llm_api_key FROM user_settings WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if not api_key or api_key.startswith("****"):
+            api_key = old["llm_api_key"] if old else ""
+        conn.execute(
+            "INSERT INTO user_settings(user_id, llm_base_url, llm_api_key, llm_model, updated_at) "
+            "VALUES(?,?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "llm_base_url=excluded.llm_base_url, llm_api_key=excluded.llm_api_key, "
+            "llm_model=excluded.llm_model, updated_at=excluded.updated_at",
+            (user_id, base_url, api_key, model, now),
+        )
+        return True
 
 
 # ---------- 归属校验 ----------

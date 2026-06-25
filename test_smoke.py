@@ -59,6 +59,19 @@ chap = c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()
 ok(chap["content"] == "你好世界", "正文已追加")
 ok(len(chap["segments"]) == 1, "段落历史 1 条")
 
+# 每用户大模型设置
+c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a"}, headers=H(tokA))
+s = c.get("/api/settings", headers=H(tokA)).json()
+ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a", "设置读回 base_url/model")
+ok(s["has_key"] is True and "secret" not in s["api_key_masked"] and s["api_key_masked"].startswith("****"), "key 掩码不泄露明文")
+# 空 key 提交应保留旧 key
+c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "", "model": "m-a2"}, headers=H(tokA))
+ok(c.get("/api/settings", headers=H(tokA)).json()["has_key"] is True, "空 key 不清空已存 key")
+# bob 与 alice 设置隔离
+c.post("/api/settings", json={"base_url": "https://b.test/v1", "api_key": "sk-bob", "model": "m-b"}, headers=H(tokB))
+sb = c.get("/api/settings", headers=H(tokB)).json()
+ok(sb["model"] == "m-b" and c.get("/api/settings", headers=H(tokA)).json()["model"] == "m-a2", "设置按用户隔离")
+
 # 备注保存
 ok(c.put(f"/api/chapters/{cid}", json={"notes": "设定X"}, headers=H(tokA)).status_code == 200, "存备注")
 ok(c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["notes"] == "设定X", "备注读回")
