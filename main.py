@@ -125,6 +125,22 @@ async def del_work(wid: int, request: Request):
     return {"ok": True}
 
 
+@app.get("/api/works/{wid}/notes")
+async def get_work_notes_api(wid: int, request: Request):
+    n = db.get_work_notes(wid, _auth(request))
+    if n is None:
+        raise HTTPException(404, "作品不存在")
+    return {"notes": n or ""}
+
+
+@app.put("/api/works/{wid}/notes")
+async def save_work_notes(wid: int, request: Request):
+    body = await request.json()
+    if not db.update_work_notes(wid, _auth(request), body.get("notes", "")):
+        raise HTTPException(404, "作品不存在")
+    return {"ok": True}
+
+
 # ---------- 章节 ----------
 
 @app.get("/api/works/{wid}/chapters")
@@ -253,6 +269,45 @@ async def export(cid: int, request: Request, format: str = "txt"):
     )
 
 
+@app.get("/api/works/{wid}/export")
+async def export_work(wid: int, request: Request, format: str = "txt"):
+    uid = _auth(request)
+    work = db.get_work(wid, uid)
+    if not work:
+        raise HTTPException(404, "作品不存在")
+    chaps = db.list_chapters_full(wid, uid)
+    title = work["title"] or "writehtml"
+    q = quote(title)
+    def _disp(ext):
+        return f"attachment; filename=work.{ext}; filename*=UTF-8''{q}.{ext}"
+    if format == "docx":
+        from io import BytesIO
+        from docx import Document
+        doc = Document()
+        doc.add_heading(title, 0)
+        for c in chaps:
+            doc.add_heading(c["title"] or "(无标题)", level=1)
+            for para in (c["content"] or "").split("\n"):
+                if para.strip():
+                    doc.add_paragraph(para)
+        buf = BytesIO()
+        doc.save(buf)
+        return Response(
+            buf.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": _disp("docx")},
+        )
+    # txt：每章标题 + 正文，空行分隔
+    content = "\n\n".join(
+        f"{'　' * 2}{c['title'] or '(无标题)'}\n\n{c['content'] or ''}" for c in chaps
+    )
+    return Response(
+        content.encode("utf-8"),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": _disp("txt")},
+    )
+
+
 # ---------- AI 处理 ----------
 
 @app.post("/api/process")
@@ -264,32 +319,49 @@ async def do_process(request: Request):
     context = body.get("context") or ""
     cid = body.get("chapter_id")
 
-    if not text:
-        raise HTTPException(400, "内容为空")
-
     notes = ""
+    bible = ""
+    chap = None
     if cid:
         chap = db.get_chapter(cid, uid)
         if not chap:
             raise HTTPException(404, "章节不存在")
         notes = chap.get("notes") or ""
+        bible = db.get_work_notes(chap["work_id"], uid) or ""
+
+    seg_raw = text  # 段落历史里记录的"原始输入"
+    # 找回：从指定历史版本里恢复内容，主输入=旧草稿，上下文=当前正文全文
+    if mode == "找回":
+        rid = body.get("revision_id")
+        rev = db.get_revision(cid, uid, rid) if (cid and rid) else None
+        if not rev:
+            raise HTTPException(404, "历史版本不存在")
+        rev_content = (rev["content"] or "").strip()
+        if not rev_content:
+            raise HTTPException(400, "该历史版本为空")
+        context = (chap["content"] if chap else "") or ""
+        text = rev_content
+        seg_raw = f"（找回自历史版本 #{rid}）"
+
+    if not text:
+        raise HTTPException(400, "内容为空")
 
     if mode == "转写":
         result = text
-    elif mode in ("润色", "扩写", "续写"):
+    elif mode in ("润色", "扩写", "续写", "找回"):
         s = db.get_settings(uid) or {}
         base_url = s.get("llm_base_url") or config.LLM_BASE_URL
         api_key = s.get("llm_api_key") or config.LLM_API_KEY
         model = s.get("llm_model") or config.LLM_MODEL
         if not api_key:
             raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
-        result = llm.process(mode, text, context, notes,
+        result = llm.process(mode, text, context, notes, bible=bible,
                              base_url=base_url, api_key=api_key, model=model)
     else:
         raise HTTPException(400, "未知模式")
 
-    seg = db.add_segment(cid, uid, text, result, mode) if cid else None
-    return {"result": result, "raw": text, "mode": mode, "content": seg["content"] if seg else None}
+    seg = db.add_segment(cid, uid, seg_raw, result, mode) if cid else None
+    return {"result": result, "raw": seg_raw, "mode": mode, "content": seg["content"] if seg else None}
 
 
 # ---------- 静态前端（放最后，避免盖住 /api） ----------

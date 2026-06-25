@@ -119,6 +119,7 @@ function renderTree() {
       <div class="work ${open ? "open" : ""}">
         <div class="w-row" onclick="selectWork(${w.id})">
           <span class="w-title">${esc(w.title)}</span>
+          <button class="ic" onclick="event.stopPropagation();openWorkNotes(${w.id})" title="作品设定">📋</button>
           <button class="c-del" onclick="event.stopPropagation();delWork(${w.id})" title="删除">✕</button>
         </div>
         ${open ? `<div class="chaps">${items || '<div class="empty">点「＋章」</div>'}</div>
@@ -397,6 +398,7 @@ async function showRevisions() {
     <div class="rev">
       <span>${new Date(r.created_at * 1000).toLocaleString()} · ${r.chars}字</span>
       <button class="ic" onclick="restoreRevision(${r.id})">恢复</button>
+      <button class="ic" onclick="recoverFromRevision(${r.id})" title="让 AI 读这版旧草稿，把被删掉的好内容找回成段落追加">AI找回</button>
     </div>`).join("") : '<div class="empty">还没有存过版本</div>';
   $("revOverlay").classList.remove("hidden");
 }
@@ -409,19 +411,44 @@ async function restoreRevision(rid) {
   closeRevisions();
   flash("已恢复");
 }
+async function recoverFromRevision(rid) {
+  if (!currentChapterId) return;
+  if (dirty) await saveNow();
+  setMicStatus("AI 找回中…");
+  try {
+    const r = await api("/api/process", {
+      body: { mode: "找回", chapter_id: currentChapterId, revision_id: rid },
+    });
+    appendText(r.result);          // 找回的段落追加进正文，非破坏式
+    onContentInput();
+    closeRevisions();
+    flash("已找回内容并追加");
+  } catch (e) { setMicStatus("出错：" + e.message); }
+}
 
 /* ---------- 导出 ---------- */
 
 async function exportChap(fmt) {
   if (!fmt) return;
-  if (!currentChapterId) { alert("先选章节"); return; }
   try {
-    const res = await fetch(`/api/chapters/${currentChapterId}/export?format=${fmt}`, { headers: { Authorization: "Bearer " + token } });
+    let url, name;
+    if (fmt.startsWith("work-")) {
+      const f = fmt.slice(5);
+      if (!currentWorkId) { alert("先选作品"); return; }
+      url = `/api/works/${currentWorkId}/export?format=${f}`;
+      const w = works.find(x => x.id === currentWorkId);
+      name = ((w && w.title) || "work") + "." + f;
+    } else {
+      if (!currentChapterId) { alert("先选章节"); return; }
+      url = `/api/chapters/${currentChapterId}/export?format=${fmt}`;
+      name = ($("chapTitle").value || "chapter") + "." + fmt;
+    }
+    const res = await fetch(url, { headers: { Authorization: "Bearer " + token } });
     if (!res.ok) throw new Error("导出失败");
     const blob = await res.blob();
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = ($("chapTitle").value || "chapter") + "." + fmt;
+    a.download = name;
     a.click(); URL.revokeObjectURL(a.href);
   } catch (e) { alert(e.message); }
 }
@@ -452,6 +479,27 @@ async function saveSettings() {
     $("setMsg").textContent = "已保存";
     setTimeout(closeSettings, 600);
   } catch (e) { $("setMsg").textContent = e.message; }
+}
+
+/* ---------- 作品设定（bible，喂给 AI 当全文记忆） ---------- */
+
+let notesWorkId = null;
+async function openWorkNotes(wid) {
+  notesWorkId = wid;
+  try {
+    const r = await api(`/api/works/${wid}/notes`, { method: "GET" });
+    $("wnText").value = r.notes || "";
+    $("wnMsg").textContent = "";
+  } catch (e) { $("wnMsg").textContent = e.message; }
+  $("wnOverlay").classList.remove("hidden");
+}
+function closeWorkNotes() { $("wnOverlay").classList.add("hidden"); }
+async function saveWorkNotes() {
+  try {
+    await api(`/api/works/${notesWorkId}/notes`, { method: "PUT", body: { notes: $("wnText").value } });
+    $("wnMsg").textContent = "已保存";
+    setTimeout(closeWorkNotes, 600);
+  } catch (e) { $("wnMsg").textContent = e.message; }
 }
 
 /* ---------- 阅读视图 ---------- */

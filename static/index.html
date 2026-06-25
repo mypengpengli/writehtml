@@ -45,8 +45,10 @@
         <span id="saveStat" class="save-stat"></span>
         <select id="exportSel" class="ic" onchange="exportChap(this.value);this.selectedIndex=0" title="导出">
           <option value="">⬇导出</option>
-          <option value="txt">TXT</option>
-          <option value="docx">DOCX</option>
+          <option value="txt">本章TXT</option>
+          <option value="docx">本章DOCX</option>
+          <option value="work-txt">整本TXT</option>
+          <option value="work-docx">整本DOCX</option>
         </select>
         <button class="ic" onclick="saveRevision()" title="存为版本">🗂存版</button>
         <button class="ic" onclick="showRevisions()" title="历史版本">🕘历史</button>
@@ -135,6 +137,22 @@
           <button class="ic" onclick="closeSettings()">取消</button>
         </div>
         <p id="setMsg" class="msg"></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 作品设定（人物/世界观/大纲，喂给 AI 当全文记忆） -->
+  <div id="wnOverlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-head"><span>作品设定</span><button class="ic" onclick="closeWorkNotes()">✕</button></div>
+      <div class="set-form">
+        <p class="set-hint">人物表 / 世界观 / 大纲。本作品下所有 AI（润色/扩写/续写/找回）都会读到它，保证全文一致。</p>
+        <textarea id="wnText" rows="14" placeholder="主角：……&#10;世界观：……&#10;大纲：……"></textarea>
+        <div class="set-actions">
+          <button onclick="saveWorkNotes()">保存</button>
+          <button class="ic" onclick="closeWorkNotes()">取消</button>
+        </div>
+        <p id="wnMsg" class="msg"></p>
       </div>
     </div>
   </div>

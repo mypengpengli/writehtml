@@ -89,6 +89,7 @@ def init_db():
         )
         _add_col(conn, "chapters", "notes", "TEXT DEFAULT ''")
         _add_col(conn, "works", "user_id", "INTEGER DEFAULT 0")
+        _add_col(conn, "works", "notes", "TEXT DEFAULT ''")  # 作品设定(人物/世界观/大纲)
 
 
 # ---------- 用户 / 鉴权 ----------
@@ -208,6 +209,42 @@ def delete_work(wid, user_id):
             conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM works WHERE id=?", (wid,))
+        return True
+
+
+def get_work(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        r = conn.execute("SELECT * FROM works WHERE id=?", (wid,)).fetchone()
+        return dict(r) if r else None
+
+
+def list_chapters_full(wid, user_id):
+    """带正文的章节列表，按 ord 排序，用于整本导出。"""
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        return [dict(r) for r in conn.execute(
+            "SELECT id, title, ord, content FROM chapters WHERE work_id=? ORDER BY ord", (wid,)
+        )]
+
+
+def get_work_notes(wid, user_id):
+    """作品设定（人物/世界观/大纲），喂给 AI 当全文记忆。"""
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        r = conn.execute("SELECT notes FROM works WHERE id=?", (wid,)).fetchone()
+        return r["notes"] if r else None
+
+
+def update_work_notes(wid, user_id, notes):
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return False
+        conn.execute("UPDATE works SET notes=?, updated_at=? WHERE id=?", (notes, now, wid))
         return True
 
 
@@ -392,6 +429,12 @@ def add_revision(cid, user_id):
             "INSERT INTO chapter_revisions(chapter_id, title, content, created_at) VALUES(?,?,?,?)",
             (cid, chap["title"], chap["content"], now),
         )
+        # 每章只保留最近 20 个版本，老的自动清掉，省盘
+        conn.execute(
+            "DELETE FROM chapter_revisions WHERE chapter_id=? AND id NOT IN "
+            "(SELECT id FROM chapter_revisions WHERE chapter_id=? ORDER BY id DESC LIMIT 20)",
+            (cid, cid),
+        )
         return {"id": cur.lastrowid, "created_at": now}
 
 
@@ -421,3 +464,15 @@ def restore_revision(cid, user_id, rid):
             (rev["title"], rev["content"], now, cid),
         )
     return get_chapter(cid, user_id)
+
+
+def get_revision(cid, user_id, rid):
+    """取单个历史版本的完整内容（供 AI 找回读取）。"""
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        r = conn.execute(
+            "SELECT id, title, content, created_at FROM chapter_revisions WHERE id=? AND chapter_id=?",
+            (rid, cid),
+        ).fetchone()
+        return dict(r) if r else None

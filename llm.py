@@ -30,16 +30,28 @@ PROMPTS = {
         "你是中文写作助手。请阅读前文，然后根据口述的方向继续往下写，"
         "保持风格、人称和语气一致，自然衔接。只输出续写部分，不要重复前文，不要解释。"
     ),
+    "找回": (
+        "你是中文写作助手。下面「当前正文」是作者现在的版本，"
+        "「历史草稿」是作者之前写过的旧版本。请从历史草稿里找出写得好的、"
+        "当前正文里没有或被删掉的内容，整理成可以补回当前正文的段落。"
+        "只输出要补充的段落，不要重复当前正文已有的内容，不要解释、不要标题。"
+    ),
 }
 
 
-def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None):
-    """按模式调用 LLM，返回生成文本。notes 为本章备注/设定，喂给 AI 保持一致。
+def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None):
+    """按模式调用 LLM，返回生成文本。
+    notes 为本章备注；bible 为作品级设定（人物/世界观/大纲），全文记忆。
     base_url/api_key/model 优先用调用方传入的（来自用户设置），缺省回落到 .env。"""
     base_url = base_url or config.LLM_BASE_URL
     api_key = api_key or config.LLM_API_KEY
     model = model or config.LLM_MODEL
     messages = []
+    if bible:
+        messages.append({
+            "role": "system",
+            "content": "这是作品设定（人物/世界观/大纲），全文请遵循保持一致：\n" + bible,
+        })
     if notes:
         messages.append({
             "role": "system",

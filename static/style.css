@@ -143,6 +143,7 @@ input, textarea, select {
 .set-form { padding: 14px; display: flex; flex-direction: column; gap: 4px; }
 .set-form label { font-size: 13px; color: var(--mic); margin-top: 6px; }
 .set-form input { width: 100%; box-sizing: border-box; }
+.set-form textarea { width: 100%; box-sizing: border-box; resize: vertical; font-family: inherit; font-size: 14px; }
 .set-hint { font-size: 13px; color: var(--mic); margin: 0 0 4px; line-height: 1.5; }
 .set-actions { display: flex; gap: 8px; margin-top: 14px; }
 .set-actions button { flex: 1; }
