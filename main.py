@@ -1,5 +1,6 @@
 """FastAPI 后端：多用户鉴权 + 作品/章节 CRUD + AI 处理 + 拆分/排序/修订/导出。"""
 import secrets
+import difflib
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException
@@ -141,6 +142,45 @@ async def save_work_notes(wid: int, request: Request):
     return {"ok": True}
 
 
+# ---------- 实体卡片（作品级 wiki）----------
+
+@app.get("/api/works/{wid}/entities")
+async def get_entities(wid: int, request: Request):
+    r = db.list_entities(wid, _auth(request))
+    if r is None:
+        raise HTTPException(404, "作品不存在")
+    return r
+
+
+@app.post("/api/works/{wid}/entities")
+async def new_entity(wid: int, request: Request):
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "实体名不能为空")
+    r = db.create_entity(wid, _auth(request), name, body.get("kind", "人物"),
+                         body.get("summary", ""), body.get("detail", ""))
+    if r is None:
+        raise HTTPException(404, "作品不存在")
+    return r
+
+
+@app.put("/api/entities/{eid}")
+async def save_entity(eid: int, request: Request):
+    body = await request.json()
+    if not db.update_entity(eid, _auth(request), body.get("name"), body.get("kind"),
+                            body.get("summary"), body.get("detail")):
+        raise HTTPException(404, "实体不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/entities/{eid}")
+async def del_entity(eid: int, request: Request):
+    if not db.delete_entity(eid, _auth(request)):
+        raise HTTPException(404, "实体不存在")
+    return {"ok": True}
+
+
 # ---------- 章节 ----------
 
 @app.get("/api/works/{wid}/chapters")
@@ -191,6 +231,20 @@ async def del_chapter(cid: int, request: Request):
     return {"ok": True}
 
 
+@app.post("/api/chapters/{cid}/restore")
+async def restore_chapter(cid: int, request: Request):
+    if not db.restore_chapter(cid, _auth(request)):
+        raise HTTPException(404, "章节不存在")
+    return {"ok": True}
+
+
+@app.post("/api/chapters/{cid}/purge")
+async def purge_chapter(cid: int, request: Request):
+    if not db.purge_chapter(cid, _auth(request)):
+        raise HTTPException(404, "章节不存在")
+    return {"ok": True}
+
+
 @app.post("/api/chapters/{cid}/split")
 async def split(cid: int, request: Request):
     body = await request.json()
@@ -205,6 +259,14 @@ async def undo(cid: int, request: Request):
     r = db.undo_last_segment(cid, _auth(request))
     if r is None:
         raise HTTPException(404, "章节不存在")
+    return r
+
+
+@app.get("/api/works/{wid}/trash")
+async def get_trash(wid: int, request: Request):
+    r = db.list_trashed(wid, _auth(request))
+    if r is None:
+        raise HTTPException(404, "作品不存在")
     return r
 
 
@@ -232,6 +294,24 @@ async def restore(cid: int, rid: int, request: Request):
     if r is None:
         raise HTTPException(404, "不存在")
     return r
+
+
+@app.get("/api/chapters/{cid}/revisions/{rid}/diff")
+async def diff_revision(cid: int, rid: int, request: Request):
+    """对比某历史版本与当前正文，按行给出增删块。鉴权复用 get_revision/get_chapter。"""
+    uid = _auth(request)
+    rev = db.get_revision(cid, uid, rid)
+    if not rev:
+        raise HTTPException(404, "历史版本不存在")
+    cur = db.get_chapter(cid, uid)
+    if not cur:
+        raise HTTPException(404, "章节不存在")
+    a = (rev["content"] or "").splitlines()   # 旧（历史版本）
+    b = (cur["content"] or "").splitlines()   # 新（当前正文）
+    ops = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
+        ops.append({"op": tag, "old": "\n".join(a[i1:i2]), "new": "\n".join(b[j1:j2])})
+    return {"ops": ops, "rev_title": rev["title"], "cur_title": cur["title"], "rev_at": rev["created_at"]}
 
 
 # ---------- 导出 ----------
@@ -318,6 +398,7 @@ async def do_process(request: Request):
     text = (body.get("text") or "").strip()
     context = body.get("context") or ""
     cid = body.get("chapter_id")
+    style = body.get("style")  # 改写风格预设（更生动/更精炼/文艺风/…），仅改写模式用
 
     notes = ""
     bible = ""
@@ -328,6 +409,9 @@ async def do_process(request: Request):
             raise HTTPException(404, "章节不存在")
         notes = chap.get("notes") or ""
         bible = db.get_work_notes(chap["work_id"], uid) or ""
+        digest = db.get_entity_digest(chap["work_id"], uid)  # 实体卡片 → 结构化设定
+        if digest:
+            bible = (bible + "\n\n" + digest) if bible else digest
 
     seg_raw = text  # 段落历史里记录的"原始输入"
     # 找回：从指定历史版本里恢复内容，主输入=旧草稿，上下文=当前正文全文
@@ -356,7 +440,7 @@ async def do_process(request: Request):
 
     if mode == "转写":
         result = text
-    elif mode in ("润色", "扩写", "续写", "找回", "校验", "摘要"):
+    elif mode in ("润色", "扩写", "续写", "找回", "校验", "摘要", "缩写", "改写"):
         s = db.get_settings(uid) or {}
         base_url = s.get("llm_base_url") or config.LLM_BASE_URL
         api_key = s.get("llm_api_key") or config.LLM_API_KEY
@@ -364,7 +448,7 @@ async def do_process(request: Request):
         if not api_key:
             raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
         result = llm.process(mode, text, context, notes, bible=bible,
-                             base_url=base_url, api_key=api_key, model=model)
+                             base_url=base_url, api_key=api_key, model=model, style=style)
     else:
         raise HTTPException(400, "未知模式")
 
@@ -398,6 +482,9 @@ async def chat(request: Request):
         chap = db.get_chapter(cid, uid)
         if chap:
             bible = db.get_work_notes(chap["work_id"], uid) or ""
+            digest = db.get_entity_digest(chap["work_id"], uid)
+            if digest:
+                bible = (bible + "\n\n" + digest) if bible else digest
             if bible:
                 sys_ctx.append({"role": "system", "content": "作品设定（人物/世界观/大纲），探讨时请遵循：\n" + bible})
             notes = chap.get("notes") or ""

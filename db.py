@@ -85,9 +85,21 @@ def init_db():
                 llm_model TEXT,
                 updated_at REAL
             );
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                summary TEXT DEFAULT '',
+                detail TEXT DEFAULT '',
+                created_at REAL,
+                updated_at REAL,
+                FOREIGN KEY(work_id) REFERENCES works(id)
+            );
             """
         )
         _add_col(conn, "chapters", "notes", "TEXT DEFAULT ''")
+        _add_col(conn, "chapters", "deleted_at", "REAL")  # 软删时间戳；NULL=正常在册
         _add_col(conn, "works", "user_id", "INTEGER DEFAULT 0")
         _add_col(conn, "works", "notes", "TEXT DEFAULT ''")  # 作品设定(人物/世界观/大纲)
 
@@ -226,7 +238,7 @@ def list_chapters_full(wid, user_id):
         if not _work_owned(conn, wid, user_id):
             return None
         return [dict(r) for r in conn.execute(
-            "SELECT id, title, ord, content FROM chapters WHERE work_id=? ORDER BY ord", (wid,)
+            "SELECT id, title, ord, content FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY ord", (wid,)
         )]
 
 
@@ -248,6 +260,77 @@ def update_work_notes(wid, user_id, notes):
         return True
 
 
+# ---------- 实体卡片（作品级 wiki）----------
+
+def list_entities(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        return [dict(r) for r in conn.execute(
+            "SELECT id, name, kind, summary, detail, created_at, updated_at "
+            "FROM entities WHERE work_id=? ORDER BY kind, id", (wid,)
+        )]
+
+
+def create_entity(wid, user_id, name, kind, summary, detail):
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        cur = conn.execute(
+            "INSERT INTO entities(work_id,name,kind,summary,detail,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (wid, name, kind, summary or "", detail or "", now, now),
+        )
+        return {"id": cur.lastrowid, "work_id": wid, "name": name, "kind": kind,
+                "summary": summary or "", "detail": detail or ""}
+
+
+def _entity_owned(conn, eid, user_id):
+    r = conn.execute(
+        "SELECT w.user_id FROM entities e JOIN works w ON e.work_id=w.id WHERE e.id=?",
+        (eid,),
+    ).fetchone()
+    return r is not None and r["user_id"] == user_id
+
+
+def update_entity(eid, user_id, name, kind, summary, detail):
+    now = time.time()
+    with get_conn() as conn:
+        if not _entity_owned(conn, eid, user_id):
+            return False
+        conn.execute(
+            "UPDATE entities SET name=COALESCE(?,name), kind=COALESCE(?,kind), "
+            "summary=COALESCE(?,summary), detail=COALESCE(?,detail), updated_at=? WHERE id=?",
+            (name, kind, summary, detail, now, eid),
+        )
+        return True
+
+
+def delete_entity(eid, user_id):
+    with get_conn() as conn:
+        if not _entity_owned(conn, eid, user_id):
+            return False
+        conn.execute("DELETE FROM entities WHERE id=?", (eid,))
+        return True
+
+
+def get_entity_digest(wid, user_id):
+    """把作品实体格式化成一行一条的摘要，拼进 bible 喂给 AI 当结构化设定。"""
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return ""
+        rows = conn.execute(
+            "SELECT name, kind, summary FROM entities WHERE work_id=? ORDER BY kind, id",
+            (wid,)
+        ).fetchall()
+    if not rows:
+        return ""
+    return "作品实体（写作时保持一致）：\n" + "\n".join(
+        f"[{r['kind']}] {r['name']}" + (f"：{r['summary']}" if r['summary'] else "") for r in rows
+    )
+
+
 # ---------- 章节 ----------
 
 def list_chapters(wid, user_id):
@@ -256,7 +339,7 @@ def list_chapters(wid, user_id):
             return None
         return [dict(r) for r in conn.execute(
             "SELECT id, work_id, title, ord, created_at, length(content) AS chars "
-            "FROM chapters WHERE work_id=? ORDER BY ord", (wid,)
+            "FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY ord", (wid,)
         )]
 
 
@@ -292,7 +375,7 @@ def get_chapter(cid, user_id):
     with get_conn() as conn:
         if not _chapter_owned(conn, cid, user_id):
             return None
-        row = conn.execute("SELECT * FROM chapters WHERE id=?", (cid,)).fetchone()
+        row = conn.execute("SELECT * FROM chapters WHERE id=? AND deleted_at IS NULL", (cid,)).fetchone()
         if not row:
             return None
         chap = dict(row)
@@ -323,12 +406,47 @@ def update_chapter(cid, user_id, title, content, notes):
 
 
 def delete_chapter(cid, user_id):
+    """软删（移入回收站），可恢复。"""
+    now = time.time()
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return False
+        conn.execute("UPDATE chapters SET deleted_at=? WHERE id=?", (now, cid))
+        return True
+
+
+def purge_chapter(cid, user_id):
+    """彻底删除（从回收站清空），不可恢复。"""
     with get_conn() as conn:
         if not _chapter_owned(conn, cid, user_id):
             return False
         conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE id=?", (cid,))
+        return True
+
+
+def list_trashed(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        return [dict(r) for r in conn.execute(
+            "SELECT id, title, ord, length(content) AS chars, deleted_at "
+            "FROM chapters WHERE work_id=? AND deleted_at IS NOT NULL "
+            "ORDER BY deleted_at DESC", (wid,)
+        )]
+
+
+def restore_chapter(cid, user_id):
+    """从回收站恢复；放到章节列表末尾，避免 ord 冲突。"""
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return False
+        new_ord = conn.execute(
+            "SELECT COALESCE(MAX(ord),0)+1 FROM chapters WHERE work_id="
+            "(SELECT work_id FROM chapters WHERE id=?)", (cid,)
+        ).fetchone()[0]
+        conn.execute("UPDATE chapters SET deleted_at=NULL, ord=? WHERE id=?", (new_ord, cid))
         return True
 
 

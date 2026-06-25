@@ -52,8 +52,10 @@
         </select>
         <button class="ic" onclick="saveRevision()" title="存为版本">🗂存版</button>
         <button class="ic" onclick="showRevisions()" title="历史版本">🕘历史</button>
+        <button class="ic" onclick="openTrash()" title="回收站">🗑回收</button>
         <button class="ic" onclick="openAITools()" title="AI 写作工具（校验/摘要）">✦AI</button>
         <button class="ic" onclick="openChat()" title="和 AI 探讨剧情">💬</button>
+        <button class="ic" onclick="openWiki()" title="实体卡片（人物/地点…）">👥实体</button>
         <button class="ic" onclick="toggleFocus()" title="专注">⊚</button>
         <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
         <button class="ic" onclick="openSettings()" title="大模型设置">⚙</button>
@@ -75,6 +77,12 @@
         <button class="ic" onclick="toggleFind()" title="查找替换">🔍找</button>
         <button class="ic" onclick="splitChapter()" title="在光标处拆分章节">✂拆分</button>
         <button class="ic" onclick="toggleNotes()" title="本章备注">📝备注</button>
+        <span class="vbar"></span>
+        <button class="ic" onclick="processSelection('缩写')" title="把选中的段落缩到约一半">↧缩写选区</button>
+        <select id="rwStyle" class="ic" title="改写风格">
+          <option>更生动</option><option>更精炼</option><option>文艺风</option><option>口语化</option><option>悬疑感</option>
+        </select>
+        <button class="ic" onclick="processSelection('改写', $('rwStyle').value)" title="把选中的段落换成上面的风格">✎改写选区</button>
       </div>
 
       <div id="findBar" class="findbar hidden">
@@ -121,6 +129,50 @@
       <div id="revList" class="rev-list"></div>
     </div>
   </div>
+
+  <!-- 版本对比 -->
+  <div id="diffOverlay" class="overlay hidden">
+    <div class="overlay-card chat-card">
+      <div class="overlay-head"><span>版本对比（历史 → 当前）</span><button class="ic" onclick="closeDiff()">✕</button></div>
+      <div id="diffSub" class="set-hint" style="padding:8px 14px 0"></div>
+      <div id="diffBody" class="diff-body"></div>
+    </div>
+  </div>
+
+  <!-- 回收站 -->
+  <div id="trashOverlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-head"><span>回收站</span><button class="ic" onclick="closeTrash()">✕</button></div>
+      <div id="trashList" class="rev-list"></div>
+    </div>
+  </div>
+
+  <!-- 实体卡片 wiki -->
+  <div id="wikiOverlay" class="overlay hidden">
+    <div class="overlay-card chat-card">
+      <div class="overlay-head"><span>实体卡片</span><button class="ic" onclick="closeWiki()">✕</button></div>
+      <div class="set-form">
+        <div id="wikiList" class="wiki-list"></div>
+        <hr class="sep">
+        <div class="wiki-edit">
+          <input id="entName" placeholder="名称（如：林晚）">
+          <select id="entKind" class="ic">
+            <option>人物</option><option>地点</option><option>物品</option><option>组织</option><option>概念</option>
+          </select>
+          <input id="entSummary" placeholder="一句话摘要">
+          <textarea id="entDetail" placeholder="详细设定（外貌/性格/关系/来历…）"></textarea>
+          <div class="set-actions">
+            <button id="entSaveBtn" onclick="saveEntity()">新增</button>
+            <button id="entInsBtn" onclick="insertEntity()" title="在正文光标处插入 @名">插入到正文</button>
+          </div>
+          <span id="entMsg" class="msg"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- @提及悬浮卡 -->
+  <div id="mentionPop" class="mention-pop hidden"></div>
 
   <!-- 大模型设置 -->
   <div id="setOverlay" class="overlay hidden">

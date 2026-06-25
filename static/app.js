@@ -183,7 +183,7 @@ async function newChapter(wid) {
 }
 
 async function delChapter(cid) {
-  if (!confirm("删除这一章？不可恢复。")) return;
+  if (!confirm("移到回收站？（可找回，点 🗑 彻底删除）")) return;
   if (dirty) await saveNow();
   await api(`/api/chapters/${cid}`, { method: "DELETE" });
   currentChapterId = null;
@@ -195,6 +195,31 @@ async function delWork(wid) {
   await api(`/api/works/${wid}`, { method: "DELETE" });
   currentWorkId = null; currentChapterId = null;
   await loadWorks();
+}
+
+/* ---------- 回收站 ---------- */
+async function openTrash() {
+  if (!currentWorkId) { alert("先选一个作品"); return; }
+  const list = await api(`/api/works/${currentWorkId}/trash`, { method: "GET" });
+  $("trashList").innerHTML = list.length ? list.map(c => `
+    <div class="rev">
+      <span>${esc(c.title)} · ${c.chars}字 · ${new Date(c.deleted_at * 1000).toLocaleString()}</span>
+      <button class="ic" onclick="restoreFromTrash(${c.id})">恢复</button>
+      <button class="ic" onclick="purgeFromTrash(${c.id})" title="彻底删除，不可恢复">彻底删</button>
+    </div>`).join("") : '<div class="empty">回收站是空的</div>';
+  $("trashOverlay").classList.remove("hidden");
+}
+function closeTrash() { $("trashOverlay").classList.add("hidden"); }
+async function restoreFromTrash(cid) {
+  await api(`/api/chapters/${cid}/restore`, { method: "POST" });
+  await loadChapters();
+  await openTrash();
+  flash("已恢复");
+}
+async function purgeFromTrash(cid) {
+  if (!confirm("彻底删除？这一步不可恢复。")) return;
+  await api(`/api/chapters/${cid}/purge`, { method: "POST" });
+  await openTrash();
 }
 
 /* ---------- 拖拽排序 ---------- */
@@ -311,6 +336,23 @@ async function processAndAppend(text) {
   } catch (e) { setMicStatus("出错：" + e.message); }
 }
 
+// 选区操作：缩写 / 改写风格。对正文里选中的一段原地替换，可 Ctrl+Z 撤销
+async function processSelection(m, style) {
+  const el = $("content");
+  if (!currentChapterId) { alert("先选择或新建一个章节"); return; }
+  const s = el.selectionStart, e = el.selectionEnd;
+  if (s == null || s === e) { alert("先在正文里选中一段文字再操作"); return; }
+  setMicStatus("处理中…");
+  try {
+    const r = await api("/api/process", {
+      body: { mode: m, text: el.value.slice(s, e), context: tail(el.value, 1500), chapter_id: currentChapterId, style }
+    });
+    el.setRangeText(r.result, s, e, "end");   // 原地替换选区，保留撤销历史
+    onContentInput();                          // 触发自动保存（走 PUT /api/chapters/{cid}）
+    setMicStatus("");
+  } catch (e) { setMicStatus("出错：" + e.message); }
+}
+
 async function generate() {
   if (!draftBuffer) { setMicStatus("先说点内容再生成"); return; }
   const text = draftBuffer; draftBuffer = ""; showDraft("");
@@ -397,12 +439,31 @@ async function showRevisions() {
   $("revList").innerHTML = list.length ? list.map(r => `
     <div class="rev">
       <span>${new Date(r.created_at * 1000).toLocaleString()} · ${r.chars}字</span>
+      <button class="ic" onclick="openDiff(${r.id})" title="和当前正文逐行对比增删">对比</button>
       <button class="ic" onclick="restoreRevision(${r.id})">恢复</button>
       <button class="ic" onclick="recoverFromRevision(${r.id})" title="让 AI 读这版旧草稿，把被删掉的好内容找回成段落追加">AI找回</button>
     </div>`).join("") : '<div class="empty">还没有存过版本</div>';
   $("revOverlay").classList.remove("hidden");
 }
 function closeRevisions() { $("revOverlay").classList.add("hidden"); }
+async function openDiff(rid) {
+  if (!currentChapterId) return;
+  setMicStatus("对比中…");
+  try {
+    const d = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/diff`, { method: "GET" });
+    $("diffSub").textContent = `${d.rev_title || "(无标题)"}  →  ${d.cur_title || "(当前)"}  ·  ${new Date(d.rev_at * 1000).toLocaleString()}`;
+    $("diffBody").innerHTML = (d.ops || []).map(o => {
+      if (o.op === "equal")  return `<div class="d-eq">${esc(o.old)}</div>`;
+      if (o.op === "delete") return `<div class="d-del">－ ${esc(o.old)}</div>`;
+      if (o.op === "insert") return `<div class="d-ins">＋ ${esc(o.new)}</div>`;
+      // replace：先旧（红）后新（绿）
+      return `<div class="d-del">－ ${esc(o.old)}</div><div class="d-ins">＋ ${esc(o.new)}</div>`;
+    }).join("") || '<div class="empty">无差异</div>';
+    $("diffOverlay").classList.remove("hidden");
+  } catch (e) { alert("对比失败：" + e.message); }
+  setMicStatus("");
+}
+function closeDiff() { $("diffOverlay").classList.add("hidden"); }
 async function restoreRevision(rid) {
   if (!confirm("恢复此版本？当前正文会被覆盖（可先存个版本备份）")) return;
   const c = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/restore`, { method: "POST" });
@@ -555,25 +616,144 @@ async function sendChat() {
 }
 function clearChat() { chatMsgs = []; chatError = ""; renderChat(); }
 
+/* ---------- 实体卡片 wiki（人物/地点…，喂给 AI 当结构化设定） ---------- */
+
+let entitiesCache = [];
+let entitiesCacheWorkId = null;
+let editingEntityId = null;
+
+async function openWiki() {
+  if (!currentWorkId) { alert("先选一个作品"); return; }
+  try {
+    entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
+    entitiesCacheWorkId = currentWorkId;
+    renderWikiList();
+    resetEntityForm();
+    $("wikiOverlay").classList.remove("hidden");
+  } catch (e) { alert("加载失败：" + e.message); }
+}
+function closeWiki() { $("wikiOverlay").classList.add("hidden"); }
+function renderWikiList() {
+  $("wikiList").innerHTML = entitiesCache.length ? entitiesCache.map(e => `
+    <div class="ent">
+      <div class="ent-h"><b>${esc(e.kind)}</b> · ${esc(e.name)}</div>
+      ${e.summary ? `<div class="ent-s">${esc(e.summary)}</div>` : ""}
+      ${e.detail ? `<div class="ent-d">${esc(e.detail)}</div>` : ""}
+      <div class="ent-a">
+        <button class="ic" onclick="startEditEntity(${e.id})">编辑</button>
+        <button class="ic" onclick="delEntity(${e.id})">删除</button>
+      </div>
+    </div>`).join("") : '<div class="empty">还没有实体卡片</div>';
+}
+function resetEntityForm() {
+  editingEntityId = null;
+  $("entName").value = ""; $("entSummary").value = ""; $("entDetail").value = "";
+  $("entKind").selectedIndex = 0;
+  $("entSaveBtn").textContent = "新增";
+  $("entInsBtn").classList.add("hidden");
+}
+async function saveEntity() {
+  const name = $("entName").value.trim();
+  if (!name) { $("entMsg").textContent = "名称不能为空"; return; }
+  const body = { name, kind: $("entKind").value,
+    summary: $("entSummary").value, detail: $("entDetail").value };
+  try {
+    if (editingEntityId) {
+      await api(`/api/entities/${editingEntityId}`, { method: "PUT", body });
+    } else {
+      await api(`/api/works/${currentWorkId}/entities`, { method: "POST", body });
+    }
+    entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
+    renderWikiList(); resetEntityForm();
+    $("entMsg").textContent = "已保存";
+    setTimeout(() => { $("entMsg").textContent = ""; }, 1200);
+  } catch (e) { $("entMsg").textContent = e.message; }
+}
+function startEditEntity(eid) {
+  const e = entitiesCache.find(x => x.id === eid);
+  if (!e) return;
+  editingEntityId = eid;
+  $("entName").value = e.name;
+  $("entKind").value = e.kind;
+  $("entSummary").value = e.summary || "";
+  $("entDetail").value = e.detail || "";
+  $("entSaveBtn").textContent = "保存修改";
+  $("entInsBtn").classList.remove("hidden");
+  $("entName").focus();
+}
+async function delEntity(eid) {
+  if (!confirm("删除这张实体卡片？")) return;
+  await api(`/api/entities/${eid}`, { method: "DELETE" });
+  entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
+  if (editingEntityId === eid) resetEntityForm();
+  renderWikiList();
+}
+function insertEntity() {
+  const name = $("entName").value.trim();
+  if (!name) { $("entMsg").textContent = "先填名称"; return; }
+  const el = $("content");
+  el.setRangeText("@" + name, el.selectionStart, el.selectionEnd, "end");
+  onContentInput();
+  el.focus();
+}
+
+// @提及：阅读视图里把 @名 包成可悬浮 span
+function wrapMentions(html) {
+  const names = entitiesCache.map(e => e.name).filter(Boolean)
+    .sort((a, b) => b.length - a.length);   // 长名优先，避免短名子串误匹配
+  if (!names.length) return html;
+  const re = new RegExp("@" + names.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|@"), "g");
+  return html.replace(re, m => `<span class="mention" data-name="${m.slice(1)}">${m}</span>`);
+}
+function showMentionPop(m) {
+  const ent = entitiesCache.find(e => e.name === m.dataset.name);
+  if (!ent) return;
+  const pop = $("mentionPop");
+  pop.innerHTML = `<div class="mp-head"><b>${esc(ent.kind)}</b> · ${esc(ent.name)}</div>`
+    + (ent.summary ? `<div class="mp-sum">${esc(ent.summary)}</div>` : "")
+    + (ent.detail ? `<div class="mp-det">${esc(ent.detail)}</div>` : "");
+  pop.classList.remove("hidden");
+  const r = m.getBoundingClientRect();
+  pop.style.left = Math.max(8, Math.min(r.left, innerWidth - 300)) + "px";
+  pop.style.top = (r.bottom + 6) + "px";
+}
+function hideMentionPop() { $("mentionPop").classList.add("hidden"); }
+async function ensureEntities() {
+  if (currentWorkId && entitiesCacheWorkId !== currentWorkId) {
+    try { entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
+      entitiesCacheWorkId = currentWorkId; } catch (e) { entitiesCache = []; }
+  }
+}
+// 阅读视图 @提及 事件委托（只绑一次）
+$("readView").addEventListener("click", e => {
+  const m = e.target.closest(".mention");
+  if (m) { showMentionPop(m); e.stopPropagation(); } else hideMentionPop();
+});
+$("readView").addEventListener("mouseover", e => {
+  const m = e.target.closest(".mention");
+  if (m) showMentionPop(m);
+});
+$("readView").addEventListener("mouseleave", hideMentionPop);
+
 /* ---------- 阅读视图 ---------- */
 
 let readerFontPx = +localStorage.getItem("rFont") || 19;
 let readerLH = +localStorage.getItem("rLH") || 2;
 let ttsPlaying = false;
 
-function toggleRead() {
+async function toggleRead() {
   const r = $("reader");
   const closing = !r.classList.contains("hidden");
   if (closing && ttsPlaying) readerToggleTTS();
   r.classList.toggle("hidden");
-  if (!r.classList.contains("hidden")) renderReader();
+  if (!r.classList.contains("hidden")) { await ensureEntities(); renderReader(); }
 }
 function renderReader() {
   $("readerTitle").textContent = $("chapTitle").value || "(无标题)";
   const v = $("readView");
   v.style.fontSize = readerFontPx + "px";
   v.style.lineHeight = readerLH;
-  v.innerHTML = esc($("content").value).replace(/\n/g, "<br>");
+  v.innerHTML = wrapMentions(esc($("content").value)).replace(/\n/g, "<br>");
   $("readerJump").innerHTML = chapters.map(c =>
     `<option value="${c.id}" ${c.id === currentChapterId ? "selected" : ""}>${esc(c.title)}</option>`).join("");
 }

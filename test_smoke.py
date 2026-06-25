@@ -160,6 +160,52 @@ r = c.get(f"/api/works/{wid}/export?format=docx", headers=H(tokA))
 ok(r.status_code == 200 and r.content[:2] == b"PK", "整本导出 docx (zip)")
 ok(c.get(f"/api/works/{wid}/export?format=txt", headers=H(tokB)).status_code == 404, "bob 整本导出 alice 作品 404")
 
+# 功能1 缩写/改写：无 key 走 LLM 分支 500（区别于未知模式 400）；空内容 400
+ok(c.post("/api/process", json={"mode": "缩写", "text": "一段话", "chapter_id": ccid}, headers=H(tokC)).status_code == 500, "缩写走 LLM(无key 500)")
+ok(c.post("/api/process", json={"mode": "改写", "text": "一段话", "style": "更精炼", "chapter_id": ccid}, headers=H(tokC)).status_code == 500, "改写走 LLM(无key 500)")
+ok(c.post("/api/process", json={"mode": "缩写", "text": ""}, headers=H(tokC)).status_code == 400, "缩写空内容 400")
+ok(c.post("/api/process", json={"mode": "改写", "text": ""}, headers=H(tokC)).status_code == 400, "改写空内容 400")
+
+# 功能2 可视化 Diff（历史版本 → 当前正文）
+rid2 = c.post(f"/api/chapters/{cid2}/revisions", headers=H(tokA)).json()["id"]   # 此时正文="世界"
+c.put(f"/api/chapters/{cid2}", json={"content": "世界改了"}, headers=H(tokA))
+d = c.get(f"/api/chapters/{cid2}/revisions/{rid2}/diff", headers=H(tokA)).json()
+ok(any(o["op"] != "equal" for o in d["ops"]), "diff 检测到增删改")
+ok(any("世界改了" in (o.get("new") or "") for o in d["ops"]), "diff 新块含当前正文")
+ok(c.get(f"/api/chapters/{cid2}/revisions/{rid2}/diff", headers=H(tokB)).status_code == 404, "bob 看 alice diff 404")
+
+# 功能3 回收站（软删/恢复/清空/隔离）
+tid = c.post(f"/api/works/{wid}/chapters", json={"title": "待删章"}, headers=H(tokA)).json()["id"]
+c.put(f"/api/chapters/{tid}", json={"content": "待回收"}, headers=H(tokA))
+ok(c.delete(f"/api/chapters/{tid}", headers=H(tokA)).status_code == 200, "软删章节(进回收站)")
+ok(not any(ch["id"] == tid for ch in c.get(f"/api/works/{wid}/chapters", headers=H(tokA)).json()), "软删后不在章节列表")
+ok(any(t["id"] == tid for t in c.get(f"/api/works/{wid}/trash", headers=H(tokA)).json()), "软删后出现在回收站")
+ok(c.get(f"/api/chapters/{tid}", headers=H(tokA)).status_code == 404, "软删章直接访问 404")
+ok(c.post(f"/api/chapters/{tid}/restore", headers=H(tokA)).status_code == 200, "从回收站恢复")
+ok(any(ch["id"] == tid for ch in c.get(f"/api/works/{wid}/chapters", headers=H(tokA)).json()), "恢复后回到章节列表")
+ok(c.post(f"/api/chapters/{tid}/restore", headers=H(tokB)).status_code == 404, "bob 恢复 alice 章节 404")
+ok(c.delete(f"/api/chapters/{tid}", headers=H(tokA)).status_code == 200, "再次软删")
+ok(c.post(f"/api/chapters/{tid}/purge", headers=H(tokA)).status_code == 200, "彻底清空")
+ok(not any(t["id"] == tid for t in c.get(f"/api/works/{wid}/trash", headers=H(tokA)).json()), "清空后不在回收站")
+ok(c.post(f"/api/chapters/{tid}/purge", headers=H(tokA)).status_code == 404, "清空后再清空 404")
+ok(c.get(f"/api/works/{wid}/trash", headers=H(tokB)).status_code == 404, "bob 看 alice 回收站 404")
+
+# 功能4 实体卡片 wiki：CRUD + 隔离 + digest
+ok(c.post(f"/api/works/{wid}/entities", json={"name": ""}, headers=H(tokA)).status_code == 400, "实体空名 400")
+ent = c.post(f"/api/works/{wid}/entities", json={"name": "林晚", "kind": "人物", "summary": "女主角", "detail": "冷静"}, headers=H(tokA)).json()
+ent2 = c.post(f"/api/works/{wid}/entities", json={"name": "北城", "kind": "地点", "summary": "故事发生地"}, headers=H(tokA)).json()
+ok(c.put(f"/api/entities/{ent['id']}", json={"summary": "女主角，冷静"}, headers=H(tokA)).status_code == 200, "改实体")
+ok(c.delete(f"/api/entities/{ent2['id']}", headers=H(tokA)).status_code == 200, "删实体")
+lst = c.get(f"/api/works/{wid}/entities", headers=H(tokA)).json()
+ok(len(lst) == 1 and lst[0]["name"] == "林晚" and lst[0]["summary"] == "女主角，冷静", "实体列表反映增删改")
+ok(c.get(f"/api/works/{wid}/entities", headers=H(tokB)).status_code == 404, "bob 看 alice 实体 404")
+ok(c.put(f"/api/entities/{ent['id']}", json={"name": "hack"}, headers=H(tokB)).status_code == 404, "bob 改 alice 实体 404")
+ok(c.delete(f"/api/entities/{ent['id']}", headers=H(tokB)).status_code == 404, "bob 删 alice 实体 404")
+uidA = db.verify_user("alice", "pw1234")["id"]
+dig = db.get_entity_digest(wid, uidA)
+ok(dig.startswith("作品实体") and "[人物] 林晚" in dig and "女主角，冷静" in dig, "实体 digest 格式正确")
+ok(db.get_entity_digest(wid, uidA + 9999) == "", "他人作品 digest 为空(隔离)")
+
 # 删除
 ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")
 ok(c.delete(f"/api/works/{wid}", headers=H(tokA)).status_code == 200, "删作品")

@@ -47,6 +47,16 @@ PROMPTS = {
         "用要点逐条列出问题并指明大致位置；没有矛盾就只回「未发现矛盾」。"
         "不要改写正文，只列问题。"
     ),
+    "缩写": (
+        "你是中文写作助手。把下面的段落缩写到约一半篇幅，"
+        "保留关键情节、人物动作与对话要点，保持原风格和语气，"
+        "只输出缩写后的正文，不要解释、不要标题。"
+    ),
+    "改写": (
+        "你是中文写作助手。把下面的段落改写成「{style}」的风格，"
+        "保持原意、人物设定与情节不变，只输出改写后的正文，"
+        "不要解释、不要标题。"
+    ),
 }
 
 
@@ -61,7 +71,7 @@ def chat(messages, *, base_url=None, api_key=None, model=None):
     return (resp.choices[0].message.content or "").strip()
 
 
-def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None):
+def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None, style=None):
     """按模式调用 LLM，返回生成文本。
     notes 为本章备注；bible 为作品级设定（人物/世界观/大纲），全文记忆。
     base_url/api_key/model 优先用调用方传入的（来自用户设置），缺省回落到 .env。"""
@@ -84,7 +94,9 @@ def process(mode, text, context="", notes="", *, base_url=None, api_key=None, mo
             "role": "system",
             "content": "这是当前文章已有的前文，请保持风格、人称和语气一致：\n" + context,
         })
-    messages.append({"role": "system", "content": PROMPTS[mode]})
+    # 改写带风格参数；其余模式直接查表
+    prompt = PROMPTS["改写"].format(style=style or "更生动") if mode == "改写" else PROMPTS[mode]
+    messages.append({"role": "system", "content": prompt})
     messages.append({"role": "user", "content": text})
 
     resp = _get_client(base_url, api_key).chat.completions.create(
