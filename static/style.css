@@ -33,11 +33,12 @@ input, textarea, select {
   font: inherit; border: 1px solid var(--line); background: var(--panel);
   color: var(--ink); border-radius: 8px; padding: 8px;
 }
+.link { display: inline-block; margin-top: 10px; color: var(--accent); font-size: 14px; text-decoration: none; }
 
 /* 登录 */
-.screen { max-width: 360px; margin: 18vh auto; text-align: center; padding: 0 16px; }
+.screen { max-width: 360px; margin: 16vh auto; text-align: center; padding: 0 16px; }
 .screen h1 { margin-bottom: 18px; }
-.screen input { width: 100%; margin-bottom: 12px; }
+.screen input { width: 100%; margin-bottom: 10px; }
 .screen button { width: 100%; padding: 10px; }
 .msg { color: var(--mic); font-size: 14px; min-height: 1.2em; }
 
@@ -52,23 +53,23 @@ input, textarea, select {
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 12px; border-bottom: 1px solid var(--line);
 }
-.side-head span { font-weight: 600; }
+.side-head span { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree { flex: 1; overflow-y: auto; padding: 6px 0; }
 .empty { color: var(--muted); font-size: 13px; padding: 6px 14px; }
 
 .work { border-bottom: 1px solid var(--line); }
-.w-row {
-  display: flex; align-items: center; padding: 9px 12px; cursor: pointer;
-}
+.w-row { display: flex; align-items: center; padding: 9px 12px; cursor: pointer; }
 .w-row:hover { background: var(--panel); }
 .w-title { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chaps { padding: 2px 0 4px; }
 .chap {
-  display: flex; align-items: center; padding: 7px 12px 7px 22px; cursor: pointer;
-  gap: 6px;
+  display: flex; align-items: center; padding: 7px 12px 7px 14px; cursor: pointer; gap: 4px;
 }
 .chap:hover { background: var(--panel); }
-.chap.cur { background: var(--panel); border-left: 3px solid var(--accent); padding-left: 19px; }
+.chap.cur { background: var(--panel); border-left: 3px solid var(--accent); padding-left: 11px; }
+.chap[draggable="true"] { cursor: grab; }
+.chap[draggable="true"]:active { cursor: grabbing; }
+.drag { color: var(--muted); font-size: 14px; }
 .c-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
 .c-wc { color: var(--muted); font-size: 12px; }
 .c-del {
@@ -85,13 +86,13 @@ input, textarea, select {
 /* 主区 */
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar {
-  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
-  background: var(--panel); border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px;
+  background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap;
 }
-.title-input { flex: 1; min-width: 0; font-weight: 600; border: none; background: transparent; }
+.title-input { flex: 1; min-width: 100px; font-weight: 600; border: none; background: transparent; }
 .title-input:focus { outline: 1px solid var(--line); }
 .wc { color: var(--muted); font-size: 13px; white-space: nowrap; }
-.save-stat { color: var(--accent); font-size: 12px; min-width: 48px; }
+.save-stat { color: var(--accent); font-size: 12px; min-width: 40px; }
 .ic { padding: 7px 8px; white-space: nowrap; }
 
 .modes { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
@@ -99,26 +100,26 @@ input, textarea, select {
 .mode.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .gen { background: var(--accent); color: #fff; border-color: var(--accent); flex: 1.4; }
 
-.micbar { display: flex; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.micbar { display: flex; gap: 6px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 .mic { background: var(--mic); color: #fff; border-color: var(--mic); font-weight: 600; padding: 9px 14px; }
 .mic.on { background: #555; border-color: #555; }
 .status { color: var(--muted); font-size: 13px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 .findbar { display: flex; gap: 6px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
-.findbar input { min-width: 80px; }
+.findbar input { min-width: 70px; }
 .find-info { color: var(--muted); font-size: 13px; }
+
+.notesbar { padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.notesbar textarea { width: 100%; min-height: 56px; font-size: 14px; }
 
 .draft { margin: 10px; padding: 12px; min-height: 44px; border-radius: 8px; background: var(--panel); border: 1px dashed var(--line); color: var(--muted); font-size: 15px; }
 .draft.active { color: var(--ink); border-style: solid; }
 
-.content {
-  flex: 1; width: calc(100% - 20px); margin: 10px; resize: none;
-  line-height: 1.9; font-size: 17px; border-radius: 8px;
-}
+.content { flex: 1; width: calc(100% - 20px); margin: 10px; resize: none; line-height: 1.9; font-size: 17px; border-radius: 8px; }
 
-/* 专注模式：只留标题栏 + 正文 */
+/* 专注模式 */
 #app.focus .sidebar, #app.focus .modes, #app.focus .micbar,
-#app.focus .findbar, #app.focus .draft { display: none !important; }
+#app.focus .findbar, #app.focus .notesbar, #app.focus .draft { display: none !important; }
 #app.focus .content { font-size: 20px; }
 
 /* 移动端：侧栏变抽屉 */
@@ -130,6 +131,13 @@ input, textarea, select {
   #app.side-open .sidebar { transform: none; }
   .c-del { opacity: .5; }
 }
+
+/* 弹层（历史版本） */
+.overlay { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.overlay-card { background: var(--panel); border-radius: 12px; width: 100%; max-width: 460px; max-height: 70vh; display: flex; flex-direction: column; }
+.overlay-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 600; }
+.rev-list { overflow-y: auto; padding: 6px; }
+.rev { display: flex; align-items: center; justify-content: space-between; padding: 9px 10px; border-bottom: 1px solid var(--line); font-size: 14px; }
 
 /* 阅读视图 */
 .reader { position: fixed; inset: 0; z-index: 40; background: var(--bg); overflow: auto; }

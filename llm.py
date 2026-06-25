@@ -30,9 +30,14 @@ PROMPTS = {
 }
 
 
-def process(mode, text, context=""):
-    """按模式调用 LLM，返回生成文本。"""
+def process(mode, text, context="", notes=""):
+    """按模式调用 LLM，返回生成文本。notes 为本章备注/设定，喂给 AI 保持一致。"""
     messages = []
+    if notes:
+        messages.append({
+            "role": "system",
+            "content": "这是作者给本章的备注/设定，写作时请遵循：\n" + notes,
+        })
     if context:
         messages.append({
             "role": "system",

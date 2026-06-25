@@ -11,8 +11,19 @@
   <!-- 登录 -->
   <div id="login" class="screen">
     <h1>✍ 写作</h1>
-    <input id="pwd" type="password" placeholder="密码" onkeydown="if(event.key==='Enter')doLogin()">
-    <button onclick="doLogin()">进入</button>
+    <div id="loginForm">
+      <input id="user" placeholder="用户名" onkeydown="if(event.key==='Enter')doLogin()">
+      <input id="pwd" type="password" placeholder="密码" onkeydown="if(event.key==='Enter')doLogin()">
+      <button onclick="doLogin()">登录</button>
+      <a id="toRegister" href="#" class="link hidden" onclick="showRegister();return false">注册账号</a>
+    </div>
+    <div id="registerForm" class="hidden">
+      <input id="regUser" placeholder="用户名（≥2位）">
+      <input id="regPwd" type="password" placeholder="密码（≥4位）">
+      <input id="regCode" placeholder="注册码">
+      <button onclick="doRegister()">注册并登录</button>
+      <a href="#" class="link" onclick="showLogin();return false">返回登录</a>
+    </div>
     <p id="loginMsg" class="msg"></p>
   </div>
 
@@ -20,7 +31,7 @@
   <div id="app" class="hidden">
     <aside id="sidebar" class="sidebar">
       <div class="side-head">
-        <span>目录</span>
+        <span id="meName">目录</span>
         <button class="ic" onclick="newWork()" title="新建作品">＋作品</button>
       </div>
       <div id="workTree" class="tree"></div>
@@ -32,6 +43,13 @@
         <input id="chapTitle" class="title-input" placeholder="章节标题">
         <span id="wc" class="wc">0 字</span>
         <span id="saveStat" class="save-stat"></span>
+        <select id="exportSel" class="ic" onchange="exportChap(this.value);this.selectedIndex=0" title="导出">
+          <option value="">⬇导出</option>
+          <option value="txt">TXT</option>
+          <option value="docx">DOCX</option>
+        </select>
+        <button class="ic" onclick="saveRevision()" title="存为版本">🗂存版</button>
+        <button class="ic" onclick="showRevisions()" title="历史版本">🕘历史</button>
         <button class="ic" onclick="toggleFocus()" title="专注">⊚</button>
         <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
         <button class="ic" onclick="doLogout()" title="退出">⏻</button>
@@ -50,6 +68,8 @@
         <span id="micStatus" class="status"></span>
         <button class="ic" onclick="undo()" title="撤销最近一段">↩撤销</button>
         <button class="ic" onclick="toggleFind()" title="查找替换">🔍找</button>
+        <button class="ic" onclick="splitChapter()" title="在光标处拆分章节">✂拆分</button>
+        <button class="ic" onclick="toggleNotes()" title="本章备注">📝备注</button>
       </div>
 
       <div id="findBar" class="findbar hidden">
@@ -62,9 +82,13 @@
         <button class="ic" onclick="toggleFind()">✕</button>
       </div>
 
+      <div id="notesBar" class="notesbar hidden">
+        <textarea id="notes" placeholder="本章备注/梗概/设定（会作为 AI 续写、扩写的上下文）"></textarea>
+      </div>
+
       <div id="draft" class="draft">这里显示你正在说的话…</div>
 
-      <textarea id="content" class="content" placeholder="正文（手打或语音都行，自动保存）"></textarea>
+      <textarea id="content" class="content" spellcheck="true" lang="zh-CN" placeholder="正文（手打或语音都行，自动保存）"></textarea>
     </main>
   </div>
 
@@ -83,6 +107,14 @@
       <select id="readerJump" onchange="readerJumpTo()"></select>
     </div>
     <article id="readView" class="read-text"></article>
+  </div>
+
+  <!-- 历史版本 -->
+  <div id="revOverlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-head"><span>历史版本</span><button class="ic" onclick="closeRevisions()">✕</button></div>
+      <div id="revList" class="rev-list"></div>
+    </div>
   </div>
 
   <script src="app.js"></script>

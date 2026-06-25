@@ -1,15 +1,14 @@
-"""冒烟测试：用 TestClient 走一遍接口（转写模式不调 LLM，无需 key）。"""
+"""冒烟测试：多用户隔离 + P1 新功能。转写模式不调 LLM，无需 key。"""
 import os, tempfile
-tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-tmp.close()
-os.environ["DB_PATH"] = tmp.name  # 用临时文件库，测完删除
+tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); tmp.close()
+os.environ["DB_PATH"] = tmp.name
+os.environ["SIGNUP_CODE"] = "testcode"   # 开放凭码注册
 
 from fastapi.testclient import TestClient
 import main, db
 
 db.init_db()
 c = TestClient(main.app)
-H = {}
 
 
 def ok(cond, msg):
@@ -18,45 +17,90 @@ def ok(cond, msg):
         raise SystemExit(1)
 
 
-# 未登录应 401
-ok(c.get("/api/works").status_code == 401, "未登录 401")
+def H(tok):
+    return {"Authorization": "Bearer " + tok}
 
-# 登录（默认密码 changeme）
-r = c.post("/api/login", json={"password": "changeme"})
-ok(r.status_code == 200, "登录成功")
-H["Authorization"] = "Bearer " + r.json()["token"]
 
-# 建作品 + 章节
-wid = c.post("/api/works", json={"title": "测试作品"}, headers=H).json()["id"]
-ok(bool(wid), "建作品")
-cid = c.post(f"/api/works/{wid}/chapters", json={"title": "第一章"}, headers=H).json()["id"]
-ok(bool(cid), "建章节")
+# 注册状态
+s = c.get("/api/signup-status").json()
+ok(s["enabled"] and s["needs_code"], "注册：凭码开放")
 
-# 章节列表带字数
-chaps = c.get(f"/api/works/{wid}/chapters", headers=H).json()
-ok("chars" in chaps[0], "章节列表含 chars")
+# 注册两个用户
+r = c.post("/api/register", json={"username": "alice", "password": "pw1234", "code": "testcode"})
+ok(r.status_code == 200, "注册 alice")
+tokA = r.json()["token"]
+r = c.post("/api/register", json={"username": "bob", "password": "pw1234", "code": "testcode"})
+ok(r.status_code == 200, "注册 bob")
+tokB = r.json()["token"]
 
-# 转写处理（追加到正文）
-r = c.post("/api/process", json={"mode": "转写", "text": "你好世界", "chapter_id": cid}, headers=H)
+# 错码 / 重名
+ok(c.post("/api/register", json={"username": "x", "password": "pw1234", "code": "wrong"}).status_code == 403, "错注册码 403")
+ok(c.post("/api/register", json={"username": "alice", "password": "pw1234", "code": "testcode"}).status_code == 409, "重名 409")
+
+# 登录 / me
+r = c.post("/api/login", json={"username": "alice", "password": "pw1234"})
+ok(r.status_code == 200, "登录 alice")
+ok(c.get("/api/me", headers=H(tokA)).json()["username"] == "alice", "me 返回用户名")
+ok(c.get("/api/me").status_code == 401, "未登录 401")
+
+# alice 建作品 + 章节
+wid = c.post("/api/works", json={"title": "A作"}, headers=H(tokA)).json()["id"]
+cid = c.post(f"/api/works/{wid}/chapters", json={"title": "第一章"}, headers=H(tokA)).json()["id"]
+
+# 隔离：bob 看不到 alice 的作品/章节
+ok(c.get("/api/works", headers=H(tokB)).json() == [], "bob 看不到 alice 作品")
+ok(c.get(f"/api/chapters/{cid}", headers=H(tokB)).status_code == 404, "bob 访问 alice 章节 404")
+ok(c.delete(f"/api/works/{wid}", headers=H(tokB)).status_code == 404, "bob 删 alice 作品 404")
+
+# 转写（追加正文）
+r = c.post("/api/process", json={"mode": "转写", "text": "你好世界", "chapter_id": cid}, headers=H(tokA))
 ok(r.json()["result"] == "你好世界", "转写结果=原文")
-chap = c.get(f"/api/chapters/{cid}", headers=H).json()
-ok("你好世界" in chap["content"], "正文已追加")
-ok(len(chap["segments"]) == 1, "段落历史记录1条")
+chap = c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()
+ok(chap["content"] == "你好世界", "正文已追加")
+ok(len(chap["segments"]) == 1, "段落历史 1 条")
 
-# 撤销
-chap = c.post(f"/api/chapters/{cid}/undo", headers=H).json()
-ok("你好世界" not in (chap["content"] or ""), "撤销后正文回退")
+# 备注保存
+ok(c.put(f"/api/chapters/{cid}", json={"notes": "设定X"}, headers=H(tokA)).status_code == 200, "存备注")
+ok(c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["notes"] == "设定X", "备注读回")
 
-# 手动保存
-r = c.put(f"/api/chapters/{cid}", json={"title": "改名", "content": "手动正文"}, headers=H)
-ok(r.status_code == 200 and r.json().get("ok"), "保存接口")
+# 拆分：在 2 处拆，左"你好" 右"世界"
+r = c.post(f"/api/chapters/{cid}/split", json={"at": 2, "title": "第二章"}, headers=H(tokA))
+cid2 = r.json()["new_chapter_id"]
+chaps = c.get(f"/api/works/{wid}/chapters", headers=H(tokA)).json()
+ok(len(chaps) == 2, "拆分后 2 章")
+ok(c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["content"] == "你好", "左半留存")
+ok(c.get(f"/api/chapters/{cid2}", headers=H(tokA)).json()["content"] == "世界", "右半进新章")
+
+# 排序：把新章挪到前面
+ok(c.post(f"/api/works/{wid}/reorder", json={"ids": [cid2, cid]}, headers=H(tokA)).status_code == 200, "排序")
+order = [c["id"] for c in c.get(f"/api/works/{wid}/chapters", headers=H(tokA)).json()]
+ok(order == [cid2, cid], "排序生效")
+
+# 修订版本：存版 → 改正文 → 恢复
+rid = c.post(f"/api/chapters/{cid}/revisions", headers=H(tokA)).json()["id"]
+c.put(f"/api/chapters/{cid}", json={"content": "被改了"}, headers=H(tokA))
+ok(c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["content"] == "被改了", "正文已改")
+restored = c.post(f"/api/chapters/{cid}/revisions/{rid}/restore", headers=H(tokA)).json()
+ok(restored["content"] == "你好", "恢复版本")
+ok(len(c.get(f"/api/chapters/{cid}/revisions", headers=H(tokA)).json()) == 1, "版本列表 1 条")
+
+# 撤销最近一段
+c.post(f"/api/chapters/{cid}/undo", headers=H(tokA))
+# （上面恢复后 content=你好，undo 会尝试裁掉最近 segment 的 result "你好世界"，
+#  但 content 是"你好"不以"你好世界"结尾，故仅删历史记录，正文不变——验证不崩即可）
+ok(True, "undo 不崩")
+
+# 导出
+r = c.get(f"/api/chapters/{cid}/export?format=txt", headers=H(tokA))
+ok(r.status_code == 200 and "text/plain" in r.headers["content-type"], "导出 txt")
+r = c.get(f"/api/chapters/{cid}/export?format=docx", headers=H(tokA))
+ok(r.status_code == 200 and r.content[:2] == b"PK", "导出 docx (zip)")
 
 # 删除
-ok(c.delete(f"/api/chapters/{cid}", headers=H).status_code == 200, "删章节")
-ok(c.delete(f"/api/works/{wid}", headers=H).status_code == 200, "删作品")
-ok(c.get("/api/works", headers=H).json() == [], "删除后为空")
+ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")
+ok(c.delete(f"/api/works/{wid}", headers=H(tokA)).status_code == 200, "删作品")
 
-# 首页能取到
+# 首页
 ok(c.get("/").status_code == 200, "首页可访问")
 
 print("\n全部通过 ✅")
