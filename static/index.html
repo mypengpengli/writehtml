@@ -18,41 +18,69 @@
 
   <!-- 主界面 -->
   <div id="app" class="hidden">
-    <header class="topbar">
-      <select id="workSel" onchange="loadChapters()"></select>
-      <select id="chapSel" onchange="loadChapter()"></select>
-      <button class="ic" onclick="newWork()" title="新建作品">＋作品</button>
-      <button class="ic" onclick="newChapter()" title="新建章节">＋章</button>
-      <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
-      <button class="ic" onclick="doLogout()" title="退出">⏻</button>
-    </header>
+    <aside id="sidebar" class="sidebar">
+      <div class="side-head">
+        <span>目录</span>
+        <button class="ic" onclick="newWork()" title="新建作品">＋作品</button>
+      </div>
+      <div id="workTree" class="tree"></div>
+    </aside>
 
-    <div class="modes">
-      <button class="mode" data-mode="转写" onclick="setMode('转写')">转写</button>
-      <button class="mode" data-mode="润色" onclick="setMode('润色')">润色</button>
-      <button class="mode" data-mode="扩写" onclick="setMode('扩写')">扩写</button>
-      <button class="mode" data-mode="续写" onclick="setMode('续写')">续写</button>
-      <button id="genBtn" class="gen hidden" onclick="generate()">⏎ 生成</button>
-    </div>
+    <main class="main">
+      <header class="topbar">
+        <button class="ic" onclick="toggleSidebar()" title="目录">☰</button>
+        <input id="chapTitle" class="title-input" placeholder="章节标题">
+        <span id="wc" class="wc">0 字</span>
+        <span id="saveStat" class="save-stat"></span>
+        <button class="ic" onclick="toggleFocus()" title="专注">⊚</button>
+        <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
+        <button class="ic" onclick="doLogout()" title="退出">⏻</button>
+      </header>
 
-    <div class="micbar">
-      <button id="micBtn" class="mic" onclick="toggleMic()">🎤 开始说</button>
-      <span id="micStatus" class="status"></span>
-      <button class="ic" onclick="undo()" title="撤销最近一段">↩撤销</button>
-      <button class="ic" onclick="saveContent()" title="保存正文">💾存</button>
-    </div>
+      <div class="modes">
+        <button class="mode active" data-mode="转写" onclick="setMode('转写')">转写</button>
+        <button class="mode" data-mode="润色" onclick="setMode('润色')">润色</button>
+        <button class="mode" data-mode="扩写" onclick="setMode('扩写')">扩写</button>
+        <button class="mode" data-mode="续写" onclick="setMode('续写')">续写</button>
+        <button id="genBtn" class="gen hidden" onclick="generate()">⏎ 生成</button>
+      </div>
 
-    <div id="draft" class="draft">这里显示你正在说的话…</div>
+      <div class="micbar">
+        <button id="micBtn" class="mic" onclick="toggleMic()">🎤 开始说</button>
+        <span id="micStatus" class="status"></span>
+        <button class="ic" onclick="undo()" title="撤销最近一段">↩撤销</button>
+        <button class="ic" onclick="toggleFind()" title="查找替换">🔍找</button>
+      </div>
 
-    <textarea id="content" class="content" placeholder="正文（可手动编辑）"></textarea>
-    <div class="hint">转写/润色：说一句落一句。扩写/续写：口述大意后点「生成」。</div>
+      <div id="findBar" class="findbar hidden">
+        <input id="findInput" placeholder="查找…" oninput="doFind()">
+        <button class="ic" onclick="findNext()">下一个</button>
+        <input id="replaceInput" placeholder="替换为…">
+        <button class="ic" onclick="doReplace()">替换</button>
+        <button class="ic" onclick="replaceAll()">全部</button>
+        <span id="findInfo" class="find-info"></span>
+        <button class="ic" onclick="toggleFind()">✕</button>
+      </div>
+
+      <div id="draft" class="draft">这里显示你正在说的话…</div>
+
+      <textarea id="content" class="content" placeholder="正文（手打或语音都行，自动保存）"></textarea>
+    </main>
   </div>
 
   <!-- 阅读视图 -->
   <div id="reader" class="reader hidden">
     <div class="reader-top">
-      <button onclick="toggleRead()">✕ 关闭</button>
-      <span id="readerTitle"></span>
+      <button onclick="toggleRead()">✕</button>
+      <button onclick="readerPrev()">‹ 上章</button>
+      <span id="readerTitle" class="r-title"></span>
+      <button onclick="readerNext()">下章 ›</button>
+      <span class="r-spacer"></span>
+      <button class="ic" onclick="readerFont(-1)">A－</button>
+      <button class="ic" onclick="readerFont(1)">A＋</button>
+      <button class="ic" onclick="readerLine()">行距</button>
+      <button class="ic" onclick="readerToggleTTS()" id="ttsBtn">▶朗读</button>
+      <select id="readerJump" onchange="readerJumpTo()"></select>
     </div>
     <article id="readView" class="read-text"></article>
   </div>

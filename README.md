@@ -49,6 +49,13 @@ cp .env.example .env && nano .env
 python main.py
 ```
 
+## 自检
+
+```bash
+python -m py_compile *.py && node --check static/app.js   # 语法
+python test_smoke.py                                       # 接口冒烟（转写模式，无需 LLM key）
+```
+
 ## 关于 HTTPS（重要）
 
 手机浏览器调用麦克风 **必须 HTTPS**（localhost 除外）。正式用要在服务器前面挂反代 + 证书，例如：

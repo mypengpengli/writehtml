@@ -82,8 +82,8 @@ def create_work(title):
 def list_chapters(work_id):
     with get_conn() as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT id, work_id, title, ord, created_at FROM chapters "
-            "WHERE work_id=? ORDER BY ord", (work_id,)
+            "SELECT id, work_id, title, ord, created_at, length(content) AS chars "
+            "FROM chapters WHERE work_id=? ORDER BY ord", (work_id,)
         )]
 
 
@@ -101,6 +101,23 @@ def create_chapter(work_id, title):
         )
         cid = cur.lastrowid
     return {"id": cid, "work_id": work_id, "title": title, "ord": ord_}
+
+
+def delete_chapter(cid):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM chapters WHERE id=?", (cid,))
+
+
+def delete_work(wid):
+    with get_conn() as conn:
+        cids = [r["id"] for r in conn.execute(
+            "SELECT id FROM chapters WHERE work_id=?", (wid,)
+        )]
+        for cid in cids:
+            conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM chapters WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM works WHERE id=?", (wid,))
 
 
 def get_chapter(cid):

@@ -6,140 +6,137 @@
   --accent: #6b8e4e;
   --line: #e3ddd0;
   --mic: #c0392b;
+  --side-bg: #efece4;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1a1a1a;
-    --panel: #262626;
-    --ink: #e8e6e1;
-    --muted: #8a8a8a;
-    --accent: #8fb96b;
-    --line: #3a3a3a;
-    --mic: #e57373;
+    --bg: #1a1a1a; --panel: #262626; --ink: #e8e6e1; --muted: #8a8a8a;
+    --accent: #8fb96b; --line: #3a3a3a; --mic: #e57373; --side-bg: #202020;
   }
 }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
+html, body { margin: 0; padding: 0; height: 100%; }
 body {
   font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  background: var(--bg);
-  color: var(--ink);
-  line-height: 1.7;
+  background: var(--bg); color: var(--ink); line-height: 1.6;
   -webkit-text-size-adjust: 100%;
 }
 .hidden { display: none !important; }
 
 button {
-  font: inherit;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--ink);
-  border-radius: 8px;
-  padding: 7px 10px;
-  cursor: pointer;
+  font: inherit; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink); border-radius: 8px; padding: 7px 10px; cursor: pointer;
 }
 button:active { background: var(--line); }
-
 input, textarea, select {
-  font: inherit;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--ink);
-  border-radius: 8px;
-  padding: 8px;
+  font: inherit; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink); border-radius: 8px; padding: 8px;
 }
 
 /* 登录 */
-.screen {
-  max-width: 360px;
-  margin: 18vh auto;
-  text-align: center;
-  padding: 0 16px;
-}
+.screen { max-width: 360px; margin: 18vh auto; text-align: center; padding: 0 16px; }
 .screen h1 { margin-bottom: 18px; }
 .screen input { width: 100%; margin-bottom: 12px; }
 .screen button { width: 100%; padding: 10px; }
 .msg { color: var(--mic); font-size: 14px; min-height: 1.2em; }
 
-/* 顶栏 */
-.topbar {
-  position: sticky; top: 0; z-index: 5;
-  display: flex; gap: 6px; align-items: center;
-  padding: 8px 10px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
+/* 主布局 */
+#app { display: flex; height: 100vh; overflow: hidden; }
+
+.sidebar {
+  width: 248px; flex-shrink: 0; background: var(--side-bg);
+  border-right: 1px solid var(--line); overflow-y: auto; display: flex; flex-direction: column;
 }
-.topbar select { flex: 1; min-width: 0; }
+.side-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border-bottom: 1px solid var(--line);
+}
+.side-head span { font-weight: 600; }
+.tree { flex: 1; overflow-y: auto; padding: 6px 0; }
+.empty { color: var(--muted); font-size: 13px; padding: 6px 14px; }
+
+.work { border-bottom: 1px solid var(--line); }
+.w-row {
+  display: flex; align-items: center; padding: 9px 12px; cursor: pointer;
+}
+.w-row:hover { background: var(--panel); }
+.w-title { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chaps { padding: 2px 0 4px; }
+.chap {
+  display: flex; align-items: center; padding: 7px 12px 7px 22px; cursor: pointer;
+  gap: 6px;
+}
+.chap:hover { background: var(--panel); }
+.chap.cur { background: var(--panel); border-left: 3px solid var(--accent); padding-left: 19px; }
+.c-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+.c-wc { color: var(--muted); font-size: 12px; }
+.c-del {
+  border: none; background: transparent; color: var(--muted);
+  padding: 2px 5px; font-size: 13px; opacity: 0; border-radius: 4px;
+}
+.w-row:hover .c-del, .chap:hover .c-del { opacity: .7; }
+.c-del:hover { opacity: 1; color: var(--mic); }
+.add-chap {
+  display: block; width: calc(100% - 20px); margin: 4px 10px 8px; padding: 6px;
+  font-size: 13px; color: var(--accent); border-style: dashed;
+}
+
+/* 主区 */
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.topbar {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.title-input { flex: 1; min-width: 0; font-weight: 600; border: none; background: transparent; }
+.title-input:focus { outline: 1px solid var(--line); }
+.wc { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.save-stat { color: var(--accent); font-size: 12px; min-width: 48px; }
 .ic { padding: 7px 8px; white-space: nowrap; }
 
-/* 模式条 */
-.modes {
-  display: flex; gap: 6px; padding: 8px 10px; flex-wrap: wrap;
-  border-bottom: 1px solid var(--line);
-}
-.mode { flex: 1; min-width: 64px; }
-.mode.active {
-  background: var(--accent); color: #fff; border-color: var(--accent);
-}
-.gen {
-  background: var(--accent); color: #fff; border-color: var(--accent);
-  flex: 1.4;
-}
+.modes { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.mode { flex: 1; min-width: 60px; }
+.mode.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.gen { background: var(--accent); color: #fff; border-color: var(--accent); flex: 1.4; }
 
-/* 麦克风条 */
-.micbar {
-  display: flex; gap: 8px; align-items: center;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--line);
-}
-.mic {
-  background: var(--mic); color: #fff; border-color: var(--mic);
-  font-weight: 600; padding: 9px 14px;
-}
+.micbar { display: flex; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.mic { background: var(--mic); color: #fff; border-color: var(--mic); font-weight: 600; padding: 9px 14px; }
 .mic.on { background: #555; border-color: #555; }
-.status { color: var(--muted); font-size: 13px; flex: 1; min-width: 0; }
+.status { color: var(--muted); font-size: 13px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
-/* 实时口述区 */
-.draft {
-  margin: 10px;
-  padding: 12px;
-  min-height: 48px;
-  border-radius: 8px;
-  background: var(--panel);
-  border: 1px dashed var(--line);
-  color: var(--muted);
-  font-size: 15px;
-}
+.findbar { display: flex; gap: 6px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.findbar input { min-width: 80px; }
+.find-info { color: var(--muted); font-size: 13px; }
+
+.draft { margin: 10px; padding: 12px; min-height: 44px; border-radius: 8px; background: var(--panel); border: 1px dashed var(--line); color: var(--muted); font-size: 15px; }
 .draft.active { color: var(--ink); border-style: solid; }
 
-/* 正文编辑 */
 .content {
-  display: block;
-  width: calc(100% - 20px);
-  margin: 10px;
-  min-height: 50vh;
-  resize: vertical;
-  line-height: 1.9;
-  font-size: 17px;
-  border-radius: 8px;
+  flex: 1; width: calc(100% - 20px); margin: 10px; resize: none;
+  line-height: 1.9; font-size: 17px; border-radius: 8px;
 }
-.hint { padding: 0 12px 16px; color: var(--muted); font-size: 13px; }
+
+/* 专注模式：只留标题栏 + 正文 */
+#app.focus .sidebar, #app.focus .modes, #app.focus .micbar,
+#app.focus .findbar, #app.focus .draft { display: none !important; }
+#app.focus .content { font-size: 20px; }
+
+/* 移动端：侧栏变抽屉 */
+@media (max-width: 700px) {
+  .sidebar {
+    position: fixed; z-index: 30; height: 100%;
+    transform: translateX(-100%); transition: transform .2s; box-shadow: 2px 0 12px rgba(0,0,0,.2);
+  }
+  #app.side-open .sidebar { transform: none; }
+  .c-del { opacity: .5; }
+}
 
 /* 阅读视图 */
-.reader {
-  position: fixed; inset: 0; z-index: 20;
-  background: var(--bg);
-  overflow: auto;
-  padding: 16px;
-}
+.reader { position: fixed; inset: 0; z-index: 40; background: var(--bg); overflow: auto; }
 .reader-top {
-  display: flex; align-items: center; gap: 12px;
-  padding-bottom: 12px; border-bottom: 1px solid var(--line);
-  margin-bottom: 16px;
+  display: flex; align-items: center; gap: 6px; padding: 10px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap;
 }
-.reader-top span { font-size: 18px; font-weight: 600; }
-.read-text {
-  max-width: 720px; margin: 0 auto;
-  font-size: 19px; line-height: 2;
-}
+.r-title { font-weight: 600; margin: 0 6px; }
+.r-spacer { flex: 1; }
+.read-text { max-width: 720px; margin: 24px auto; font-size: 19px; line-height: 2; }

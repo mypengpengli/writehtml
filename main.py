@@ -80,7 +80,22 @@ async def get_chapter(cid: int, request: Request):
 async def save_chapter(cid: int, request: Request):
     _auth(request)
     body = await request.json()
-    return db.update_chapter(cid, body.get("title"), body.get("content"))
+    db.update_chapter(cid, body.get("title"), body.get("content"))
+    return {"ok": True}
+
+
+@app.delete("/api/chapters/{cid}")
+async def del_chapter(cid: int, request: Request):
+    _auth(request)
+    db.delete_chapter(cid)
+    return {"ok": True}
+
+
+@app.delete("/api/works/{wid}")
+async def del_work(wid: int, request: Request):
+    _auth(request)
+    db.delete_work(wid)
+    return {"ok": True}
 
 
 @app.post("/api/chapters/{cid}/undo")
