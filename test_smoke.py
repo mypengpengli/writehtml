@@ -209,6 +209,10 @@ ok(db.get_entity_digest(wid, uidA + 9999) == "", "他人作品 digest 为空(隔
 # 删除
 ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")
 ok(c.delete(f"/api/works/{wid}", headers=H(tokA)).status_code == 200, "删作品")
+# 删作品应级联清掉其下实体（不留孤儿行）
+with db.get_conn() as conn:
+    _nent = conn.execute("SELECT COUNT(*) FROM entities WHERE work_id=?", (wid,)).fetchone()[0]
+ok(_nent == 0, "删作品级联清空实体")
 
 # 首页
 ok(c.get("/").status_code == 200, "首页可访问")

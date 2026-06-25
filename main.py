@@ -401,17 +401,12 @@ async def do_process(request: Request):
     style = body.get("style")  # 改写风格预设（更生动/更精炼/文艺风/…），仅改写模式用
 
     notes = ""
-    bible = ""
     chap = None
     if cid:
-        chap = db.get_chapter(cid, uid)
+        chap = db.get_chapter_meta(cid, uid)  # 轻量取元数据，不拉段落历史（转写热路径）
         if not chap:
             raise HTTPException(404, "章节不存在")
         notes = chap.get("notes") or ""
-        bible = db.get_work_notes(chap["work_id"], uid) or ""
-        digest = db.get_entity_digest(chap["work_id"], uid)  # 实体卡片 → 结构化设定
-        if digest:
-            bible = (bible + "\n\n" + digest) if bible else digest
 
     seg_raw = text  # 段落历史里记录的"原始输入"
     # 找回：从指定历史版本里恢复内容，主输入=旧草稿，上下文=当前正文全文
@@ -447,6 +442,13 @@ async def do_process(request: Request):
         model = s.get("llm_model") or config.LLM_MODEL
         if not api_key:
             raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
+        # bible 只在真的要调 LLM 时才拼（作品设定 + 实体 digest）；转写/无key 不浪费这两次查询
+        bible = ""
+        if cid:
+            bible = db.get_work_notes(chap["work_id"], uid) or ""
+            digest = db.get_entity_digest(chap["work_id"], uid)
+            if digest:
+                bible = (bible + "\n\n" + digest) if bible else digest
         result = llm.process(mode, text, context, notes, bible=bible,
                              base_url=base_url, api_key=api_key, model=model, style=style)
     else:
@@ -479,7 +481,7 @@ async def chat(request: Request):
         "回答简洁有建设性，给选项和建议，不要替作者下最终决定。"}]
     cid = body.get("chapter_id")
     if cid:
-        chap = db.get_chapter(cid, uid)
+        chap = db.get_chapter_meta(cid, uid)  # 轻量取元数据，不拉段落历史
         if chap:
             bible = db.get_work_notes(chap["work_id"], uid) or ""
             digest = db.get_entity_digest(chap["work_id"], uid)

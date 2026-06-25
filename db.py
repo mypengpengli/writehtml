@@ -220,6 +220,7 @@ def delete_work(wid, user_id):
             conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM works WHERE id=?", (wid,))
         return True
 
@@ -385,6 +386,19 @@ def get_chapter(cid, user_id):
         ).fetchall()
         chap["segments"] = [dict(s) for s in segs]
         return chap
+
+
+def get_chapter_meta(cid, user_id):
+    """轻量取章节元数据（title/content/notes/work_id），不拉段落历史。
+    do_process / chat 等只需元数据与归属校验的热路径用这个，避免随段落增长放大开销。"""
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        r = conn.execute(
+            "SELECT id, work_id, title, content, notes FROM chapters WHERE id=? AND deleted_at IS NULL",
+            (cid,),
+        ).fetchone()
+        return dict(r) if r else None
 
 
 def update_chapter(cid, user_id, title, content, notes):
