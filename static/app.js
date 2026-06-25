@@ -502,6 +502,59 @@ async function saveWorkNotes() {
   } catch (e) { $("wnMsg").textContent = e.message; }
 }
 
+/* ---------- AI 写作工具（校验/摘要，不污染正文） ---------- */
+
+function openAITools() { $("aiResult").textContent = ""; $("aiOverlay").classList.remove("hidden"); }
+function closeAITools() { $("aiOverlay").classList.add("hidden"); }
+async function aiCheck() {
+  if (!currentChapterId) { $("aiResult").textContent = "先选一章"; return; }
+  $("aiResult").textContent = "校验中…";
+  try {
+    const r = await api("/api/process", { body: { mode: "校验", chapter_id: currentChapterId } });
+    $("aiResult").textContent = r.result;
+  } catch (e) { $("aiResult").textContent = "出错：" + e.message; }
+}
+async function aiSynopsis() {
+  if (!currentChapterId) { $("aiResult").textContent = "先选一章"; return; }
+  $("aiResult").textContent = "生成摘要中…";
+  try {
+    const r = await api("/api/process", { body: { mode: "摘要", chapter_id: currentChapterId } });
+    $("notes").value = r.result;                 // 摘要填进备注 → 成为续写/扩写/找回的上下文
+    if ($("notesBar").classList.contains("hidden")) toggleNotes();
+    onNotesInput();
+    $("aiResult").textContent = "已填入备注：\n\n" + r.result;
+  } catch (e) { $("aiResult").textContent = "出错：" + e.message; }
+}
+
+/* ---------- 与 AI 探讨剧情（多轮对话，不污染正文） ---------- */
+
+let chatMsgs = [];
+let chatError = "";
+function openChat() { $("chatOverlay").classList.remove("hidden"); renderChat(); setTimeout(() => $("chatInput").focus(), 50); }
+function closeChat() { $("chatOverlay").classList.add("hidden"); }
+function renderChat() {
+  const el = $("chatMsgs");
+  el.innerHTML = chatMsgs.length ? chatMsgs.map(m =>
+    `<div class="cm ${m.role}">${esc(m.content)}</div>`).join("") :
+    '<div class="empty">和 AI 探讨剧情，不会动你的正文。AI 会读作品设定和本章上下文。</div>';
+  if (chatError) el.innerHTML += `<div class="cm err">${esc(chatError)}</div>`;
+  el.scrollTop = el.scrollHeight;
+}
+async function sendChat() {
+  const text = $("chatInput").value.trim();
+  if (!text) return;
+  $("chatInput").value = "";
+  chatError = "";
+  chatMsgs.push({ role: "user", content: text });
+  renderChat();
+  try {
+    const r = await api("/api/chat", { body: { messages: chatMsgs, chapter_id: currentChapterId } });
+    chatMsgs.push({ role: "assistant", content: r.reply });
+    renderChat();
+  } catch (e) { chatError = "出错：" + e.message; renderChat(); }
+}
+function clearChat() { chatMsgs = []; chatError = ""; renderChat(); }
+
 /* ---------- 阅读视图 ---------- */
 
 let readerFontPx = +localStorage.getItem("rFont") || 19;

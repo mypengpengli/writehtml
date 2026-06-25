@@ -52,6 +52,8 @@
         </select>
         <button class="ic" onclick="saveRevision()" title="存为版本">🗂存版</button>
         <button class="ic" onclick="showRevisions()" title="历史版本">🕘历史</button>
+        <button class="ic" onclick="openAITools()" title="AI 写作工具（校验/摘要）">✦AI</button>
+        <button class="ic" onclick="openChat()" title="和 AI 探讨剧情">💬</button>
         <button class="ic" onclick="toggleFocus()" title="专注">⊚</button>
         <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
         <button class="ic" onclick="openSettings()" title="大模型设置">⚙</button>
@@ -153,6 +155,35 @@
           <button class="ic" onclick="closeWorkNotes()">取消</button>
         </div>
         <p id="wnMsg" class="msg"></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI 写作工具（校验/摘要，不污染正文） -->
+  <div id="aiOverlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-head"><span>AI 写作工具</span><button class="ic" onclick="closeAITools()">✕</button></div>
+      <div class="set-form">
+        <p class="set-hint">基于作品设定 + 本章正文。校验只列问题不改字；摘要会填进备注，成为后续 AI 上下文。</p>
+        <div class="set-actions">
+          <button onclick="aiCheck()">一致性校验</button>
+          <button onclick="aiSynopsis()">生成本章摘要</button>
+        </div>
+        <pre id="aiResult" class="ai-result"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- 与 AI 探讨剧情（不污染正文） -->
+  <div id="chatOverlay" class="overlay hidden">
+    <div class="overlay-card chat-card">
+      <div class="overlay-head"><span>与 AI 探讨剧情</span><button class="ic" onclick="closeChat()">✕</button></div>
+      <div id="chatMsgs" class="chat-msgs"></div>
+      <div class="chat-input-row">
+        <textarea id="chatInput" rows="2" placeholder="聊剧情走向、逻辑漏洞…（Enter 发送，Shift+Enter 换行）"
+                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
+        <button onclick="sendChat()">发送</button>
+        <button class="ic" onclick="clearChat()" title="清空对话">🗑</button>
       </div>
     </div>
   </div>

@@ -342,13 +342,21 @@ async def do_process(request: Request):
         context = (chap["content"] if chap else "") or ""
         text = rev_content
         seg_raw = f"（找回自历史版本 #{rid}）"
+    elif mode in ("校验", "摘要"):
+        # 作用对象是整章正文，不需要用户额外输入；结果不写进正文
+        if not cid:
+            raise HTTPException(400, "请先选择章节")
+        text = (chap["content"] if chap else "") or ""
+        if not text:
+            raise HTTPException(400, "本章为空")
+        seg_raw = f"（{mode}）"
 
     if not text:
         raise HTTPException(400, "内容为空")
 
     if mode == "转写":
         result = text
-    elif mode in ("润色", "扩写", "续写", "找回"):
+    elif mode in ("润色", "扩写", "续写", "找回", "校验", "摘要"):
         s = db.get_settings(uid) or {}
         base_url = s.get("llm_base_url") or config.LLM_BASE_URL
         api_key = s.get("llm_api_key") or config.LLM_API_KEY
@@ -360,8 +368,47 @@ async def do_process(request: Request):
     else:
         raise HTTPException(400, "未知模式")
 
-    seg = db.add_segment(cid, uid, seg_raw, result, mode) if cid else None
+    # 只有这些模式把结果写进正文；校验/摘要不污染正文
+    seg = None
+    if cid and mode in ("转写", "润色", "扩写", "续写", "找回"):
+        seg = db.add_segment(cid, uid, seg_raw, result, mode)
     return {"result": result, "raw": seg_raw, "mode": mode, "content": seg["content"] if seg else None}
+
+
+@app.post("/api/chat")
+async def chat(request: Request):
+    """头脑风暴：多轮对话，不碰正文。带作品设定+本章备注+正文末尾作上下文。"""
+    uid = _auth(request)
+    body = await request.json()
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        raise HTTPException(400, "没有对话内容")
+    s = db.get_settings(uid) or {}
+    base_url = s.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = s.get("llm_api_key") or config.LLM_API_KEY
+    model = s.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
+
+    sys_ctx = [{"role": "system", "content":
+        "你是作者的联合创作者，帮其推敲剧情、查逻辑漏洞、探讨走向。"
+        "回答简洁有建设性，给选项和建议，不要替作者下最终决定。"}]
+    cid = body.get("chapter_id")
+    if cid:
+        chap = db.get_chapter(cid, uid)
+        if chap:
+            bible = db.get_work_notes(chap["work_id"], uid) or ""
+            if bible:
+                sys_ctx.append({"role": "system", "content": "作品设定（人物/世界观/大纲），探讨时请遵循：\n" + bible})
+            notes = chap.get("notes") or ""
+            if notes:
+                sys_ctx.append({"role": "system", "content": "本章备注：\n" + notes})
+            tail = (chap["content"] or "")[-2000:]
+            if tail:
+                sys_ctx.append({"role": "system", "content":
+                    "当前正文末尾（供理解上下文，不要重复或改写）：\n" + tail})
+    reply = llm.chat(sys_ctx + msgs, base_url=base_url, api_key=api_key, model=model)
+    return {"reply": reply}
 
 
 # ---------- 静态前端（放最后，避免盖住 /api） ----------

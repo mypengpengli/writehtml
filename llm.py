@@ -36,7 +36,29 @@ PROMPTS = {
         "当前正文里没有或被删掉的内容，整理成可以补回当前正文的段落。"
         "只输出要补充的段落，不要重复当前正文已有的内容，不要解释、不要标题。"
     ),
+    "摘要": (
+        "你是中文写作助手。用1-3句话概括下面章节的剧情梗概，"
+        "便于作为后续写作的上下文。只输出摘要，不要解释、不要标题。"
+    ),
+    "校验": (
+        "你是中文写作的设定校验员。下面是作者写的正文，请与作品设定、本章备注比对，"
+        "找出矛盾之处：人物性格/身份崩坏、时间线或地点前后不一致、"
+        "人物状态冲突（如已断手却在用该手）、违反设定。"
+        "用要点逐条列出问题并指明大致位置；没有矛盾就只回「未发现矛盾」。"
+        "不要改写正文，只列问题。"
+    ),
 }
+
+
+def chat(messages, *, base_url=None, api_key=None, model=None):
+    """多轮对话（头脑风暴）。messages 已含系统上下文 + 历史，直接发给模型。"""
+    base_url = base_url or config.LLM_BASE_URL
+    api_key = api_key or config.LLM_API_KEY
+    model = model or config.LLM_MODEL
+    resp = _get_client(base_url, api_key).chat.completions.create(
+        model=model, messages=messages, temperature=0.7,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None):
