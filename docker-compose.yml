@@ -3,7 +3,7 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "9123:9123"   # 改端口就改这两个数（左=宿主机，右=容器）
     env_file:
       - .env
     environment:

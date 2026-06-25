@@ -29,7 +29,7 @@ nano .env   # 设 APP_PASSWORD、LLM_BASE_URL、LLM_API_KEY、LLM_MODEL
 
 # 3. 起服务
 docker compose up -d --build
-# 访问 http://服务器IP:8000
+# 访问 http://服务器IP:9123
 ```
 
 **更新**（改完代码 push 后，在服务器上）：

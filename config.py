@@ -18,5 +18,5 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 # SQLite 路径（Docker 里挂到数据卷）
 DB_PATH = os.getenv("DB_PATH", "writehtml.db")
 
-# 服务端口
-PORT = int(os.getenv("PORT", "8000"))
+# 服务端口（选了个基本不用的 9123，可自行改）
+PORT = int(os.getenv("PORT", "9123"))

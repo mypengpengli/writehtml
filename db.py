@@ -126,9 +126,11 @@ def update_chapter(cid, title, content):
             (title, content, now, cid),
         )
         if cid:
-            conn.execute("UPDATE works SET updated_at=? WHERE id=(
-                "SELECT work_id FROM chapters WHERE id=?", (cid,)
-            ), (now,))
+            conn.execute(
+                "UPDATE works SET updated_at=? WHERE id="
+                "(SELECT work_id FROM chapters WHERE id=?)",
+                (now, cid),
+            )
     return get_chapter(cid)
 
 
@@ -157,9 +159,10 @@ def add_segment(chapter_id, raw, result, mode):
         )
         sid = cur.lastrowid
         conn.execute(
-            "UPDATE works SET updated_at=? WHERE id=(
-                "SELECT work_id FROM chapters WHERE id=?", (chapter_id,)
-            ), (now,))
+            "UPDATE works SET updated_at=? WHERE id="
+            "(SELECT work_id FROM chapters WHERE id=?)",
+            (now, chapter_id),
+        )
     return {"segment_id": sid, "content": content}
 
 
