@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>写作</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- 登录 -->
+  <div id="login" class="screen">
+    <h1>✍ 写作</h1>
+    <input id="pwd" type="password" placeholder="密码" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">进入</button>
+    <p id="loginMsg" class="msg"></p>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="app" class="hidden">
+    <header class="topbar">
+      <select id="workSel" onchange="loadChapters()"></select>
+      <select id="chapSel" onchange="loadChapter()"></select>
+      <button class="ic" onclick="newWork()" title="新建作品">＋作品</button>
+      <button class="ic" onclick="newChapter()" title="新建章节">＋章</button>
+      <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
+      <button class="ic" onclick="doLogout()" title="退出">⏻</button>
+    </header>
+
+    <div class="modes">
+      <button class="mode" data-mode="转写" onclick="setMode('转写')">转写</button>
+      <button class="mode" data-mode="润色" onclick="setMode('润色')">润色</button>
+      <button class="mode" data-mode="扩写" onclick="setMode('扩写')">扩写</button>
+      <button class="mode" data-mode="续写" onclick="setMode('续写')">续写</button>
+      <button id="genBtn" class="gen hidden" onclick="generate()">⏎ 生成</button>
+    </div>
+
+    <div class="micbar">
+      <button id="micBtn" class="mic" onclick="toggleMic()">🎤 开始说</button>
+      <span id="micStatus" class="status"></span>
+      <button class="ic" onclick="undo()" title="撤销最近一段">↩撤销</button>
+      <button class="ic" onclick="saveContent()" title="保存正文">💾存</button>
+    </div>
+
+    <div id="draft" class="draft">这里显示你正在说的话…</div>
+
+    <textarea id="content" class="content" placeholder="正文（可手动编辑）"></textarea>
+    <div class="hint">转写/润色：说一句落一句。扩写/续写：口述大意后点「生成」。</div>
+  </div>
+
+  <!-- 阅读视图 -->
+  <div id="reader" class="reader hidden">
+    <div class="reader-top">
+      <button onclick="toggleRead()">✕ 关闭</button>
+      <span id="readerTitle"></span>
+    </div>
+    <article id="readView" class="read-text"></article>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时数据 / 密钥
+writehtml.db
+data/
+.env
+
+# 系统
+.DS_Store
+Thumbs.db

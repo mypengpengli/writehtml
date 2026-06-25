@@ -1,0 +1,145 @@
+:root {
+  --bg: #f6f4ee;
+  --panel: #ffffff;
+  --ink: #2b2b2b;
+  --muted: #8a8178;
+  --accent: #6b8e4e;
+  --line: #e3ddd0;
+  --mic: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1a1a;
+    --panel: #262626;
+    --ink: #e8e6e1;
+    --muted: #8a8a8a;
+    --accent: #8fb96b;
+    --line: #3a3a3a;
+    --mic: #e57373;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.7;
+  -webkit-text-size-adjust: 100%;
+}
+.hidden { display: none !important; }
+
+button {
+  font: inherit;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+button:active { background: var(--line); }
+
+input, textarea, select {
+  font: inherit;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+/* 登录 */
+.screen {
+  max-width: 360px;
+  margin: 18vh auto;
+  text-align: center;
+  padding: 0 16px;
+}
+.screen h1 { margin-bottom: 18px; }
+.screen input { width: 100%; margin-bottom: 12px; }
+.screen button { width: 100%; padding: 10px; }
+.msg { color: var(--mic); font-size: 14px; min-height: 1.2em; }
+
+/* 顶栏 */
+.topbar {
+  position: sticky; top: 0; z-index: 5;
+  display: flex; gap: 6px; align-items: center;
+  padding: 8px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.topbar select { flex: 1; min-width: 0; }
+.ic { padding: 7px 8px; white-space: nowrap; }
+
+/* 模式条 */
+.modes {
+  display: flex; gap: 6px; padding: 8px 10px; flex-wrap: wrap;
+  border-bottom: 1px solid var(--line);
+}
+.mode { flex: 1; min-width: 64px; }
+.mode.active {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+}
+.gen {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+  flex: 1.4;
+}
+
+/* 麦克风条 */
+.micbar {
+  display: flex; gap: 8px; align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.mic {
+  background: var(--mic); color: #fff; border-color: var(--mic);
+  font-weight: 600; padding: 9px 14px;
+}
+.mic.on { background: #555; border-color: #555; }
+.status { color: var(--muted); font-size: 13px; flex: 1; min-width: 0; }
+
+/* 实时口述区 */
+.draft {
+  margin: 10px;
+  padding: 12px;
+  min-height: 48px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px dashed var(--line);
+  color: var(--muted);
+  font-size: 15px;
+}
+.draft.active { color: var(--ink); border-style: solid; }
+
+/* 正文编辑 */
+.content {
+  display: block;
+  width: calc(100% - 20px);
+  margin: 10px;
+  min-height: 50vh;
+  resize: vertical;
+  line-height: 1.9;
+  font-size: 17px;
+  border-radius: 8px;
+}
+.hint { padding: 0 12px 16px; color: var(--muted); font-size: 13px; }
+
+/* 阅读视图 */
+.reader {
+  position: fixed; inset: 0; z-index: 20;
+  background: var(--bg);
+  overflow: auto;
+  padding: 16px;
+}
+.reader-top {
+  display: flex; align-items: center; gap: 12px;
+  padding-bottom: 12px; border-bottom: 1px solid var(--line);
+  margin-bottom: 16px;
+}
+.reader-top span { font-size: 18px; font-weight: 600; }
+.read-text {
+  max-width: 720px; margin: 0 auto;
+  font-size: 19px; line-height: 2;
+}
