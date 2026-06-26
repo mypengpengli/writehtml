@@ -273,6 +273,55 @@ def list_users_admin():
             "SELECT id, username, is_admin, created_at FROM users ORDER BY id")]
 
 
+def admin_user_stats():
+    """每个用户的占用统计：作品数 / 章节数 / 对话数 / 对话存储字节数。
+    分多句聚合而非一次大 JOIN，避免 章节×对话 笛卡尔积把字节数算重。"""
+    with get_conn() as conn:
+        users = [dict(r) for r in conn.execute(
+            "SELECT id, username, is_admin, created_at FROM users ORDER BY id")]
+        wcnt = {r["user_id"]: r["n"] for r in conn.execute(
+            "SELECT user_id, COUNT(*) AS n FROM works GROUP BY user_id")}
+        ccnt = {r["user_id"]: r["n"] for r in conn.execute(
+            "SELECT w.user_id, COUNT(*) AS n FROM chapters c "
+            "JOIN works w ON c.work_id=w.id GROUP BY w.user_id")}
+        conv = {r["user_id"]: (r["n"], r["bytes"]) for r in conn.execute(
+            "SELECT user_id, COUNT(*) AS n, "
+            "COALESCE(SUM(LENGTH(messages)+LENGTH(summary)),0) AS bytes "
+            "FROM agent_conversations GROUP BY user_id")}
+        for u in users:
+            uid = u["id"]
+            c = conv.get(uid, (0, 0))
+            u["works"] = wcnt.get(uid, 0)
+            u["chapters"] = ccnt.get(uid, 0)
+            u["convs"] = c[0]
+            u["conv_bytes"] = c[1]
+        return users
+
+
+def admin_delete_user(user_id):
+    """彻底删除一个用户及其全部数据（作品/章节/段落/版本/实体/对话/设置）。
+    事务内执行；用户不存在返回 False。"""
+    with get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+            return False
+        # 该用户各章节下的段落/版本/对话
+        cids = [r["id"] for r in conn.execute(
+            "SELECT c.id FROM chapters c JOIN works w ON c.work_id=w.id WHERE w.user_id=?",
+            (user_id,))]
+        for cid in cids:
+            conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
+        # 章节以上的作品级数据 + 该用户的无章节对话 + 设置 + 账号本身
+        conn.execute("DELETE FROM chapters WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM works WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM agent_conversations WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM user_settings WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        return True
+
+
 def list_conversations_admin():
     """列出所有用户的对话，带用户名与章节标题（便于 admin 辨识后删除）。"""
     with get_conn() as conn:

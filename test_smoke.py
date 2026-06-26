@@ -316,6 +316,10 @@ _lst = c.get("/api/admin/conversations", headers=H(tokAdm)).json()["conversation
 ok(any(x["user_id"] == uidA and x["chapter_id"] == cid for x in _lst), "admin 列出 alice 的对话")
 _usrs = c.get("/api/admin/users", headers=H(tokAdm)).json()["users"]
 ok(any(u["username"] == "alice" for u in _usrs) and any(u["is_admin"] == 1 for u in _usrs), "admin 列出用户(含管理员标记)")
+# 用户占用统计：作品/章节/对话数/对话字节数
+_alice_u = next(u for u in _usrs if u["username"] == "alice")
+ok(_alice_u["works"] >= 1 and _alice_u["chapters"] >= 2, "admin 用户统计含作品/章节数")
+ok("conv_bytes" in _alice_u and _alice_u["conv_bytes"] > 0, "admin 用户统计含对话字节数(>0)")
 # admin 删除单条对话（用 cid2 上临时落的一条，不动 cid 那条留作级联验证）
 _put_conv(tokA, cid2)
 _one = next(x for x in c.get("/api/admin/conversations", headers=H(tokAdm)).json()["conversations"]
@@ -328,6 +332,21 @@ uidB = db.verify_user("bob", "pw1234")["id"]
 _put_conv(tokB, None)
 ok(c.delete(f"/api/admin/users/{uidB}/conversations", headers=H(tokAdm)).json()["deleted"] >= 1, "admin 清空指定用户对话")
 ok(db.get_conversation(uidB, None) is None, "admin 清空后该用户对话为空")
+# admin 删除用户账号 + 级联（carol 此前已不再使用）
+uidC = db.verify_user("carol", "pw1234")["id"]
+ok(c.delete(f"/api/admin/users/{uidC}", headers=H(tokAdm)).status_code == 200, "admin 删除用户 carol")
+ok(db.verify_user("carol", "pw1234") is None, "删用户后 carol 账号已不存在")
+with db.get_conn() as _conn:
+    _cworks = _conn.execute("SELECT COUNT(*) FROM works WHERE user_id=?", (uidC,)).fetchone()[0]
+    _cchap = _conn.execute("SELECT COUNT(*) FROM chapters WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (uidC,)).fetchone()[0]
+ok(_cworks == 0 and _cchap == 0, "删用户级联清空其作品/章节")
+ok(db.get_conversation(uidC, ccid) is None, "删用户级联清空其对话")
+_usrs2 = c.get("/api/admin/users", headers=H(tokAdm)).json()["users"]
+ok(not any(u["username"] == "carol" for u in _usrs2), "删用户后用户列表不再含 carol")
+# 防误删：不能删自己 / 不能删管理员 / 删不存在用户 404
+uidAdm = db.verify_user("admin", "admintest")["id"]
+ok(c.delete(f"/api/admin/users/{uidAdm}", headers=H(tokAdm)).status_code == 400, "管理员不能删自己(400)")
+ok(c.delete("/api/admin/users/99999", headers=H(tokAdm)).status_code == 404, "删不存在用户 404")
 
 # 删除
 ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")

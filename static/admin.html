@@ -93,20 +93,30 @@
       }
     }
 
-    function convCountFor(uid) { return CONVS.filter(x => x.user_id === uid).length; }
+    function fmtBytes(n) {
+      n = n || 0;
+      if (n < 1024) return n + " B";
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+      return (n / 1024 / 1024).toFixed(1) + " MB";
+    }
+    function userName(uid) { const u = USERS.find(x => x.id === uid); return u ? u.username : ("#" + uid); }
 
     function renderUsers() {
       const box = document.getElementById("usersBox");
       if (!USERS.length) { box.innerHTML = '<div class="empty">暂无用户</div>'; return; }
       box.innerHTML = `<table class="adm-tbl"><thead><tr>
-        <th>ID</th><th>用户名</th><th>角色</th><th>对话数</th><th>注册时间</th><th class="hide-sm">操作</th>
+        <th>ID</th><th>用户名</th><th>角色</th><th class="hide-sm">作品</th><th class="hide-sm">章节</th><th>对话数</th><th>对话占用</th><th class="hide-sm">注册时间</th><th>操作</th>
       </tr></thead><tbody>` + USERS.map(u => {
-        const n = convCountFor(u.id);
+        const acts = [];
+        if (u.convs) acts.push(`<button class="del-btn" onclick="clearUser(${u.id})">清空对话</button>`);
+        if (!u.is_admin) acts.push(`<button class="del-btn" onclick="delUser(${u.id})">删除账号</button>`);
         return `<tr>
           <td>${u.id}</td><td>${esc(u.username)}</td>
           <td>${u.is_admin ? '<span class="tag adm-tag">管理员</span>' : '<span class="tag">普通</span>'}</td>
-          <td>${n}</td><td class="hide-sm">${fmtTime(u.created_at)}</td>
-          <td class="hide-sm">${n ? `<button class="del-btn" onclick="clearUser(${u.id}, '${esc(u.username)}')">清空该用户对话</button>` : '<span class="muted">—</span>'}</td>
+          <td class="hide-sm">${u.works || 0}</td><td class="hide-sm">${u.chapters || 0}</td>
+          <td>${u.convs || 0}</td><td>${fmtBytes(u.conv_bytes)}</td>
+          <td class="hide-sm">${fmtTime(u.created_at)}</td>
+          <td>${acts.length ? acts.join(" ") : '<span class="muted">—</span>'}</td>
         </tr>`;
       }).join("") + "</tbody></table>";
     }
@@ -135,10 +145,17 @@
       try { await api(`/api/admin/conversations/${id}`, { method: "DELETE" }); showToast("已删除", "ok"); await loadAll(); }
       catch (e) { showToast("删除失败：" + e.message, "err"); }
     }
-    async function clearUser(uid, name) {
+    async function clearUser(uid) {
+      const name = userName(uid);
       if (!confirm(`清空用户「${name}」的全部对话记录？不可恢复。`)) return;
       try { const r = await api(`/api/admin/users/${uid}/conversations`, { method: "DELETE" }); showToast(`已清空 ${r.deleted} 条`, "ok"); await loadAll(); }
       catch (e) { showToast("清空失败：" + e.message, "err"); }
+    }
+    async function delUser(uid) {
+      const name = userName(uid);
+      if (!confirm(`彻底删除用户「${name}」？将一并清除其全部作品/章节/段落/版本/实体/对话/设置，不可恢复。`)) return;
+      try { await api(`/api/admin/users/${uid}`, { method: "DELETE" }); showToast(`已删除用户「${name}」`, "ok"); await loadAll(); }
+      catch (e) { showToast("删除失败：" + e.message, "err"); }
     }
 
     document.getElementById("refreshBtn").onclick = loadAll;

@@ -935,8 +935,9 @@ async def delete_agent_conversation(request: Request):
 
 @app.get("/api/admin/users")
 async def admin_users(request: Request):
+    """用户列表 + 占用统计（作品/章节/对话数/对话字节数），便于管理员清理。"""
     _admin_auth(request)
-    return {"users": db.list_users_admin()}
+    return {"users": db.admin_user_stats()}
 
 
 @app.get("/api/admin/conversations")
@@ -960,6 +961,20 @@ async def admin_clear_user_conversations(request: Request, target_uid: int):
     _admin_auth(request)
     n = db.admin_clear_user_conversations(target_uid)
     return {"ok": True, "deleted": n}
+
+
+@app.delete("/api/admin/users/{target_uid}")
+async def admin_delete_user(request: Request, target_uid: int):
+    """彻底删除一个用户账号及其全部数据。
+    不允许删除管理员账号、不允许管理员删除自己（避免误锁后台）。"""
+    me = _admin_auth(request)
+    if target_uid == me:
+        raise HTTPException(400, "不能删除自己")
+    if db.is_admin(target_uid):
+        raise HTTPException(400, "不能删除管理员账号")
+    if not db.admin_delete_user(target_uid):
+        raise HTTPException(404, "用户不存在")
+    return {"ok": True}
 
 
 # ---------- 静态前端（放最后，避免盖住 /api） ----------
