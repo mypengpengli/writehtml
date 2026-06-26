@@ -45,6 +45,7 @@ const ICONS = {
   sparkles: `<svg ${_W}><path d="M12 3l1.7 4.8L18 9.5l-4.3 1.7L12 16l-1.7-4.8L6 9.5l4.3-1.7z"/><path d="M18.5 14.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg>`,
   settings: `<svg ${_W}><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>`,
   logout:   `<svg ${_W}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>`,
+  shield:   `<svg ${_W}><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
   mic:      `<svg ${_W}><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="22"/></svg>`,
   square:   `<svg ${_W}><rect x="6" y="6" width="12" height="12" rx="2"/></svg>`,
   undo:     `<svg ${_W}><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 2.3L3 13"/></svg>`,
@@ -191,6 +192,7 @@ async function init() {
   setupRec();
   const me = await api("/api/me", { method: "GET" });
   $("meName").textContent = me.username ? `${me.username} · 目录` : "目录";
+  if (me.is_admin) $("adminBtn").classList.remove("hidden");
   await loadWorks();
 }
 
@@ -252,8 +254,8 @@ async function loadChapters() {
 async function selectChapter(cid) {
   if (dirty) await saveNow();
   currentChapterId = cid;
-  agentMsgs = []; agentUndone.clear();  // 切章清空 agent 上下文，避免跨章错乱
-  if ($("app").classList.contains("ai-open")) renderAgent();
+  agentUndone.clear();
+  await loadConversation();  // 切章：从服务端拉取该章持久化对话（刷新/切回都不丢）
   await loadChapter();
   renderTree();
   if (window.innerWidth <= 700) $("app").classList.remove("side-open");
@@ -762,8 +764,9 @@ async function sendAgent() {
   busy($("sendBtn"), true, "发送");
   renderAgent();
   try {
-    const r = await api("/api/agent", { body: { messages: agentMsgs, chapter_id: currentChapterId } });
+    const r = await api("/api/agent", { body: { text, chapter_id: currentChapterId } });
     agentMsgs = Array.isArray(r.messages) ? r.messages : agentMsgs;
+    if (r.compacted) showToast("已压缩早期对话，保留最近几轮", "ok");
     // 检测工具是否改动正文/侧栏，决定刷新哪块
     let contentChanged = false, sidebarDirty = false;
     for (const m of agentMsgs) {
@@ -806,7 +809,21 @@ async function undoAgentAction(rid) {
     renderAgent();
   } catch (e) { showToast("撤销失败：" + e.message, "err"); }
 }
-function clearAgent() { agentMsgs = []; agentUndone.clear(); renderAgent(); }
+async function clearAgent() {
+  try {
+    await api(`/api/agent/conversation${currentChapterId != null ? "?chapter_id=" + currentChapterId : ""}`, { method: "DELETE" });
+  } catch (e) { showToast("清空失败：" + e.message, "err"); return; }
+  agentMsgs = []; agentUndone.clear(); renderAgent();
+}
+async function loadConversation() {
+  // 从服务端拉取当前 用户×章节 的持久化对话；刷新或切回都能恢复上下文
+  try {
+    const r = await api(`/api/agent/conversation${currentChapterId != null ? "?chapter_id=" + currentChapterId : ""}`, { method: "GET" });
+    agentMsgs = Array.isArray(r.messages) ? r.messages : [];
+  } catch (e) { agentMsgs = []; }
+  if ($("app").classList.contains("ai-open")) renderAgent();
+}
+function openAdmin() { location.href = "admin.html"; }
 
 /* 语音输入 + 自动朗读（浏览器原生 speechRecognition / speechSynthesis，零配置） */
 

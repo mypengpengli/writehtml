@@ -1,4 +1,5 @@
 """OpenAI 兼容的大模型调用。润色 / 扩写 / 续写 三种模式的提示词。"""
+import json
 from openai import OpenAI
 import config
 
@@ -82,6 +83,51 @@ def agent_chat(messages, tools, *, base_url=None, api_key=None, model=None):
         temperature=0.6,
     )
     return resp.choices[0].message
+
+
+def summarize(messages, prev="", *, base_url=None, api_key=None, model=None):
+    """把多轮对话压成一段摘要（用于 agent 上下文压缩）。
+    失败时抛异常，由调用方兜底（不阻断主流程）。"""
+    base_url = base_url or config.LLM_BASE_URL
+    api_key = api_key or config.LLM_API_KEY
+    model = model or config.LLM_MODEL
+    lines = []
+    for m in messages:
+        role = m.get("role", "")
+        content = m.get("content") or ""
+        if role == "tool":
+            # 工具结果一般是 JSON，取 summary/error 字段更精炼
+            try:
+                r = json.loads(content)
+                content = r.get("summary") or r.get("error") or "已执行操作"
+            except Exception:
+                pass
+            tag = "操作"
+        elif role == "user":
+            tag = "用户"
+        elif role == "assistant":
+            tag = "助手"
+            if m.get("tool_calls"):
+                names = ",".join(tc.get("function", {}).get("name", "") for tc in m["tool_calls"])
+                content = f"调用工具：{names}" + (f"；{content}" if content else "")
+        else:
+            tag = role
+        if content:
+            lines.append(f"{tag}：{content}")
+    transcript = "\n".join(lines)
+    sys = (
+        "你是对话摘要器。把下面的多轮写作助手对话（用户指令、AI 回复、工具操作）"
+        f"压缩成一段不超过 {config.AGENT_SUMMARY_MAX} 字的摘要，"
+        "保留：已执行的关键操作、用户的核心意图与偏好、尚未完成的事项。"
+        "不要编造、不要解释，直接输出摘要正文。"
+    )
+    user_content = (f"已有摘要：\n{prev}\n\n" if prev else "") + f"对话内容：\n{transcript}"
+    resp = _get_client(base_url, api_key).chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_content}],
+        temperature=0.3,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None, style=None):

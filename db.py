@@ -2,6 +2,7 @@
 import sqlite3
 import os
 import time
+import json
 import secrets
 import hashlib
 from contextlib import contextmanager
@@ -96,17 +97,66 @@ def init_db():
                 updated_at REAL,
                 FOREIGN KEY(work_id) REFERENCES works(id)
             );
+            CREATE TABLE IF NOT EXISTS agent_conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                chapter_id INTEGER,      -- NULL 表示未选章节时的通用对话
+                messages TEXT DEFAULT '[]',  -- 非系统对话消息的 JSON 数组
+                summary TEXT DEFAULT '',     -- 已压缩掉的早期对话的滚动摘要
+                msg_count INTEGER DEFAULT 0,
+                created_at REAL,
+                updated_at REAL,
+                UNIQUE(user_id, chapter_id)  -- 一个用户一个章节一行
+            );
             CREATE INDEX IF NOT EXISTS idx_works_user ON works(user_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_chapters_work ON chapters(work_id, ord);
             CREATE INDEX IF NOT EXISTS idx_segments_chapter ON segments(chapter_id);
             CREATE INDEX IF NOT EXISTS idx_revisions_chapter ON chapter_revisions(chapter_id);
             CREATE INDEX IF NOT EXISTS idx_entities_work ON entities(work_id);
+            CREATE INDEX IF NOT EXISTS idx_conv_user ON agent_conversations(user_id, updated_at);
             """
         )
         _add_col(conn, "chapters", "notes", "TEXT DEFAULT ''")
         _add_col(conn, "chapters", "deleted_at", "REAL")  # 软删时间戳；NULL=正常在册
         _add_col(conn, "works", "user_id", "INTEGER DEFAULT 0")
         _add_col(conn, "works", "notes", "TEXT DEFAULT ''")  # 作品设定(人物/世界观/大纲)
+        _add_col(conn, "users", "is_admin", "INTEGER DEFAULT 0")  # 后台管理员标记
+        _bootstrap_admin(conn)
+
+
+def _bootstrap_admin(conn):
+    """首次启动若无任何管理员，按 config.ADMIN_USER 引导创建一个 is_admin=1 账户。
+    密码用 config.ADMIN_PASSWORD；为空则随机生成并打印到日志，请尽快用 env 固定。"""
+    if conn.execute("SELECT 1 FROM users WHERE is_admin=1 LIMIT 1").fetchone():
+        return
+    name = (config.ADMIN_USER or "").strip()
+    if not name:
+        return
+    pwd = config.ADMIN_PASSWORD or ""
+    generated = False
+    if not pwd:
+        pwd = secrets.token_urlsafe(9)
+        generated = True
+    now = time.time()
+    salt = secrets.token_bytes(16)
+    h = _hash_pw(pwd, salt)
+    existing = conn.execute("SELECT id FROM users WHERE username=?", (name,)).fetchone()
+    if existing:
+        # 同名用户已存在（非管理员）：提升为管理员，不改其密码
+        conn.execute("UPDATE users SET is_admin=1 WHERE id=?", (existing["id"],))
+        print(f"[writehtml] 已将已有用户 {name!r} 提升为管理员。", flush=True)
+        return
+    try:
+        conn.execute(
+            "INSERT INTO users(username, salt, hash, is_admin, created_at) VALUES(?,?,?,?,?)",
+            (name, salt.hex(), h, 1, now),
+        )
+    except sqlite3.IntegrityError:
+        return
+    if generated:
+        print(f"[writehtml] 已创建管理员账户 用户名={name!r} 初始密码={pwd!r}（请尽快登录后在 .env 用 WRITEHTML_ADMIN_PASSWORD 固定强密码）", flush=True)
+    else:
+        print(f"[writehtml] 已创建管理员账户 用户名={name!r}（密码来自 WRITEHTML_ADMIN_PASSWORD）", flush=True)
 
 
 # ---------- 用户 / 鉴权 ----------
@@ -145,6 +195,109 @@ def get_username(user_id):
     with get_conn() as conn:
         r = conn.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
         return r["username"] if r else ""
+
+
+def is_admin(user_id):
+    with get_conn() as conn:
+        r = conn.execute("SELECT is_admin FROM users WHERE id=?", (user_id,)).fetchone()
+        return bool(r and r["is_admin"])
+
+
+# ---------- agent 对话持久化（按 用户 × 章节 存一行） ----------
+
+def get_conversation(user_id, chapter_id):
+    with get_conn() as conn:
+        if chapter_id is None:
+            r = conn.execute(
+                "SELECT messages, summary FROM agent_conversations WHERE user_id=? AND chapter_id IS NULL",
+                (user_id,)).fetchone()
+        else:
+            r = conn.execute(
+                "SELECT messages, summary FROM agent_conversations WHERE user_id=? AND chapter_id=?",
+                (user_id, chapter_id)).fetchone()
+        if not r:
+            return None
+        try:
+            msgs = json.loads(r["messages"] or "[]")
+        except Exception:
+            msgs = []
+        if not isinstance(msgs, list):
+            msgs = []
+        return {"messages": msgs, "summary": r["summary"] or ""}
+
+
+def save_conversation(user_id, chapter_id, messages, summary):
+    """upsert 一条对话。chapter_id 为 None 时走应用层查重（SQLite NULL 不唯一）。"""
+    now = time.time()
+    msgs_json = json.dumps(messages, ensure_ascii=False)
+    cnt = len(messages)
+    with get_conn() as conn:
+        if chapter_id is None:
+            row = conn.execute(
+                "SELECT id FROM agent_conversations WHERE user_id=? AND chapter_id IS NULL",
+                (user_id,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM agent_conversations WHERE user_id=? AND chapter_id=?",
+                (user_id, chapter_id)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE agent_conversations SET messages=?, summary=?, msg_count=?, updated_at=? WHERE id=?",
+                (msgs_json, summary, cnt, now, row["id"]))
+        else:
+            conn.execute(
+                "INSERT INTO agent_conversations(user_id, chapter_id, messages, summary, msg_count, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (user_id, chapter_id, msgs_json, summary, cnt, now, now))
+        return True
+
+
+def delete_conversation(user_id, chapter_id):
+    with get_conn() as conn:
+        if chapter_id is None:
+            cur = conn.execute(
+                "DELETE FROM agent_conversations WHERE user_id=? AND chapter_id IS NULL",
+                (user_id,))
+        else:
+            cur = conn.execute(
+                "DELETE FROM agent_conversations WHERE user_id=? AND chapter_id=?",
+                (user_id, chapter_id))
+        return cur.rowcount > 0
+
+
+# ---------- 后台管理（admin）查询 ----------
+
+def list_users_admin():
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, username, is_admin, created_at FROM users ORDER BY id")]
+
+
+def list_conversations_admin():
+    """列出所有用户的对话，带用户名与章节标题（便于 admin 辨识后删除）。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT ac.id, ac.user_id, u.username, ac.chapter_id, "
+            "c.title AS chapter_title, ac.msg_count, "
+            "CASE WHEN ac.summary!='' THEN 1 ELSE 0 END AS has_summary, "
+            "ac.created_at, ac.updated_at "
+            "FROM agent_conversations ac "
+            "LEFT JOIN users u ON u.id=ac.user_id "
+            "LEFT JOIN chapters c ON c.id=ac.chapter_id "
+            "ORDER BY ac.updated_at DESC")
+        return [dict(r) for r in rows]
+
+
+def admin_delete_conversation(conv_id):
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM agent_conversations WHERE id=?", (conv_id,))
+        return cur.rowcount > 0
+
+
+def admin_clear_user_conversations(user_id):
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM agent_conversations WHERE user_id=?", (user_id,))
+        return cur.rowcount
 
 
 # ---------- 每个用户自己的大模型设置 ----------
@@ -224,6 +377,7 @@ def delete_work(wid, user_id):
         for cid in cids:
             conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM works WHERE id=?", (wid,))
@@ -467,6 +621,7 @@ def purge_chapter(cid, user_id):
             return False
         conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE id=?", (cid,))
         return True
 

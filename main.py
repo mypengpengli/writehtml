@@ -25,6 +25,20 @@ def _auth(request: Request):
     return uid
 
 
+def _admin_auth(request: Request):
+    """鉴权 + 管理员校验。非管理员 403。"""
+    uid = _auth(request)
+    if not db.is_admin(uid):
+        raise HTTPException(403, "需要管理员权限")
+    return uid
+
+
+def _qparam_int(request: Request, name):
+    """从 query string 取一个可选整数，缺省/空返回 None。"""
+    v = request.query_params.get(name)
+    return int(v) if v else None
+
+
 # ---------- 鉴权 / 注册 ----------
 
 @app.get("/api/signup-status")
@@ -74,7 +88,7 @@ async def logout(request: Request):
 @app.get("/api/me")
 async def me(request: Request):
     uid = _auth(request)
-    return {"username": db.get_username(uid)}
+    return {"username": db.get_username(uid), "is_admin": db.is_admin(uid)}
 
 
 # ---------- 每用户大模型设置 ----------
@@ -592,6 +606,20 @@ def _agent_bible(wid, uid):
     return bible
 
 
+def _compact_split(msgs, preserve):
+    """计算可压缩前缀的起点索引：保留最近 preserve 条，且 recent 从一条 user
+    消息开始（确保不切断 assistant(tool_calls)→tool 的工具对，避免悬空 tool_call_id）。
+    返回 0 表示无可压缩前缀。"""
+    n = len(msgs)
+    if n <= preserve:
+        return 0
+    keep_from = n - preserve
+    # 前移到首个 role=='user' 的边界
+    while keep_from < n and msgs[keep_from].get("role") != "user":
+        keep_from += 1
+    return keep_from if keep_from < n else 0
+
+
 def _agent_system(uid, cid):
     parts = [
         "你是作者的写作 agent。你可以通过工具直接操作作者的作品：改正文、续写、"
@@ -805,12 +833,13 @@ _AGENT_TOOLS = {
 @app.post("/api/agent")
 async def agent(request: Request):
     """AI agent：对话即操作。模型经 function calling 调工具改稿/回退/加章，
-    每个写操作前自动存版本快照，返回 undo_rid 供前端撤销。"""
+    每个写操作前自动存版本快照，返回 undo_rid 供前端撤销。
+    服务端按 用户×章节 持久化对话；超长时把早期轮次 LLM 摘要压缩，保留最近几轮。"""
     uid = _auth(request)
     body = await request.json()
-    msgs = body.get("messages")
+    text = (body.get("text") or "").strip()
     cid = body.get("chapter_id")
-    if not isinstance(msgs, list) or not msgs:
+    if not text:
         raise HTTPException(400, "没有对话内容")
     st = db.get_settings(uid) or {}
     base_url = st.get("llm_base_url") or config.LLM_BASE_URL
@@ -820,7 +849,18 @@ async def agent(request: Request):
         raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
     cfg = {"base_url": base_url, "api_key": api_key, "model": model}
 
-    messages = [_agent_system(uid, cid)] + list(msgs)
+    # 加载持久化对话（服务端权威），追加本轮用户消息
+    conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
+    msgs = list(conv["messages"])
+    summary = conv["summary"] or ""
+    msgs.append({"role": "user", "content": text})
+
+    # 发给模型的数组：系统提示 + 早期摘要(若有) + 当前对话
+    messages = [_agent_system(uid, cid)]
+    if summary:
+        messages.append({"role": "user", "content": "[此前对话摘要]\n" + summary})
+    messages.extend(msgs)
+
     reply = ""
     for _ in range(6):
         msg = llm.agent_chat(messages, AGENT_TOOLS, base_url=base_url, api_key=api_key, model=model)
@@ -832,6 +872,7 @@ async def agent(request: Request):
                 for tc in msg.tool_calls
             ]
         messages.append(m)
+        msgs.append(m)  # 同步写入持久化用的非系统消息列表
         if not msg.tool_calls:
             reply = (msg.content or "").strip()
             break
@@ -846,13 +887,79 @@ async def agent(request: Request):
                 result = fn(uid, cid, cfg, args) if fn else {"error": f"未知工具 {name}"}
             except Exception as e:
                 result = {"error": f"工具执行出错：{e}"}
-            messages.append({"role": "tool", "tool_call_id": tc.id,
-                             "content": json.dumps(result, ensure_ascii=False)})
+            tm = {"role": "tool", "tool_call_id": tc.id,
+                  "content": json.dumps(result, ensure_ascii=False)}
+            messages.append(tm)
+            msgs.append(tm)
     else:
         reply = "操作较多，已暂停。已执行的动作见对话记录，可逐条撤销。"
 
-    out = [m for m in messages if m.get("role") != "system"]
-    return {"reply": reply, "messages": out}
+    # 超长压缩：把早期轮次交给 LLM 压成摘要，保留最近几轮（切在 user 边界，不切断工具对）
+    compacted = False
+    keep_from = _compact_split(msgs, config.AGENT_PRESERVE_RECENT)
+    if keep_from > 0:
+        total = sum(len(m.get("content") or "") for m in msgs)
+        if total > config.AGENT_COMPACT_CHARS:
+            try:
+                summary = llm.summarize(msgs[:keep_from], prev=summary,
+                                        base_url=base_url, api_key=api_key, model=model)
+                msgs = msgs[keep_from:]
+                compacted = True
+            except Exception:
+                # 摘要失败则保留原样，不阻断本轮
+                pass
+
+    db.save_conversation(uid, cid, msgs, summary)
+    return {"reply": reply, "messages": msgs, "compacted": compacted}
+
+
+@app.get("/api/agent/conversation")
+async def get_agent_conversation(request: Request):
+    """取当前 用户×章节 的持久化对话（切章/刷新后恢复上下文用）。"""
+    uid = _auth(request)
+    cid = _qparam_int(request, "chapter_id")
+    conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
+    return conv
+
+
+@app.delete("/api/agent/conversation")
+async def delete_agent_conversation(request: Request):
+    """清空当前 用户×章节 的持久化对话（前端「清空」按钮用）。"""
+    uid = _auth(request)
+    cid = _qparam_int(request, "chapter_id")
+    db.delete_conversation(uid, cid)
+    return {"ok": True}
+
+
+# ---------- 后台管理（admin） ----------
+
+@app.get("/api/admin/users")
+async def admin_users(request: Request):
+    _admin_auth(request)
+    return {"users": db.list_users_admin()}
+
+
+@app.get("/api/admin/conversations")
+async def admin_conversations(request: Request):
+    """列出所有用户的对话（带用户名/章节标题），供管理员辨识后删除。"""
+    _admin_auth(request)
+    return {"conversations": db.list_conversations_admin()}
+
+
+@app.delete("/api/admin/conversations/{conv_id}")
+async def admin_delete_conversation(request: Request, conv_id: int):
+    _admin_auth(request)
+    if not db.admin_delete_conversation(conv_id):
+        raise HTTPException(404, "对话不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{target_uid}/conversations")
+async def admin_clear_user_conversations(request: Request, target_uid: int):
+    """清空指定用户的全部对话。"""
+    _admin_auth(request)
+    n = db.admin_clear_user_conversations(target_uid)
+    return {"ok": True, "deleted": n}
 
 
 # ---------- 静态前端（放最后，避免盖住 /api） ----------

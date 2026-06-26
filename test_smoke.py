@@ -7,9 +7,10 @@ os.makedirs(_TMP, exist_ok=True)
 os.environ["DB_PATH"] = os.path.join(_TMP, "test.db")
 os.environ["SIGNUP_CODE"] = "testcode"   # 开放凭码注册
 os.environ["LLM_API_KEY"] = ""           # 测试不调真 LLM；校验/摘要/聊天应走"未配置"500
+os.environ["WRITEHTML_ADMIN_PASSWORD"] = "admintest"  # 引导创建的 admin 用确定性密码
 
 from fastapi.testclient import TestClient
-import main, db, llm
+import main, db, llm, config
 
 db.init_db()
 c = TestClient(main.app)
@@ -221,10 +222,19 @@ def _make_agent(stub):
         return stub[min(i, len(stub) - 1)]
     return fake
 
+def _put_conv(tok, chapter_id, text="hi"):
+    """用假 agent_chat 给某 用户×章节 落一条对话（无工具调用），便于后续测试。"""
+    _saved = llm.agent_chat
+    llm.agent_chat = lambda messages, tools, **kw: _msg("ok")
+    try:
+        c.post("/api/agent", json={"text": text, "chapter_id": chapter_id}, headers=H(tok))
+    finally:
+        llm.agent_chat = _saved
+
 # 入参校验 / 鉴权（carol 无 key，不触达 LLM）
-ok(c.post("/api/agent", json={"messages": [{"role": "user", "content": "hi"}], "chapter_id": ccid}, headers=H(tokC)).status_code == 500, "agent 无key 500")
-ok(c.post("/api/agent", json={"messages": []}, headers=H(tokA)).status_code == 400, "agent 空消息 400")
-ok(c.post("/api/agent", json={"messages": [{"role": "user", "content": "hi"}]}).status_code == 401, "agent 未登录 401")
+ok(c.post("/api/agent", json={"text": "hi", "chapter_id": ccid}, headers=H(tokC)).status_code == 500, "agent 无key 500")
+ok(c.post("/api/agent", json={"text": ""}, headers=H(tokA)).status_code == 400, "agent 空文本 400")
+ok(c.post("/api/agent", json={"text": "hi"}).status_code == 401, "agent 未登录 401")
 
 # replace_text 工具：cid 正文 "你好" → "你好呀"，并验证可撤销
 _orig_ac = llm.agent_chat
@@ -232,7 +242,7 @@ llm.agent_chat = _make_agent([
     _msg(None, [("c1", "replace_text", json.dumps({"old_text": "你好", "new_text": "你好呀"}))]),
     _msg("已改好。"),
 ])
-ag = c.post("/api/agent", json={"messages": [{"role": "user", "content": "把你好改成你好呀"}], "chapter_id": cid}, headers=H(tokA)).json()
+ag = c.post("/api/agent", json={"text": "把你好改成你好呀", "chapter_id": cid}, headers=H(tokA)).json()
 _tr = [m for m in ag["messages"] if m.get("role") == "tool"]
 ok(len(_tr) == 1 and json.loads(_tr[0]["content"]).get("changed") is True, "agent replace_text 执行")
 _undo = json.loads(_tr[0]["content"]).get("undo_rid")
@@ -240,15 +250,84 @@ ok(isinstance(_undo, int), "agent 返回 undo_rid")
 ok(c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["content"] == "你好呀", "agent 改后正文=你好呀")
 ok(c.post(f"/api/chapters/{cid}/revisions/{_undo}/restore", headers=H(tokA)).json()["content"] == "你好", "agent 动作可撤销(恢复快照)")
 
+# 持久化：服务端存了本轮对话，切回能取回；他人只看得到自己的空
+_conv = c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()
+ok(any(m.get("role") == "user" and "把你好改成" in m.get("content", "") for m in _conv["messages"]), "对话已持久化(可取回)")
+ok(len(c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokB)).json()["messages"]) == 0, "他人章对话隔离(只看得到自己的空)")
+ok(c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).status_code == 200, "清空对话 200")
+ok(len(c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()["messages"]) == 0, "清空后对话为空")
+
 # list_revisions 工具（只读，验证分派 + JSON 往返）
 llm.agent_chat = _make_agent([
     _msg(None, [("c2", "list_revisions", "{}")]),
     _msg("已列出。"),
 ])
-ag2 = c.post("/api/agent", json={"messages": [{"role": "user", "content": "列出版本"}], "chapter_id": cid}, headers=H(tokA)).json()
+ag2 = c.post("/api/agent", json={"text": "列出版本", "chapter_id": cid}, headers=H(tokA)).json()
 _tr2 = [m for m in ag2["messages"] if m.get("role") == "tool"]
 ok(len(_tr2) == 1 and isinstance(json.loads(_tr2[0]["content"]).get("revisions"), list), "agent list_revisions 返回版本数组")
+c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA))  # 清空，避免影响后续
+
+# 上下文压缩：调低阈值 + 假 summarize，验证早期轮次被摘要、保留最近几轮
+_orig_sum = llm.summarize
+_orig_cc = config.AGENT_COMPACT_CHARS
+_orig_pr = config.AGENT_PRESERVE_RECENT
+llm.agent_chat = lambda messages, tools, **kw: _msg("回复")
+llm.summarize = lambda messages, prev="", **kw: "摘要内容"
+config.AGENT_COMPACT_CHARS = 5
+config.AGENT_PRESERVE_RECENT = 2
+c.post("/api/agent", json={"text": "第一轮", "chapter_id": cid}, headers=H(tokA))   # 2 条，不压
+r3 = c.post("/api/agent", json={"text": "第二轮", "chapter_id": cid}, headers=H(tokA)).json()  # 4 条，触发压缩
+ok(r3.get("compacted") is True, "agent 超长触发压缩")
+_convc = c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()
+ok(_convc["summary"] == "摘要内容", "压缩后摘要已存")
+ok(len(_convc["messages"]) <= 2, "压缩后只保留最近几轮")
+llm.summarize = _orig_sum
+config.AGENT_COMPACT_CHARS = _orig_cc
+config.AGENT_PRESERVE_RECENT = _orig_pr
 llm.agent_chat = _orig_ac
+# cid 此刻留有一条压缩后的对话，供后面删作品级联清理验证
+
+# _compact_split 纯函数：保留最近 N、切在 user 边界、不切断工具对
+_m = [
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "u3"}, {"role": "assistant", "content": "a3"},
+]
+ok(main._compact_split(_m, 10) == 0, "compact 短于 preserve→不切")
+ok(main._compact_split(_m, 2) == 4 and _m[4]["role"] == "user", "compact 切在 user 边界")
+ok(main._compact_split(_m, 3) == 4, "compact 非user起点→前移到user")
+_m2 = [
+    {"role": "user", "content": "u1"}, {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+    {"role": "tool", "tool_call_id": "c1", "content": "{}"}, {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"},
+]
+_kf = main._compact_split(_m2, 2)
+ok(_m2[_kf]["role"] == "user", "compact 不切断 assistant→tool 工具对")
+
+# 后台管理：admin 引导已建；admin 可列/删对话；非 admin 403
+with db.get_conn() as _conn:
+    _adm = _conn.execute("SELECT username FROM users WHERE is_admin=1").fetchone()
+ok(_adm and _adm["username"] == "admin", "引导创建了 admin 账户")
+tokAdm = c.post("/api/login", json={"username": "admin", "password": "admintest"}).json()["token"]
+ok(c.get("/api/me", headers=H(tokAdm)).json()["is_admin"] is True, "admin 登录 + is_admin")
+ok(c.get("/api/admin/conversations", headers=H(tokA)).status_code == 403, "普通用户访问 admin 403")
+ok(c.get("/api/admin/conversations").status_code == 401, "未登录访问 admin 401")
+_lst = c.get("/api/admin/conversations", headers=H(tokAdm)).json()["conversations"]
+ok(any(x["user_id"] == uidA and x["chapter_id"] == cid for x in _lst), "admin 列出 alice 的对话")
+_usrs = c.get("/api/admin/users", headers=H(tokAdm)).json()["users"]
+ok(any(u["username"] == "alice" for u in _usrs) and any(u["is_admin"] == 1 for u in _usrs), "admin 列出用户(含管理员标记)")
+# admin 删除单条对话（用 cid2 上临时落的一条，不动 cid 那条留作级联验证）
+_put_conv(tokA, cid2)
+_one = next(x for x in c.get("/api/admin/conversations", headers=H(tokAdm)).json()["conversations"]
+           if x["user_id"] == uidA and x["chapter_id"] == cid2)
+ok(c.delete(f"/api/admin/conversations/{_one['id']}", headers=H(tokAdm)).status_code == 200, "admin 删除单条对话")
+ok(c.delete(f"/api/admin/conversations/{_one['id']}", headers=H(tokAdm)).status_code == 404, "admin 重复删除 404")
+ok(len(c.get(f"/api/agent/conversation?chapter_id={cid2}", headers=H(tokA)).json()["messages"]) == 0, "admin 删除后该章对话为空")
+# admin 清空指定用户全部对话（用 bob 在「无章节」上落的一条，不动 alice）
+uidB = db.verify_user("bob", "pw1234")["id"]
+_put_conv(tokB, None)
+ok(c.delete(f"/api/admin/users/{uidB}/conversations", headers=H(tokAdm)).json()["deleted"] >= 1, "admin 清空指定用户对话")
+ok(db.get_conversation(uidB, None) is None, "admin 清空后该用户对话为空")
 
 # 删除
 ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")
@@ -257,6 +336,8 @@ ok(c.delete(f"/api/works/{wid}", headers=H(tokA)).status_code == 200, "删作品
 with db.get_conn() as conn:
     _nent = conn.execute("SELECT COUNT(*) FROM entities WHERE work_id=?", (wid,)).fetchone()[0]
 ok(_nent == 0, "删作品级联清空实体")
+# 同样应级联清掉该作品各章节的 agent 对话（cid 上留有一条压缩后的对话）
+ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 
 # 首页
 ok(c.get("/").status_code == 200, "首页可访问")
