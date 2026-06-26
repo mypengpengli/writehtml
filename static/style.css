@@ -88,7 +88,8 @@ html.font-serif .read-text {
 .msg { color: var(--danger); font-size: 14px; min-height: 1.2em; }
 
 /* 主布局 */
-#app { display: flex; height: 100vh; overflow: hidden; }
+#app { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
+.side-backdrop { display: none; } /* 移动端侧栏抽屉的遮罩，仅 side-open 时显示 */
 
 .sidebar {
   width: 248px; flex-shrink: 0; background: var(--side-bg);
@@ -167,6 +168,7 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
   padding: 8px 10px; border: none; background: transparent; text-align: left; opacity: 1; }
 .menu button:hover { background: var(--side-bg); }
 .menu button svg { width: 18px; height: 18px; }
+.m-item { display: none; } /* 顶栏折叠项：仅移动端在「⋯」菜单里显示 */
 
 .modes { display: flex; gap: 6px; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); }
 .mode { flex: 1; min-width: 60px; }
@@ -205,10 +207,10 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 #app.focus .content { font-size: 21px; }
 #app.focus .main { background: var(--bg); }
 
-/* 移动端：侧栏变抽屉 */
+/* 移动端：侧栏变抽屉 + 顶栏降噪折叠 */
 @media (max-width: 700px) {
   .sidebar {
-    position: fixed; z-index: 30; height: 100%;
+    position: fixed; z-index: 30; height: 100dvh;
     transform: translateX(-100%); transition: transform .2s; box-shadow: var(--shadow);
   }
   #app.side-open .sidebar { transform: none; }
@@ -216,9 +218,11 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
   .c-del { opacity: .5; }
   .topbar { gap: 4px; padding: 7px 8px; }
   .title-input { min-width: 60px; }
-  /* AI 助手侧栏变右抽屉 */
+  .topbar .t-sec { display: none; }              /* 顶栏次要按钮收到「⋯」菜单 */
+  .menu .m-item { display: flex; }               /* 菜单里显示折叠项 */
+  /* AI 助手侧栏变右抽屉；高度跟随可视视口，键盘弹出时不挡输入框 */
   .ai-side {
-    position: fixed; z-index: 35; top: 0; right: 0; bottom: 0; width: 88vw; max-width: 360px;
+    position: fixed; z-index: 35; top: 0; right: 0; height: var(--vp-h, 100dvh); width: 88vw; max-width: 360px;
     transform: translateX(100%); transition: transform .2s; box-shadow: var(--shadow);
   }
   #app.ai-open .ai-side { transform: none; }
@@ -272,7 +276,6 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .chat-msgs .cm.action .done-tag { font-size: 13px; color: var(--muted); }
 .chat-msgs .cm.action.done { opacity: .55; }
 .ai-backdrop { display: none; }
-.side-backdrop { display: none; }
 .ai-head-tools { display: flex; gap: 4px; }
 #agentMicBtn.on { background: var(--mic); color: #fff; border-color: var(--mic); opacity: 1; animation: rec-pulse 1.4s ease-in-out infinite; }
 #aiTtsBtn.on { color: var(--accent-text); opacity: 1; }

@@ -61,6 +61,7 @@ const ICONS = {
   plus:     `<svg ${_W}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
   enter:    `<svg ${_W}><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>`,
   feather:  `<svg ${_W}><path d="M20.2 12.2a6 6 0 0 0-8.5-8.5L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/></svg>`,
+  type:     `<svg ${_W}><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><path d="M12 4v16"/></svg>`,
   grip:     `<svg ${_W}><circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none"/></svg>`,
 };
 function svg(n) { return ICONS[n] || ""; }
@@ -1117,6 +1118,13 @@ document.addEventListener("click", (e) => {
 
 (async function start() {
   applyIcons();
+  // 移动端键盘适配：跟随可视视口高度，避免输入框被键盘遮挡
+  if (window.visualViewport) {
+    const onVp = () => document.documentElement.style.setProperty("--vp-h", window.visualViewport.height + "px");
+    window.visualViewport.addEventListener("resize", onVp);
+    window.visualViewport.addEventListener("scroll", onVp);
+    onVp();
+  }
   applyTheme(localStorage.getItem("theme"));
   applyFont(localStorage.getItem("fontSerif") === "1");
   if (localStorage.getItem("aiOpen") === "1") $("app").classList.add("ai-open");

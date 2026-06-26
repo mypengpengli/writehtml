@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -36,6 +36,7 @@
       </div>
       <div id="workTree" class="tree"></div>
     </aside>
+    <div class="side-backdrop" onclick="toggleSidebar()"></div>
 
     <main class="main">
       <header class="topbar">
@@ -50,14 +51,19 @@
           <option value="work-txt">整本TXT</option>
           <option value="work-docx">整本DOCX</option>
         </select>
-        <button class="ic" id="themeBtn" data-ic="moon" onclick="toggleTheme()" title="明暗主题"></button>
-        <button class="ic" id="fontBtn" onclick="toggleFont()" title="衬线/无衬线字体">文</button>
-        <button class="ic" data-ic="focus" onclick="toggleFocus()" title="专注"></button>
-        <button class="ic" data-ic="book" onclick="toggleRead()" title="阅读"></button>
-        <button class="ic" id="aiToggleBtn" data-ic="bot" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
+        <button class="ic t-sec" id="themeBtn" data-ic="moon" onclick="toggleTheme()" title="明暗主题"></button>
+        <button class="ic t-sec" id="fontBtn" onclick="toggleFont()" title="衬线/无衬线字体">文</button>
+        <button class="ic t-sec" data-ic="focus" onclick="toggleFocus()" title="专注"></button>
+        <button class="ic t-sec" data-ic="book" onclick="toggleRead()" title="阅读"></button>
+        <button class="ic t-sec" id="aiToggleBtn" data-ic="bot" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
         <div class="menu-wrap">
           <button class="ic" data-ic="more" onclick="toggleMoreMenu(event)" title="更多"></button>
           <div id="moreMenu" class="menu hidden">
+            <button class="m-item" data-ic="moon" data-label="主题" onclick="toggleTheme();closeMoreMenu()"></button>
+            <button class="m-item" data-ic="type" data-label="字体" onclick="toggleFont();closeMoreMenu()"></button>
+            <button class="m-item" data-ic="focus" data-label="专注" onclick="toggleFocus();closeMoreMenu()"></button>
+            <button class="m-item" data-ic="book" data-label="阅读" onclick="toggleRead();closeMoreMenu()"></button>
+            <button class="m-item" data-ic="bot" data-label="AI 助手" onclick="toggleAISide();closeMoreMenu()"></button>
             <button data-ic="bookmark" data-label="存为版本" onclick="saveRevision();closeMoreMenu()"></button>
             <button data-ic="clock" data-label="历史版本" onclick="showRevisions();closeMoreMenu()"></button>
             <button data-ic="trash" data-label="回收站" onclick="openTrash();closeMoreMenu()"></button>
