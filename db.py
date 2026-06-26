@@ -323,12 +323,13 @@ def admin_delete_user(user_id):
 
 
 def list_conversations_admin():
-    """列出所有用户的对话，带用户名与章节标题（便于 admin 辨识后删除）。"""
+    """列出所有用户的对话，带用户名/章节标题/占用字节数（便于 admin 辨识后删除）。"""
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT ac.id, ac.user_id, u.username, ac.chapter_id, "
             "c.title AS chapter_title, ac.msg_count, "
             "CASE WHEN ac.summary!='' THEN 1 ELSE 0 END AS has_summary, "
+            "LENGTH(ac.messages)+LENGTH(ac.summary) AS bytes, "
             "ac.created_at, ac.updated_at "
             "FROM agent_conversations ac "
             "LEFT JOIN users u ON u.id=ac.user_id "

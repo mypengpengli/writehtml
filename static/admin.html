@@ -25,6 +25,9 @@
     .muted { color: var(--muted); }
     .empty { color: var(--muted); padding: 14px 0; text-align: center; }
     .row-right { display: flex; gap: 6px; justify-content: flex-end; }
+    .filter-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0 10px; color: var(--muted); font-size: 13px; }
+    .filter-bar b { color: var(--ink); font-weight: 600; }
+    .del-btn.view { color: var(--accent-text); }
     #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 80; }
     @media (max-width: 640px) { .hide-sm { display: none; } }
   </style>
@@ -43,7 +46,7 @@
     </div>
 
     <div class="adm-card">
-      <h2>对话记录（按更新时间倒序）</h2>
+      <h2>对话记录（按占用倒序，大的在上便于清理）</h2>
       <div id="convBox"><div class="empty">加载中…</div></div>
     </div>
   </div>
@@ -77,7 +80,7 @@
       toastT = setTimeout(() => { el.innerHTML = ""; }, 2400);
     }
 
-    let USERS = [], CONVS = [];
+    let USERS = [], CONVS = [], CONV_FILTER = null;
 
     async function loadAll() {
       try {
@@ -108,7 +111,8 @@
         <th>ID</th><th>用户名</th><th>角色</th><th class="hide-sm">作品</th><th class="hide-sm">章节</th><th>对话数</th><th>对话占用</th><th class="hide-sm">注册时间</th><th>操作</th>
       </tr></thead><tbody>` + USERS.map(u => {
         const acts = [];
-        if (u.convs) acts.push(`<button class="del-btn" onclick="clearUser(${u.id})">清空对话</button>`);
+        if (u.convs) acts.push(`<button class="del-btn view" onclick="viewUserConv(${u.id})">查看对话</button>`,
+                                `<button class="del-btn" onclick="clearUser(${u.id})">清空对话</button>`);
         if (!u.is_admin) acts.push(`<button class="del-btn" onclick="delUser(${u.id})">删除账号</button>`);
         return `<tr>
           <td>${u.id}</td><td>${esc(u.username)}</td>
@@ -123,18 +127,27 @@
 
     function renderConvs() {
       const box = document.getElementById("convBox");
-      if (!CONVS.length) { box.innerHTML = '<div class="empty">暂无对话记录</div>'; return; }
-      box.innerHTML = `<table class="adm-tbl"><thead><tr>
-        <th>用户</th><th>章节</th><th class="hide-sm">消息数</th><th class="hide-sm">摘要</th><th>更新时间</th><th>操作</th>
-      </tr></thead><tbody>` + CONVS.map(c => {
+      const list = CONV_FILTER == null ? CONVS : CONVS.filter(x => x.user_id === CONV_FILTER);
+      let head = "";
+      if (CONV_FILTER != null) {
+        head = `<div class="filter-bar">仅显示 <b>${esc(userName(CONV_FILTER))}</b> 的对话`
+          + ` <button class="del-btn view" onclick="clearConvFilter()">显示全部</button></div>`;
+      }
+      if (!list.length) { box.innerHTML = head + '<div class="empty">暂无对话记录</div>'; return; }
+      // 按占用字节倒序，最大的在最上方便于清理
+      const sorted = list.slice().sort((a, b) => (b.bytes || 0) - (a.bytes || 0));
+      box.innerHTML = head + `<table class="adm-tbl"><thead><tr>
+        <th>用户</th><th>章节</th><th>占用</th><th class="hide-sm">消息数</th><th class="hide-sm">摘要</th><th class="hide-sm">更新时间</th><th>操作</th>
+      </tr></thead><tbody>` + sorted.map(c => {
         const chap = c.chapter_id == null ? '<span class="muted">（无章节）</span>'
           : (c.chapter_title ? esc(c.chapter_title) : '<span class="muted">（已删除）</span>');
         return `<tr>
           <td>${esc(c.username || ("#" + c.user_id))}</td>
           <td>${chap}</td>
+          <td>${fmtBytes(c.bytes)}</td>
           <td class="hide-sm">${c.msg_count || 0}</td>
           <td class="hide-sm">${c.has_summary ? '<span class="tag on">有</span>' : '<span class="muted">无</span>'}</td>
-          <td>${fmtTime(c.updated_at)}</td>
+          <td class="hide-sm">${fmtTime(c.updated_at)}</td>
           <td><button class="del-btn" onclick="delConv(${c.id})">删除</button></td>
         </tr>`;
       }).join("") + "</tbody></table>";
@@ -154,9 +167,15 @@
     async function delUser(uid) {
       const name = userName(uid);
       if (!confirm(`彻底删除用户「${name}」？将一并清除其全部作品/章节/段落/版本/实体/对话/设置，不可恢复。`)) return;
-      try { await api(`/api/admin/users/${uid}`, { method: "DELETE" }); showToast(`已删除用户「${name}」`, "ok"); await loadAll(); }
+      try { await api(`/api/admin/users/${uid}`, { method: "DELETE" }); showToast(`已删除用户「${name}」`, "ok"); if (CONV_FILTER === uid) CONV_FILTER = null; await loadAll(); }
       catch (e) { showToast("删除失败：" + e.message, "err"); }
     }
+    function viewUserConv(uid) {
+      CONV_FILTER = uid;
+      renderConvs();
+      document.getElementById("convBox").scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    function clearConvFilter() { CONV_FILTER = null; renderConvs(); }
 
     document.getElementById("refreshBtn").onclick = loadAll;
     loadAll();
