@@ -96,6 +96,11 @@ def init_db():
                 updated_at REAL,
                 FOREIGN KEY(work_id) REFERENCES works(id)
             );
+            CREATE INDEX IF NOT EXISTS idx_works_user ON works(user_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_chapters_work ON chapters(work_id, ord);
+            CREATE INDEX IF NOT EXISTS idx_segments_chapter ON segments(chapter_id);
+            CREATE INDEX IF NOT EXISTS idx_revisions_chapter ON chapter_revisions(chapter_id);
+            CREATE INDEX IF NOT EXISTS idx_entities_work ON entities(work_id);
             """
         )
         _add_col(conn, "chapters", "notes", "TEXT DEFAULT ''")
@@ -195,7 +200,7 @@ def _chapter_owned(conn, cid, user_id):
 def list_works(user_id):
     with get_conn() as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT * FROM works WHERE user_id=? ORDER BY updated_at DESC", (user_id,)
+            "SELECT id, user_id, title, created_at, updated_at FROM works WHERE user_id=? ORDER BY updated_at DESC", (user_id,)
         )]
 
 

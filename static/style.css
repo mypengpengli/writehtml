@@ -233,6 +233,11 @@ html.font-serif .read-text {
 .chat-msgs .cm.action .done-tag { font-size: 12px; color: var(--muted); }
 .chat-msgs .cm.action.done { opacity: .55; }
 .ai-backdrop { display: none; }
+.ai-head-tools { display: flex; gap: 4px; }
+#agentMicBtn.on { background: var(--mic); color: #fff; border-color: var(--mic); opacity: 1; }
+#aiTtsBtn.on { color: var(--accent); opacity: 1; }
+.set-form .set-row { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; margin-top: 10px; cursor: pointer; }
+.set-form .set-row input { width: auto; }
 
 /* micbar 分隔条 */
 .vbar { width: 1px; align-self: stretch; margin: 4px 2px; background: var(--line); }

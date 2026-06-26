@@ -11,6 +11,10 @@ let mode = "转写";
 // 语音
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, micOn = false, draftBuffer = "";
+// AI 侧栏：语音输入 + 自动朗读（浏览器原生，无需模型 ID）
+let agentRec = null, agentMicOn = false, agentFinalText = "", agentInterim = "", _agentPH = null;
+let voiceAutoSend = localStorage.getItem("voiceAutoSend") !== "0"; // 默认自动发
+let aiTts = localStorage.getItem("aiTts") !== "0"; // 默认开
 
 // 自动保存
 let saveTimer = null, dirty = false;
@@ -252,7 +256,7 @@ function onContentInput() {
   saveTimer = setTimeout(saveNow, 1500);
   typewriterCenter();
 }
-function onNotesInput() { dirty = true; clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); }
+function onNotesInput() { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); }
 
 async function saveNow() {
   if (!currentChapterId || !dirty) return;
@@ -310,7 +314,10 @@ function setupRec() {
 function toggleMic() {
   if (!rec) { alert("浏览器不支持语音识别，请用安卓 Chrome"); return; }
   if (micOn) { micOn = false; try { rec.stop(); } catch (e) {} setMic(false); }
-  else { micOn = true; draftBuffer = ""; try { rec.start(); } catch (e) {} setMic(true); }
+  else {
+    if (agentMicOn) { agentMicOn = false; try { agentRec.stop(); } catch (e) {} setAgentMic(false); } // 互斥
+    micOn = true; draftBuffer = ""; try { rec.start(); } catch (e) {} setMic(true);
+  }
 }
 function setMic(on) {
   $("micBtn").textContent = on ? "⏸ 停止" : "🎤 开始说";
@@ -392,6 +399,8 @@ function doFind() {
   $("findInfo").textContent = findPos.length ? `${findPos.length} 处` : "无";
   if (findPos.length) { findIdx = 0; showMatch(); }
 }
+let _findTimer = null;
+function doFindDebounced() { clearTimeout(_findTimer); _findTimer = setTimeout(doFind, 180); } // 长文查找防抖
 function showMatch() {
   if (findIdx < 0) return;
   const ta = $("content"), q = $("findInput").value;
@@ -531,6 +540,7 @@ async function openSettings() {
     // key 不回传明文：已填则用掩码占位提示，留空表示不改
     $("setApiKey").value = s.api_key_masked || "";
     $("setApiKey").placeholder = s.has_key ? `${s.api_key_masked}（留空=不改）` : "sk-…";
+    $("setVoiceAuto").checked = voiceAutoSend;
     $("setMsg").textContent = "";
   } catch (e) { $("setMsg").textContent = e.message; }
   $("setOverlay").classList.remove("hidden");
@@ -542,6 +552,9 @@ async function saveSettings() {
   let api_key = $("setApiKey").value.trim();
   // 若用户没动 key 输入框（仍是掩码占位），传空让后端保留旧值
   if (api_key.startsWith("****")) api_key = "";
+  // 语音自动发送是纯前端偏好（麦克风是设备本地能力），存 localStorage 即可
+  voiceAutoSend = $("setVoiceAuto").checked;
+  localStorage.setItem("voiceAutoSend", voiceAutoSend ? "1" : "0");
   try {
     await api("/api/settings", { body: { base_url, api_key, model } });
     $("setMsg").textContent = "已保存";
@@ -599,7 +612,8 @@ async function aiSynopsis() {
 function toggleAISide() {
   const open = $("app").classList.toggle("ai-open");
   localStorage.setItem("aiOpen", open ? "1" : "0");
-  if (open) setTimeout(() => { renderAgent(); $("agentInput").focus(); }, 50);
+  if (open) setTimeout(() => { setAiTtsBtn(); renderAgent(); $("agentInput").focus(); }, 50);
+  else if ("speechSynthesis" in window) speechSynthesis.cancel(); // 收起侧栏时停止朗读
 }
 function renderAgent() {
   const el = $("agentMsgs");
@@ -662,6 +676,20 @@ async function sendAgent() {
   } finally {
     agentBusy = false;
     renderAgent();
+    // 自动朗读本轮 AI 的回复与操作摘要（朗读开关 🔊 开启时）
+    const uIdx = agentMsgs.map(m => m.role).lastIndexOf("user");
+    let spoken = "";
+    for (let i = (uIdx < 0 ? 0 : uIdx + 1); i < agentMsgs.length; i++) {
+      const m = agentMsgs[i];
+      if (m.role === "assistant" && m.content) spoken += m.content + " ";
+      else if (m.role === "tool") {
+        let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
+        if (rr.summary) spoken += rr.summary + " ";
+        else if (rr.error) spoken += "操作出错，" + rr.error + "。";
+      }
+    }
+    speakAgentText(spoken);
+    $("agentInput").focus(); // 发完聚焦输入框，方便连续对话
   }
 }
 async function undoAgentAction(rid) {
@@ -674,6 +702,77 @@ async function undoAgentAction(rid) {
   } catch (e) { alert("撤销失败：" + e.message); }
 }
 function clearAgent() { agentMsgs = []; agentUndone.clear(); renderAgent(); }
+
+/* 语音输入 + 自动朗读（浏览器原生 speechRecognition / speechSynthesis，零配置） */
+
+function setupAgentRec() {
+  if (!SR || agentRec) return;
+  agentRec = new SR();
+  agentRec.lang = "zh-CN"; agentRec.continuous = false; agentRec.interimResults = true;
+  agentRec.onresult = (e) => {
+    agentFinalText = ""; agentInterim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) agentFinalText = r[0].transcript; else agentInterim += r[0].transcript;
+    }
+    $("agentInput").value = (agentFinalText + agentInterim).trim();
+  };
+  agentRec.onend = () => {
+    const was = agentMicOn; agentMicOn = false; setAgentMic(false);
+    const el = $("agentInput");
+    if (agentFinalText) el.value = agentFinalText.trim();
+    if (was && el.value.trim()) {
+      if (voiceAutoSend) sendAgent();        // 默认：说完自动发给 AI
+      else el.focus();                       // 关掉自动发：填进去等你确认
+    }
+  };
+  agentRec.onerror = (e) => {
+    agentMicOn = false; setAgentMic(false);
+    if (!_agentPH) _agentPH = $("agentInput").placeholder;
+    $("agentInput").placeholder = "语音错误：" + e.error + "；再按 🎤 重试";
+  };
+}
+function toggleAgentMic() {
+  if (!SR) { alert("浏览器不支持语音识别，请用安卓 Chrome"); return; }
+  setupAgentRec();
+  if (agentMicOn) { agentMicOn = false; try { agentRec.stop(); } catch (e) {} setAgentMic(false); return; }
+  if (micOn) { micOn = false; try { rec.stop(); } catch (e) {} setMic(false); } // 同一时刻只允许一个识别
+  agentFinalText = ""; agentInterim = "";
+  const el = $("agentInput"); el.value = "";
+  if (_agentPH) el.placeholder = _agentPH;
+  agentMicOn = true;
+  try { agentRec.start(); setAgentMic(true); }
+  catch (e) { // start() 同步抛出（如权限被拒）：别让按钮假装在录音
+    agentMicOn = false;
+    if (!_agentPH) _agentPH = $("agentInput").placeholder;
+    $("agentInput").placeholder = "语音无法启动：" + (e.name || "错误") + "；再按 🎤 重试";
+  }
+}
+function setAgentMic(on) {
+  const b = $("agentMicBtn"); if (!b) return;
+  b.textContent = on ? "⏹" : "🎤";
+  b.classList.toggle("on", on);
+  b.title = on ? "正在听…再按结束" : "语音输入";
+}
+function toggleAiTts() {
+  aiTts = !aiTts;
+  localStorage.setItem("aiTts", aiTts ? "1" : "0");
+  setAiTtsBtn();
+  if (!aiTts && "speechSynthesis" in window) speechSynthesis.cancel();
+}
+function setAiTtsBtn() {
+  const b = $("aiTtsBtn"); if (!b) return;
+  b.textContent = aiTts ? "🔊" : "🔇";
+  b.classList.toggle("on", aiTts);
+  b.title = aiTts ? "自动朗读：开（点一下关）" : "自动朗读：关（点一下开）";
+}
+function speakAgentText(txt) {
+  if (!aiTts || !txt || !txt.trim() || !("speechSynthesis" in window)) return;
+  speechSynthesis.cancel(); // 新回复来了，打断上一段
+  const u = new SpeechSynthesisUtterance(txt.trim());
+  u.lang = "zh-CN"; u.rate = 1;
+  speechSynthesis.speak(u);
+}
 
 /* ---------- 实体卡片 wiki（人物/地点…，喂给 AI 当结构化设定） ---------- */
 
@@ -903,7 +1002,7 @@ $("content").addEventListener("input", onContentInput);
 $("content").addEventListener("keyup", typewriterCenter);
 $("content").addEventListener("click", typewriterCenter);
 $("notes").addEventListener("input", onNotesInput);
-$("chapTitle").addEventListener("input", () => { dirty = true; clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); });
+$("chapTitle").addEventListener("input", () => { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); });
 document.addEventListener("click", (e) => {
   const m = $("moreMenu");
   if (m && !m.classList.contains("hidden") && !e.target.closest(".menu-wrap")) m.classList.add("hidden");
@@ -915,6 +1014,7 @@ document.addEventListener("click", (e) => {
   applyTheme(localStorage.getItem("theme"));
   applyFont(localStorage.getItem("fontSerif") === "1");
   if (localStorage.getItem("aiOpen") === "1") $("app").classList.add("ai-open");
+  setAiTtsBtn(); // 朗读开关按钮图标按上次状态显示
   // 根据是否开放注册，决定显示注册入口
   try {
     const s = await api("/api/signup-status", { method: "GET" });

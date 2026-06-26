@@ -93,7 +93,7 @@
       </div>
 
       <div id="findBar" class="findbar hidden">
-        <input id="findInput" placeholder="查找…" oninput="doFind()">
+        <input id="findInput" placeholder="查找…" oninput="doFindDebounced()">
         <button class="ic" onclick="findNext()">下一个</button>
         <input id="replaceInput" placeholder="替换为…">
         <button class="ic" onclick="doReplace()">替换</button>
@@ -115,12 +115,16 @@
     <aside id="aiSide" class="ai-side">
       <div class="ai-head">
         <span>🤖 AI 助手</span>
-        <button class="ic" onclick="toggleAISide()" title="收起">✕</button>
+        <span class="ai-head-tools">
+          <button class="ic" id="aiTtsBtn" onclick="toggleAiTts()" title="自动朗读"></button>
+          <button class="ic" onclick="toggleAISide()" title="收起">✕</button>
+        </span>
       </div>
       <div id="agentMsgs" class="chat-msgs"></div>
       <div class="chat-input-row">
         <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
+        <button class="ic" id="agentMicBtn" onclick="toggleAgentMic()" title="语音输入">🎤</button>
         <button onclick="sendAgent()">发送</button>
         <button class="ic" onclick="clearAgent()" title="清空对话">🗑</button>
       </div>
@@ -208,6 +212,7 @@
         <input id="setApiKey" type="password" placeholder="sk-…（已设置则显示 ****，留空=不改）">
         <label>模型 ID</label>
         <input id="setModel" placeholder="deepseek-chat">
+        <label class="set-row"><input id="setVoiceAuto" type="checkbox"> 语音说完自动发送给 AI（关掉则填进输入框等你确认）</label>
         <div class="set-actions">
           <button onclick="saveSettings()">保存</button>
           <button class="ic" onclick="closeSettings()">取消</button>
