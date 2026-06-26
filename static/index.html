@@ -10,7 +10,7 @@
 
   <!-- 登录 -->
   <div id="login" class="screen">
-    <h1>✍ 写作</h1>
+    <h1 data-ic="feather" data-label="写作"></h1>
     <div id="loginForm">
       <input id="user" placeholder="用户名" onkeydown="if(event.key==='Enter')doLogin()">
       <input id="pwd" type="password" placeholder="密码" onkeydown="if(event.key==='Enter')doLogin()">
@@ -32,39 +32,39 @@
     <aside id="sidebar" class="sidebar">
       <div class="side-head">
         <span id="meName">目录</span>
-        <button class="ic" onclick="newWork()" title="新建作品">＋作品</button>
+        <button class="ic" data-ic="plus" data-label="作品" onclick="newWork()" title="新建作品"></button>
       </div>
       <div id="workTree" class="tree"></div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <button class="ic" onclick="toggleSidebar()" title="目录">☰</button>
+        <button class="ic" data-ic="menu" onclick="toggleSidebar()" title="目录"></button>
         <input id="chapTitle" class="title-input" placeholder="章节标题">
         <span id="wc" class="wc">0 字</span>
         <span id="saveStat" class="save-stat"></span>
         <select id="exportSel" class="ic" onchange="exportChap(this.value);this.selectedIndex=0" title="导出">
-          <option value="">⬇导出</option>
+          <option value="">导出</option>
           <option value="txt">本章TXT</option>
           <option value="docx">本章DOCX</option>
           <option value="work-txt">整本TXT</option>
           <option value="work-docx">整本DOCX</option>
         </select>
-        <button class="ic" id="themeBtn" onclick="toggleTheme()" title="明暗主题">🌙</button>
+        <button class="ic" id="themeBtn" data-ic="moon" onclick="toggleTheme()" title="明暗主题"></button>
         <button class="ic" id="fontBtn" onclick="toggleFont()" title="衬线/无衬线字体">文</button>
-        <button class="ic" onclick="toggleFocus()" title="专注">⊚</button>
-        <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
-        <button class="ic" id="aiToggleBtn" onclick="toggleAISide()" title="AI 助手（对话即操作）">🤖</button>
+        <button class="ic" data-ic="focus" onclick="toggleFocus()" title="专注"></button>
+        <button class="ic" data-ic="book" onclick="toggleRead()" title="阅读"></button>
+        <button class="ic" id="aiToggleBtn" data-ic="bot" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
         <div class="menu-wrap">
-          <button class="ic" onclick="toggleMoreMenu(event)" title="更多">⋯</button>
+          <button class="ic" data-ic="more" onclick="toggleMoreMenu(event)" title="更多"></button>
           <div id="moreMenu" class="menu hidden">
-            <button onclick="saveRevision();closeMoreMenu()">🗂 存为版本</button>
-            <button onclick="showRevisions();closeMoreMenu()">🕘 历史版本</button>
-            <button onclick="openTrash();closeMoreMenu()">🗑 回收站</button>
-            <button onclick="openWiki();closeMoreMenu()">👥 实体卡片</button>
-            <button onclick="openAITools();closeMoreMenu()">✦ AI 工具</button>
-            <button onclick="openSettings();closeMoreMenu()">⚙ 大模型设置</button>
-            <button onclick="doLogout();closeMoreMenu()">⏻ 退出</button>
+            <button data-ic="bookmark" data-label="存为版本" onclick="saveRevision();closeMoreMenu()"></button>
+            <button data-ic="clock" data-label="历史版本" onclick="showRevisions();closeMoreMenu()"></button>
+            <button data-ic="trash" data-label="回收站" onclick="openTrash();closeMoreMenu()"></button>
+            <button data-ic="users" data-label="实体卡片" onclick="openWiki();closeMoreMenu()"></button>
+            <button data-ic="sparkles" data-label="AI 工具" onclick="openAITools();closeMoreMenu()"></button>
+            <button data-ic="settings" data-label="大模型设置" onclick="openSettings();closeMoreMenu()"></button>
+            <button data-ic="logout" data-label="退出" onclick="doLogout();closeMoreMenu()"></button>
           </div>
         </div>
       </header>
@@ -74,22 +74,22 @@
         <button class="mode" data-mode="润色" onclick="setMode('润色')">润色</button>
         <button class="mode" data-mode="扩写" onclick="setMode('扩写')">扩写</button>
         <button class="mode" data-mode="续写" onclick="setMode('续写')">续写</button>
-        <button id="genBtn" class="gen hidden" onclick="generate()">⏎ 生成</button>
+        <button id="genBtn" class="gen hidden" data-ic="enter" data-label="生成" onclick="generate()"></button>
       </div>
 
       <div class="micbar">
-        <button id="micBtn" class="mic" onclick="toggleMic()">🎤 开始说</button>
+        <button id="micBtn" class="mic" data-ic="mic" data-label="开始说" onclick="toggleMic()"></button>
         <span id="micStatus" class="status"></span>
-        <button class="ic" onclick="undo()" title="撤销最近一段">↩撤销</button>
-        <button class="ic" onclick="toggleFind()" title="查找替换">🔍找</button>
-        <button class="ic" onclick="splitChapter()" title="在光标处拆分章节">✂拆分</button>
-        <button class="ic" onclick="toggleNotes()" title="本章备注">📝备注</button>
+        <button class="ic" data-ic="undo" data-label="撤销" onclick="undo()" title="撤销最近一段"></button>
+        <button class="ic" data-ic="search" data-label="找" onclick="toggleFind()" title="查找替换"></button>
+        <button class="ic" data-ic="scissors" data-label="拆分" onclick="splitChapter()" title="在光标处拆分章节"></button>
+        <button class="ic" data-ic="note" data-label="备注" onclick="toggleNotes()" title="本章备注"></button>
         <span class="vbar"></span>
-        <button class="ic" onclick="processSelection('缩写')" title="把选中的段落缩到约一半">↧缩写选区</button>
+        <button class="ic" data-ic="shrink" data-label="缩写选区" onclick="processSelection('缩写')" title="把选中的段落缩到约一半"></button>
         <select id="rwStyle" class="ic" title="改写风格">
           <option>更生动</option><option>更精炼</option><option>文艺风</option><option>口语化</option><option>悬疑感</option>
         </select>
-        <button class="ic" onclick="processSelection('改写', $('rwStyle').value)" title="把选中的段落换成上面的风格">✎改写选区</button>
+        <button class="ic" data-ic="pen" data-label="改写选区" onclick="processSelection('改写', $('rwStyle').value)" title="把选中的段落换成上面的风格"></button>
       </div>
 
       <div id="findBar" class="findbar hidden">
@@ -99,7 +99,7 @@
         <button class="ic" onclick="doReplace()">替换</button>
         <button class="ic" onclick="replaceAll()">全部</button>
         <span id="findInfo" class="find-info"></span>
-        <button class="ic" onclick="toggleFind()">✕</button>
+        <button class="ic" data-ic="x" onclick="toggleFind()"></button>
       </div>
 
       <div id="notesBar" class="notesbar hidden">
@@ -114,19 +114,19 @@
     <div class="ai-backdrop" onclick="toggleAISide()"></div>
     <aside id="aiSide" class="ai-side">
       <div class="ai-head">
-        <span>🤖 AI 助手</span>
+        <span data-ic="bot" data-label="AI 助手"></span>
         <span class="ai-head-tools">
-          <button class="ic" id="aiTtsBtn" onclick="toggleAiTts()" title="自动朗读"></button>
-          <button class="ic" onclick="toggleAISide()" title="收起">✕</button>
+          <button class="ic" id="aiTtsBtn" data-ic="mute" onclick="toggleAiTts()" title="自动朗读"></button>
+          <button class="ic" data-ic="x" onclick="toggleAISide()" title="收起"></button>
         </span>
       </div>
       <div id="agentMsgs" class="chat-msgs"></div>
       <div class="chat-input-row">
         <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
-        <button class="ic" id="agentMicBtn" onclick="toggleAgentMic()" title="语音输入">🎤</button>
+        <button class="ic" id="agentMicBtn" data-ic="mic" onclick="toggleAgentMic()" title="语音输入"></button>
         <button onclick="sendAgent()">发送</button>
-        <button class="ic" onclick="clearAgent()" title="清空对话">🗑</button>
+        <button class="ic" data-ic="trash" onclick="clearAgent()" title="清空对话"></button>
       </div>
     </aside>
   </div>
@@ -134,15 +134,15 @@
   <!-- 阅读视图 -->
   <div id="reader" class="reader hidden">
     <div class="reader-top">
-      <button onclick="toggleRead()">✕</button>
-      <button onclick="readerPrev()">‹ 上章</button>
+      <button class="ic" data-ic="x" onclick="toggleRead()"></button>
+      <button class="ic" data-ic="chevL" data-label="上章" onclick="readerPrev()"></button>
       <span id="readerTitle" class="r-title"></span>
-      <button onclick="readerNext()">下章 ›</button>
+      <button class="ic" data-ic="chevR" data-label="下章" onclick="readerNext()"></button>
       <span class="r-spacer"></span>
       <button class="ic" onclick="readerFont(-1)">A－</button>
       <button class="ic" onclick="readerFont(1)">A＋</button>
       <button class="ic" onclick="readerLine()">行距</button>
-      <button class="ic" onclick="readerToggleTTS()" id="ttsBtn">▶朗读</button>
+      <button class="ic" id="ttsBtn" data-ic="play" data-label="朗读" onclick="readerToggleTTS()"></button>
       <select id="readerJump" onchange="readerJumpTo()"></select>
     </div>
     <article id="readView" class="read-text"></article>
@@ -151,7 +151,7 @@
   <!-- 历史版本 -->
   <div id="revOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>历史版本</span><button class="ic" onclick="closeRevisions()">✕</button></div>
+      <div class="overlay-head"><span>历史版本</span><button class="ic" data-ic="x" onclick="closeRevisions()"></button></div>
       <div id="revList" class="rev-list"></div>
     </div>
   </div>
@@ -159,7 +159,7 @@
   <!-- 版本对比 -->
   <div id="diffOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
-      <div class="overlay-head"><span>版本对比（历史 → 当前）</span><button class="ic" onclick="closeDiff()">✕</button></div>
+      <div class="overlay-head"><span>版本对比（历史 → 当前）</span><button class="ic" data-ic="x" onclick="closeDiff()"></button></div>
       <div id="diffSub" class="set-hint" style="padding:8px 14px 0"></div>
       <div id="diffBody" class="diff-body"></div>
     </div>
@@ -168,7 +168,7 @@
   <!-- 回收站 -->
   <div id="trashOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>回收站</span><button class="ic" onclick="closeTrash()">✕</button></div>
+      <div class="overlay-head"><span>回收站</span><button class="ic" data-ic="x" onclick="closeTrash()"></button></div>
       <div id="trashList" class="rev-list"></div>
     </div>
   </div>
@@ -176,7 +176,7 @@
   <!-- 实体卡片 wiki -->
   <div id="wikiOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
-      <div class="overlay-head"><span>实体卡片</span><button class="ic" onclick="closeWiki()">✕</button></div>
+      <div class="overlay-head"><span>实体卡片</span><button class="ic" data-ic="x" onclick="closeWiki()"></button></div>
       <div class="set-form">
         <div id="wikiList" class="wiki-list"></div>
         <hr class="sep">
@@ -203,7 +203,7 @@
   <!-- 大模型设置 -->
   <div id="setOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>大模型设置</span><button class="ic" onclick="closeSettings()">✕</button></div>
+      <div class="overlay-head"><span>大模型设置</span><button class="ic" data-ic="x" onclick="closeSettings()"></button></div>
       <div class="set-form">
         <p class="set-hint">填好你的 OpenAI 兼容接口，润色/扩写/续写才会生效。每人用自己的 key，互不影响。</p>
         <label>Base URL</label>
@@ -225,7 +225,7 @@
   <!-- 作品设定（人物/世界观/大纲，喂给 AI 当全文记忆） -->
   <div id="wnOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>作品设定</span><button class="ic" onclick="closeWorkNotes()">✕</button></div>
+      <div class="overlay-head"><span>作品设定</span><button class="ic" data-ic="x" onclick="closeWorkNotes()"></button></div>
       <div class="set-form">
         <p class="set-hint">人物表 / 世界观 / 大纲。本作品下所有 AI（润色/扩写/续写/找回）都会读到它，保证全文一致。</p>
         <textarea id="wnText" rows="14" placeholder="主角：……&#10;世界观：……&#10;大纲：……"></textarea>
@@ -241,7 +241,7 @@
   <!-- AI 写作工具（校验/摘要，不污染正文） -->
   <div id="aiOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>AI 写作工具</span><button class="ic" onclick="closeAITools()">✕</button></div>
+      <div class="overlay-head"><span>AI 写作工具</span><button class="ic" data-ic="x" onclick="closeAITools()"></button></div>
       <div class="set-form">
         <p class="set-hint">基于作品设定 + 本章正文。校验只列问题不改字；摘要会填进备注，成为后续 AI 上下文。</p>
         <div class="set-actions">

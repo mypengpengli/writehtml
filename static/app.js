@@ -27,6 +27,52 @@ let agentMsgs = [];
 let agentBusy = false;
 let agentUndone = new Set();
 
+/* ---------- 图标（内联 SVG，Lucide 风格 24×24 描边） ---------- */
+const _W = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
+const ICONS = {
+  menu:     `<svg ${_W}><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>`,
+  x:        `<svg ${_W}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+  moon:     `<svg ${_W}><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>`,
+  sun:      `<svg ${_W}><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>`,
+  focus:    `<svg ${_W}><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg>`,
+  book:     `<svg ${_W}><path d="M4 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H4z"/><path d="M20 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z"/></svg>`,
+  bot:      `<svg ${_W}><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 4v4"/><circle cx="12" cy="4" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="14" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="1" fill="currentColor" stroke="none"/></svg>`,
+  more:     `<svg ${_W}><circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg>`,
+  bookmark: `<svg ${_W}><path d="M6 3h12v18l-6-4-6 4z"/></svg>`,
+  clock:    `<svg ${_W}><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
+  trash:    `<svg ${_W}><path d="M3 6h18"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`,
+  users:    `<svg ${_W}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+  sparkles: `<svg ${_W}><path d="M12 3l1.7 4.8L18 9.5l-4.3 1.7L12 16l-1.7-4.8L6 9.5l4.3-1.7z"/><path d="M18.5 14.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg>`,
+  settings: `<svg ${_W}><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>`,
+  logout:   `<svg ${_W}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>`,
+  mic:      `<svg ${_W}><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="22"/></svg>`,
+  square:   `<svg ${_W}><rect x="6" y="6" width="12" height="12" rx="2"/></svg>`,
+  undo:     `<svg ${_W}><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 2.3L3 13"/></svg>`,
+  search:   `<svg ${_W}><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
+  scissors: `<svg ${_W}><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.5" y2="15.5"/><line x1="8.5" y1="8.5" x2="20" y2="20"/></svg>`,
+  note:     `<svg ${_W}><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h6"/></svg>`,
+  shrink:   `<svg ${_W}><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`,
+  pen:      `<svg ${_W}><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>`,
+  volume:   `<svg ${_W}><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19 6a9 9 0 0 1 0 12"/></svg>`,
+  mute:     `<svg ${_W}><path d="M11 5L6 9H3v6h3l5 4z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`,
+  chevL:    `<svg ${_W}><polyline points="15 18 9 12 15 6"/></svg>`,
+  chevR:    `<svg ${_W}><polyline points="9 18 15 12 9 6"/></svg>`,
+  play:     `<svg ${_W}><polygon points="6 3 20 12 6 21" fill="currentColor" stroke="none"/></svg>`,
+  plus:     `<svg ${_W}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
+  enter:    `<svg ${_W}><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>`,
+  feather:  `<svg ${_W}><path d="M20.2 12.2a6 6 0 0 0-8.5-8.5L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/></svg>`,
+  grip:     `<svg ${_W}><circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none"/></svg>`,
+};
+function svg(n) { return ICONS[n] || ""; }
+// 把图标注入 [data-ic] 元素；data-label 存在则图标后跟文字（移动端更易用）
+function setIcon(el, n, label) {
+  if (!el || !ICONS[n]) return;
+  el.innerHTML = ICONS[n] + (label != null ? `<span class="ic-label">${label}</span>` : "");
+}
+function applyIcons() {
+  document.querySelectorAll("[data-ic]").forEach(el => setIcon(el, el.dataset.ic, el.dataset.label));
+}
+
 /* ---------- 通用 ---------- */
 
 async function api(path, opts = {}) {
@@ -118,20 +164,20 @@ function renderTree() {
            ondragstart="dragStart(event,${c.id})"
            ondragover="dragOver(event)"
            ondrop="dragDrop(event,${c.id})">
-        <span class="drag">⠿</span>
+        <span class="drag">${svg("grip")}</span>
         <span class="c-title">${esc(c.title) || "(无标题)"}</span>
         <span class="c-wc">${(c.chars || 0)}字</span>
-        <button class="c-del" onclick="event.stopPropagation();delChapter(${c.id})" title="删除">✕</button>
+        <button class="c-del" onclick="event.stopPropagation();delChapter(${c.id})" title="删除">${svg("x")}</button>
       </div>`).join("") : "";
     return `
       <div class="work ${open ? "open" : ""}">
         <div class="w-row" onclick="selectWork(${w.id})">
           <span class="w-title">${esc(w.title)}</span>
-          <button class="ic" onclick="event.stopPropagation();openWorkNotes(${w.id})" title="作品设定">📋</button>
-          <button class="c-del" onclick="event.stopPropagation();delWork(${w.id})" title="删除">✕</button>
+          <button class="ic" onclick="event.stopPropagation();openWorkNotes(${w.id})" title="作品设定">${svg("book")}</button>
+          <button class="c-del" onclick="event.stopPropagation();delWork(${w.id})" title="删除">${svg("x")}</button>
         </div>
         ${open ? `<div class="chaps">${items || '<div class="empty">点「＋章」</div>'}</div>
-                 <button class="add-chap" onclick="newChapter(${w.id})">＋ 新章</button>` : ""}
+                 <button class="add-chap" onclick="newChapter(${w.id})">${svg("plus")}<span class="ic-label">新章</span></button>` : ""}
       </div>`;
   }).join("");
 }
@@ -193,7 +239,7 @@ async function newChapter(wid) {
 }
 
 async function delChapter(cid) {
-  if (!confirm("移到回收站？（可找回，点 🗑 彻底删除）")) return;
+  if (!confirm("移到回收站？（可找回，在回收站点「彻底删除」）")) return;
   if (dirty) await saveNow();
   await api(`/api/chapters/${cid}`, { method: "DELETE" });
   currentChapterId = null;
@@ -320,7 +366,7 @@ function toggleMic() {
   }
 }
 function setMic(on) {
-  $("micBtn").textContent = on ? "⏸ 停止" : "🎤 开始说";
+  setIcon($("micBtn"), on ? "square" : "mic", on ? "停止" : "开始说");
   $("micBtn").classList.toggle("on", on);
   $("micStatus").textContent = on ? "正在听…" : "";
 }
@@ -638,7 +684,7 @@ function renderAgent() {
         const card = undone
           ? `<span class="done-tag">已撤销</span>`
           : (rid ? `<button class="undo-btn" onclick="undoAgentAction(${rid})">撤销</button>` : "");
-        html += `<div class="cm action${undone ? " done" : ""}"><div class="act-bar"><span class="act-txt">✏️ ${esc(sum)}</span>${card}</div></div>`;
+        html += `<div class="cm action${undone ? " done" : ""}"><div class="act-bar"><span class="act-txt">${svg("pen")} ${esc(sum)}</span>${card}</div></div>`;
       }
     }
   }
@@ -729,7 +775,7 @@ function setupAgentRec() {
   agentRec.onerror = (e) => {
     agentMicOn = false; setAgentMic(false);
     if (!_agentPH) _agentPH = $("agentInput").placeholder;
-    $("agentInput").placeholder = "语音错误：" + e.error + "；再按 🎤 重试";
+    $("agentInput").placeholder = "语音错误：" + e.error + "；再按语音键重试";
   };
 }
 function toggleAgentMic() {
@@ -745,12 +791,12 @@ function toggleAgentMic() {
   catch (e) { // start() 同步抛出（如权限被拒）：别让按钮假装在录音
     agentMicOn = false;
     if (!_agentPH) _agentPH = $("agentInput").placeholder;
-    $("agentInput").placeholder = "语音无法启动：" + (e.name || "错误") + "；再按 🎤 重试";
+    $("agentInput").placeholder = "语音无法启动：" + (e.name || "错误") + "；再按语音键重试";
   }
 }
 function setAgentMic(on) {
   const b = $("agentMicBtn"); if (!b) return;
-  b.textContent = on ? "⏹" : "🎤";
+  setIcon(b, on ? "square" : "mic");
   b.classList.toggle("on", on);
   b.title = on ? "正在听…再按结束" : "语音输入";
 }
@@ -762,7 +808,7 @@ function toggleAiTts() {
 }
 function setAiTtsBtn() {
   const b = $("aiTtsBtn"); if (!b) return;
-  b.textContent = aiTts ? "🔊" : "🔇";
+  setIcon(b, aiTts ? "volume" : "mute");
   b.classList.toggle("on", aiTts);
   b.title = aiTts ? "自动朗读：开（点一下关）" : "自动朗读：关（点一下开）";
 }
@@ -929,13 +975,14 @@ async function readerJumpTo() {
 }
 function readerFont(d) { readerFontPx = Math.min(32, Math.max(14, readerFontPx + d)); localStorage.setItem("rFont", readerFontPx); $("readView").style.fontSize = readerFontPx + "px"; }
 function readerLine() { readerLH = readerLH >= 2.6 ? 1.6 : +(readerLH + 0.3).toFixed(1); localStorage.setItem("rLH", readerLH); $("readView").style.lineHeight = readerLH; }
+function setReaderTts(on) { setIcon($("ttsBtn"), on ? "square" : "play", on ? "停" : "朗读"); }
 function readerToggleTTS() {
   if (!("speechSynthesis" in window)) { alert("浏览器不支持朗读"); return; }
-  if (ttsPlaying) { speechSynthesis.cancel(); ttsPlaying = false; $("ttsBtn").textContent = "▶朗读"; return; }
+  if (ttsPlaying) { speechSynthesis.cancel(); ttsPlaying = false; setReaderTts(false); return; }
   const u = new SpeechSynthesisUtterance($("content").value);
   u.lang = "zh-CN"; u.rate = 1;
-  u.onend = () => { ttsPlaying = false; $("ttsBtn").textContent = "▶朗读"; };
-  speechSynthesis.speak(u); ttsPlaying = true; $("ttsBtn").textContent = "⏹停";
+  u.onend = () => { ttsPlaying = false; setReaderTts(false); };
+  speechSynthesis.speak(u); ttsPlaying = true; setReaderTts(true);
 }
 
 /* ---------- 布局 ---------- */
@@ -952,7 +999,7 @@ function applyTheme(t) {
   if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
   else document.documentElement.removeAttribute("data-theme");
   const dark = t === "dark" || (t == null && matchMedia("(prefers-color-scheme: dark)").matches);
-  const b = $("themeBtn"); if (b) b.textContent = dark ? "☀" : "🌙";
+  const b = $("themeBtn"); if (b) setIcon(b, dark ? "sun" : "moon");
 }
 function toggleTheme() {
   const cur = document.documentElement.getAttribute("data-theme");
@@ -1011,6 +1058,7 @@ document.addEventListener("click", (e) => {
 /* ---------- 启动 ---------- */
 
 (async function start() {
+  applyIcons();
   applyTheme(localStorage.getItem("theme"));
   applyFont(localStorage.getItem("fontSerif") === "1");
   if (localStorage.getItem("aiOpen") === "1") $("app").classList.add("ai-open");

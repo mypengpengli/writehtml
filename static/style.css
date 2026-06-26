@@ -126,7 +126,8 @@ html.font-serif .read-text {
 .w-row:hover .c-del, .chap:hover .c-del { opacity: .7; }
 .c-del:hover { opacity: 1; color: var(--danger); }
 .add-chap {
-  display: block; width: calc(100% - 20px); margin: 4px 10px 8px; padding: 6px;
+  display: flex; align-items: center; justify-content: center; gap: 4px;
+  width: calc(100% - 20px); margin: 4px 10px 8px; padding: 6px;
   font-size: 13px; color: var(--accent-text); border-style: dashed;
 }
 
@@ -144,6 +145,15 @@ html.font-serif .read-text {
 .ic:hover { opacity: 1; }
 button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .ic svg { width: 18px; height: 18px; display: block; }
+/* 内联 SVG 图标在非 .ic 容器里的尺寸/对齐 */
+[data-ic] svg { width: 18px; height: 18px; display: block; }
+.ai-head [data-ic], #login h1[data-ic] { display: inline-flex; align-items: center; gap: 6px; }
+#login h1[data-ic] svg { width: 1.1em; height: 1.1em; }
+.drag svg { width: 14px; height: 14px; display: block; }
+.c-del svg { width: 13px; height: 13px; display: block; }
+.add-chap svg { width: 14px; height: 14px; display: block; }
+.chat-msgs .cm.action .act-txt svg { width: 14px; height: 14px; display: inline-block; vertical-align: -2px; }
+.ic-label { white-space: nowrap; }
 
 /* 顶栏「⋯更多」下拉 */
 .menu-wrap { position: relative; }
