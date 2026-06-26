@@ -638,6 +638,8 @@ async function sendAgent() {
   const text = el.value.trim();
   if (!text) return;
   el.value = "";
+  // 先把正文框里未保存的手动编辑落库，避免 AI 基于旧正文操作、回显时覆盖手打内容
+  if (dirty) await saveNow();
   agentMsgs.push({ role: "user", content: text });
   agentBusy = true;
   renderAgent();
