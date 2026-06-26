@@ -73,6 +73,53 @@ function applyIcons() {
   document.querySelectorAll("[data-ic]").forEach(el => setIcon(el, el.dataset.ic, el.dataset.label));
 }
 
+/* ---------- 交互层：toast / 询问卡 / 忙碌态（替代原生 alert·prompt·confirm） ---------- */
+function showToast(msg, type) {
+  const host = $("toast"); if (!host) return;
+  const t = document.createElement("div");
+  t.className = "toast" + (type ? " " + type : "");
+  t.textContent = msg;
+  host.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 220); }, 2400);
+}
+let _askResolve = null;
+function askCard({ title, msg, input, def, okText, danger }) {
+  return new Promise(resolve => {
+    _askResolve = resolve;
+    $("askTitle").textContent = title || "";
+    const m = $("askMsg");
+    m.textContent = msg || "";
+    m.classList.toggle("hidden", !msg);
+    const inp = $("askInput");
+    if (input) { inp.classList.remove("hidden"); inp.placeholder = input; inp.value = def || ""; }
+    else { inp.classList.add("hidden"); inp.value = ""; }
+    const ok = $("askOk");
+    ok.textContent = okText || "确定";
+    ok.classList.toggle("danger-btn", !!danger);
+    $("askOverlay").classList.remove("hidden");
+    if (input) setTimeout(() => { inp.focus(); inp.select(); }, 40);
+    else setTimeout(() => ok.focus(), 40);
+  });
+}
+function closeAsk(ok) {
+  if (!_askResolve) return;
+  const inp = $("askInput");
+  let r;
+  if (!ok) r = false;                                   // 取消
+  else if (!inp.classList.contains("hidden")) r = inp.value; // prompt：返回输入
+  else r = true;                                        // confirm：返回 true
+  $("askOverlay").classList.add("hidden");
+  const fn = _askResolve; _askResolve = null; fn(r);
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape" && _askResolve) closeAsk(false); });
+// 忙碌态：el 加 .is-busy（CSS 变灰+禁点）；带文字的按钮顺带塞个转圈
+function busy(el, on, text) {
+  if (!el) return;
+  el.classList.toggle("is-busy", on);
+  if (text != null) el.innerHTML = on ? '<span class="spinner"></span> ' + text : text;
+}
+
 /* ---------- 通用 ---------- */
 
 async function api(path, opts = {}) {
@@ -155,7 +202,7 @@ async function loadWorks() {
 
 function renderTree() {
   const tree = $("workTree");
-  if (!works.length) { tree.innerHTML = '<div class="empty">点「＋作品」开始</div>'; return; }
+  if (!works.length) { tree.innerHTML = `<button class="empty-cta" onclick="newWork()">${svg("plus")} 新建第一篇作品</button>`; return; }
   tree.innerHTML = works.map(w => {
     const open = w.id === currentWorkId;
     const items = open ? chapters.map(c => `
@@ -163,6 +210,7 @@ function renderTree() {
            onclick="selectChapter(${c.id})"
            ondragstart="dragStart(event,${c.id})"
            ondragover="dragOver(event)"
+           ondragleave="dragLeave(event)"
            ondrop="dragDrop(event,${c.id})">
         <span class="drag">${svg("grip")}</span>
         <span class="c-title">${esc(c.title) || "(无标题)"}</span>
@@ -223,7 +271,7 @@ async function loadChapter() {
 }
 
 async function newWork() {
-  const title = prompt("作品名", "新作品");
+  const title = await askCard({ title: "新建作品", input: "作品名", def: "新作品", okText: "新建" });
   if (!title) return;
   const r = await api("/api/works", { body: { title } });
   currentWorkId = r.id; currentChapterId = null;
@@ -231,7 +279,7 @@ async function newWork() {
 }
 
 async function newChapter(wid) {
-  const title = prompt("章节名", "新章节");
+  const title = await askCard({ title: "新建章节", input: "章节名", def: "新章节", okText: "新建" });
   if (!title) return;
   const r = await api(`/api/works/${wid}/chapters`, { body: { title } });
   currentWorkId = wid; currentChapterId = r.id;
@@ -239,7 +287,7 @@ async function newChapter(wid) {
 }
 
 async function delChapter(cid) {
-  if (!confirm("移到回收站？（可找回，在回收站点「彻底删除」）")) return;
+  if (!await askCard({ title: "移到回收站？", msg: "可找回。在回收站点「彻底删除」才会真正删除。", okText: "移到回收站", danger: true })) return;
   if (dirty) await saveNow();
   await api(`/api/chapters/${cid}`, { method: "DELETE" });
   currentChapterId = null;
@@ -247,7 +295,7 @@ async function delChapter(cid) {
 }
 
 async function delWork(wid) {
-  if (!confirm("删除整个作品及其所有章节？不可恢复。")) return;
+  if (!await askCard({ title: "删除整个作品？", msg: "作品及其所有章节将被删除，不可恢复。", okText: "删除", danger: true })) return;
   await api(`/api/works/${wid}`, { method: "DELETE" });
   currentWorkId = null; currentChapterId = null;
   await loadWorks();
@@ -255,7 +303,7 @@ async function delWork(wid) {
 
 /* ---------- 回收站 ---------- */
 async function openTrash() {
-  if (!currentWorkId) { alert("先选一个作品"); return; }
+  if (!currentWorkId) { showToast("先选一个作品", "err"); return; }
   const list = await api(`/api/works/${currentWorkId}/trash`, { method: "GET" });
   $("trashList").innerHTML = list.length ? list.map(c => `
     <div class="rev">
@@ -273,7 +321,7 @@ async function restoreFromTrash(cid) {
   flash("已恢复");
 }
 async function purgeFromTrash(cid) {
-  if (!confirm("彻底删除？这一步不可恢复。")) return;
+  if (!await askCard({ title: "彻底删除？", msg: "这一步不可恢复。", okText: "彻底删除", danger: true })) return;
   await api(`/api/chapters/${cid}/purge`, { method: "POST" });
   await openTrash();
 }
@@ -281,9 +329,11 @@ async function purgeFromTrash(cid) {
 /* ---------- 拖拽排序 ---------- */
 
 function dragStart(ev, cid) { dragCid = cid; ev.dataTransfer.effectAllowed = "move"; }
-function dragOver(ev) { ev.preventDefault(); ev.dataTransfer.dropEffect = "move"; }
+function dragOver(ev) { ev.preventDefault(); ev.dataTransfer.dropEffect = "move"; ev.currentTarget.classList.add("drag-over"); }
+function dragLeave(ev) { ev.currentTarget.classList.remove("drag-over"); }
 async function dragDrop(ev, targetCid) {
   ev.preventDefault();
+  ev.currentTarget.classList.remove("drag-over");
   if (dragCid === null || dragCid === targetCid) { dragCid = null; return; }
   const ids = chapters.map(c => c.id);
   const from = ids.indexOf(dragCid), to = ids.indexOf(targetCid);
@@ -358,7 +408,7 @@ function setupRec() {
 }
 
 function toggleMic() {
-  if (!rec) { alert("浏览器不支持语音识别，请用安卓 Chrome"); return; }
+  if (!rec) { showToast("浏览器不支持语音识别，请用安卓 Chrome", "err"); return; }
   if (micOn) { micOn = false; try { rec.stop(); } catch (e) {} setMic(false); }
   else {
     if (agentMicOn) { agentMicOn = false; try { agentRec.stop(); } catch (e) {} setAgentMic(false); } // 互斥
@@ -385,7 +435,7 @@ function showDraft(s) {
 /* ---------- AI 处理（本地追加，不覆盖正文，避免丢手打内容） ---------- */
 
 async function processAndAppend(text) {
-  if (!currentChapterId) { alert("先选择或新建一个章节"); return; }
+  if (!currentChapterId) { showToast("先选择或新建一个章节", "err"); return; }
   const ctx = tail($("content").value, 1500);
   setMicStatus("处理中…");
   try {
@@ -399,9 +449,9 @@ async function processAndAppend(text) {
 // 选区操作：缩写 / 改写风格。对正文里选中的一段原地替换，可 Ctrl+Z 撤销
 async function processSelection(m, style) {
   const el = $("content");
-  if (!currentChapterId) { alert("先选择或新建一个章节"); return; }
+  if (!currentChapterId) { showToast("先选择或新建一个章节", "err"); return; }
   const s = el.selectionStart, e = el.selectionEnd;
-  if (s == null || s === e) { alert("先在正文里选中一段文字再操作"); return; }
+  if (s == null || s === e) { showToast("先在正文里选中一段文字再操作", "err"); return; }
   setMicStatus("处理中…");
   try {
     const r = await api("/api/process", {
@@ -416,7 +466,8 @@ async function processSelection(m, style) {
 async function generate() {
   if (!draftBuffer) { setMicStatus("先说点内容再生成"); return; }
   const text = draftBuffer; draftBuffer = ""; showDraft("");
-  await processAndAppend(text);
+  busy($("genBtn"), true);
+  try { await processAndAppend(text); } finally { busy($("genBtn"), false); }
 }
 
 async function undo() {
@@ -475,11 +526,11 @@ function replaceAll() {
 function toggleNotes() { $("notesBar").classList.toggle("hidden"); if (!$("notesBar").classList.contains("hidden")) $("notes").focus(); }
 
 async function splitChapter() {
-  if (!currentChapterId) { alert("先选择章节"); return; }
+  if (!currentChapterId) { showToast("先选择章节", "err"); return; }
   const ta = $("content");
   const at = ta.selectionStart;
-  if (at <= 0) { alert("把光标放在要拆分的位置（拆分点之后的内容会进新章节）"); return; }
-  const title = prompt("新章节标题", "新章节");
+  if (at <= 0) { showToast("把光标放在要拆分的位置（拆分点之后的内容会进新章节）", "err"); return; }
+  const title = await askCard({ title: "拆分为新章节", msg: "拆分点之后的内容会进入新章节。", input: "新章节标题", def: "新章节", okText: "拆分" });
   if (!title) return;
   await api(`/api/chapters/${currentChapterId}/split`, { body: { at, title } });
   await loadChapters();
@@ -503,7 +554,7 @@ async function showRevisions() {
       <span>${new Date(r.created_at * 1000).toLocaleString()} · ${r.chars}字</span>
       <button class="ic" onclick="openDiff(${r.id})" title="和当前正文逐行对比增删">对比</button>
       <button class="ic" onclick="restoreRevision(${r.id})">恢复</button>
-      <button class="ic" onclick="recoverFromRevision(${r.id})" title="让 AI 读这版旧草稿，把被删掉的好内容找回成段落追加">AI找回</button>
+      <button class="ic" onclick="recoverFromRevision(${r.id})" title="让 AI 读这版旧草稿，把被删掉的好内容找回成段落追加">AI 找回</button>
     </div>`).join("") : '<div class="empty">还没有存过版本</div>';
   $("revOverlay").classList.remove("hidden");
 }
@@ -522,12 +573,12 @@ async function openDiff(rid) {
       return `<div class="d-del">－ ${esc(o.old)}</div><div class="d-ins">＋ ${esc(o.new)}</div>`;
     }).join("") || '<div class="empty">无差异</div>';
     $("diffOverlay").classList.remove("hidden");
-  } catch (e) { alert("对比失败：" + e.message); }
+  } catch (e) { showToast("对比失败：" + e.message, "err"); }
   setMicStatus("");
 }
 function closeDiff() { $("diffOverlay").classList.add("hidden"); }
 async function restoreRevision(rid) {
-  if (!confirm("恢复此版本？当前正文会被覆盖（可先存个版本备份）")) return;
+  if (!await askCard({ title: "恢复此版本？", msg: "当前正文会被覆盖（可先存个版本备份）。", okText: "恢复" })) return;
   const c = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/restore`, { method: "POST" });
   $("content").value = c.content || ""; $("chapTitle").value = c.title || "";
   onContentInput();
@@ -557,12 +608,12 @@ async function exportChap(fmt) {
     let url, name;
     if (fmt.startsWith("work-")) {
       const f = fmt.slice(5);
-      if (!currentWorkId) { alert("先选作品"); return; }
+      if (!currentWorkId) { showToast("先选作品", "err"); return; }
       url = `/api/works/${currentWorkId}/export?format=${f}`;
       const w = works.find(x => x.id === currentWorkId);
       name = ((w && w.title) || "work") + "." + f;
     } else {
-      if (!currentChapterId) { alert("先选章节"); return; }
+      if (!currentChapterId) { showToast("先选章节", "err"); return; }
       url = `/api/chapters/${currentChapterId}/export?format=${fmt}`;
       name = ($("chapTitle").value || "chapter") + "." + fmt;
     }
@@ -573,7 +624,8 @@ async function exportChap(fmt) {
     a.href = URL.createObjectURL(blob);
     a.download = name;
     a.click(); URL.revokeObjectURL(a.href);
-  } catch (e) { alert(e.message); }
+    showToast("已导出 " + name, "ok");
+  } catch (e) { showToast(e.message || "导出失败", "err"); }
 }
 
 /* ---------- 大模型设置 ---------- */
@@ -636,14 +688,17 @@ function closeAITools() { $("aiOverlay").classList.add("hidden"); }
 async function aiCheck() {
   if (!currentChapterId) { $("aiResult").textContent = "先选一章"; return; }
   $("aiResult").textContent = "校验中…";
+  busy($("aiCheckBtn"), true);
   try {
     const r = await api("/api/process", { body: { mode: "校验", chapter_id: currentChapterId } });
     $("aiResult").textContent = r.result;
   } catch (e) { $("aiResult").textContent = "出错：" + e.message; }
+  finally { busy($("aiCheckBtn"), false); }
 }
 async function aiSynopsis() {
   if (!currentChapterId) { $("aiResult").textContent = "先选一章"; return; }
   $("aiResult").textContent = "生成摘要中…";
+  busy($("aiSynBtn"), true);
   try {
     const r = await api("/api/process", { body: { mode: "摘要", chapter_id: currentChapterId } });
     $("notes").value = r.result;                 // 摘要填进备注 → 成为续写/扩写/找回的上下文
@@ -651,6 +706,7 @@ async function aiSynopsis() {
     onNotesInput();
     $("aiResult").textContent = "已填入备注：\n\n" + r.result;
   } catch (e) { $("aiResult").textContent = "出错：" + e.message; }
+  finally { busy($("aiSynBtn"), false); }
 }
 
 /* ---------- AI 助手（常驻侧栏，对话即操作，自动存版本可撤销） ---------- */
@@ -676,7 +732,7 @@ function renderAgent() {
     } else if (m.role === "tool") {
       let r = {}; try { r = JSON.parse(m.content); } catch (e) {}
       if (r.error) {
-        html += `<div class="cm err">⚠ ${esc(r.error)}</div>`;
+        html += `<div class="cm err">${esc(r.error)}</div>`;
       } else {
         const sum = r.summary || "已执行操作";
         const rid = r.undo_rid;
@@ -702,6 +758,7 @@ async function sendAgent() {
   if (dirty) await saveNow();
   agentMsgs.push({ role: "user", content: text });
   agentBusy = true;
+  busy($("sendBtn"), true, "发送");
   renderAgent();
   try {
     const r = await api("/api/agent", { body: { messages: agentMsgs, chapter_id: currentChapterId } });
@@ -721,6 +778,7 @@ async function sendAgent() {
     agentMsgs.push({ role: "assistant", content: "出错：" + e.message });
   } finally {
     agentBusy = false;
+    busy($("sendBtn"), false, "发送");
     renderAgent();
     // 自动朗读本轮 AI 的回复与操作摘要（朗读开关 🔊 开启时）
     const uIdx = agentMsgs.map(m => m.role).lastIndexOf("user");
@@ -745,7 +803,7 @@ async function undoAgentAction(rid) {
     agentUndone.add(rid);
     await loadChapter();
     renderAgent();
-  } catch (e) { alert("撤销失败：" + e.message); }
+  } catch (e) { showToast("撤销失败：" + e.message, "err"); }
 }
 function clearAgent() { agentMsgs = []; agentUndone.clear(); renderAgent(); }
 
@@ -779,7 +837,7 @@ function setupAgentRec() {
   };
 }
 function toggleAgentMic() {
-  if (!SR) { alert("浏览器不支持语音识别，请用安卓 Chrome"); return; }
+  if (!SR) { showToast("浏览器不支持语音识别，请用安卓 Chrome", "err"); return; }
   setupAgentRec();
   if (agentMicOn) { agentMicOn = false; try { agentRec.stop(); } catch (e) {} setAgentMic(false); return; }
   if (micOn) { micOn = false; try { rec.stop(); } catch (e) {} setMic(false); } // 同一时刻只允许一个识别
@@ -827,14 +885,14 @@ let entitiesCacheWorkId = null;
 let editingEntityId = null;
 
 async function openWiki() {
-  if (!currentWorkId) { alert("先选一个作品"); return; }
+  if (!currentWorkId) { showToast("先选一个作品", "err"); return; }
   try {
     entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
     entitiesCacheWorkId = currentWorkId;
     renderWikiList();
     resetEntityForm();
     $("wikiOverlay").classList.remove("hidden");
-  } catch (e) { alert("加载失败：" + e.message); }
+  } catch (e) { showToast("加载失败：" + e.message, "err"); }
 }
 function closeWiki() { $("wikiOverlay").classList.add("hidden"); }
 function renderWikiList() {
@@ -847,7 +905,7 @@ function renderWikiList() {
         <button class="ic" onclick="startEditEntity(${e.id})">编辑</button>
         <button class="ic" onclick="delEntity(${e.id})">删除</button>
       </div>
-    </div>`).join("") : '<div class="empty">还没有实体卡片</div>';
+    </div>`).join("") : '<div class="empty">还没有人物/设定卡片</div>';
 }
 function resetEntityForm() {
   editingEntityId = null;
@@ -886,7 +944,7 @@ function startEditEntity(eid) {
   $("entName").focus();
 }
 async function delEntity(eid) {
-  if (!confirm("删除这张实体卡片？")) return;
+  if (!await askCard({ title: "删除这张卡片？", okText: "删除", danger: true })) return;
   await api(`/api/entities/${eid}`, { method: "DELETE" });
   entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
   if (editingEntityId === eid) resetEntityForm();
@@ -977,7 +1035,7 @@ function readerFont(d) { readerFontPx = Math.min(32, Math.max(14, readerFontPx +
 function readerLine() { readerLH = readerLH >= 2.6 ? 1.6 : +(readerLH + 0.3).toFixed(1); localStorage.setItem("rLH", readerLH); $("readView").style.lineHeight = readerLH; }
 function setReaderTts(on) { setIcon($("ttsBtn"), on ? "square" : "play", on ? "停" : "朗读"); }
 function readerToggleTTS() {
-  if (!("speechSynthesis" in window)) { alert("浏览器不支持朗读"); return; }
+  if (!("speechSynthesis" in window)) { showToast("浏览器不支持朗读", "err"); return; }
   if (ttsPlaying) { speechSynthesis.cancel(); ttsPlaying = false; setReaderTts(false); return; }
   const u = new SpeechSynthesisUtterance($("content").value);
   u.lang = "zh-CN"; u.rate = 1;

@@ -61,7 +61,7 @@
             <button data-ic="bookmark" data-label="存为版本" onclick="saveRevision();closeMoreMenu()"></button>
             <button data-ic="clock" data-label="历史版本" onclick="showRevisions();closeMoreMenu()"></button>
             <button data-ic="trash" data-label="回收站" onclick="openTrash();closeMoreMenu()"></button>
-            <button data-ic="users" data-label="实体卡片" onclick="openWiki();closeMoreMenu()"></button>
+            <button data-ic="users" data-label="人物/设定" onclick="openWiki();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI 工具" onclick="openAITools();closeMoreMenu()"></button>
             <button data-ic="settings" data-label="大模型设置" onclick="openSettings();closeMoreMenu()"></button>
             <button data-ic="logout" data-label="退出" onclick="doLogout();closeMoreMenu()"></button>
@@ -125,7 +125,7 @@
         <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
         <button class="ic" id="agentMicBtn" data-ic="mic" onclick="toggleAgentMic()" title="语音输入"></button>
-        <button onclick="sendAgent()">发送</button>
+        <button id="sendBtn" onclick="sendAgent()">发送</button>
         <button class="ic" data-ic="trash" onclick="clearAgent()" title="清空对话"></button>
       </div>
     </aside>
@@ -176,7 +176,7 @@
   <!-- 实体卡片 wiki -->
   <div id="wikiOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
-      <div class="overlay-head"><span>实体卡片</span><button class="ic" data-ic="x" onclick="closeWiki()"></button></div>
+      <div class="overlay-head"><span>人物 / 设定</span><button class="ic" data-ic="x" onclick="closeWiki()"></button></div>
       <div class="set-form">
         <div id="wikiList" class="wiki-list"></div>
         <hr class="sep">
@@ -245,10 +245,28 @@
       <div class="set-form">
         <p class="set-hint">基于作品设定 + 本章正文。校验只列问题不改字；摘要会填进备注，成为后续 AI 上下文。</p>
         <div class="set-actions">
-          <button onclick="aiCheck()">一致性校验</button>
-          <button onclick="aiSynopsis()">生成本章摘要</button>
+          <button id="aiCheckBtn" onclick="aiCheck()">一致性校验</button>
+          <button id="aiSynBtn" onclick="aiSynopsis()">生成本章摘要</button>
         </div>
         <pre id="aiResult" class="ai-result"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- toast 通知层（替代 alert） -->
+  <div id="toast"></div>
+
+  <!-- 通用询问卡（替代 prompt/confirm） -->
+  <div id="askOverlay" class="overlay hidden">
+    <div class="overlay-card ask-card">
+      <div class="overlay-head"><span id="askTitle"></span><button class="ic" data-ic="x" onclick="closeAsk(false)"></button></div>
+      <div class="set-form">
+        <p id="askMsg" class="set-hint"></p>
+        <input id="askInput" class="ask-input hidden" onkeydown="if(event.key==='Enter'){event.preventDefault();closeAsk(true)}">
+        <div class="set-actions">
+          <button id="askOk" onclick="closeAsk(true)">确定</button>
+          <button class="ic" onclick="closeAsk(false)">取消</button>
+        </div>
       </div>
     </div>
   </div>
