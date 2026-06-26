@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
+
 :root {
   --bg: #f6f4ee;
   --panel: #ffffff;
@@ -7,12 +9,25 @@
   --line: #e3ddd0;
   --mic: #c0392b;
   --side-bg: #efece4;
+  --shadow: 0 12px 40px rgba(0,0,0,.18);
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #1a1a1a; --panel: #262626; --ink: #e8e6e1; --muted: #8a8a8a;
     --accent: #8fb96b; --line: #3a3a3a; --mic: #e57373; --side-bg: #202020;
+    --shadow: 0 14px 44px rgba(0,0,0,.5);
   }
+}
+/* 手动主题覆盖（优先于系统偏好；不设 data-theme 时跟随系统） */
+:root[data-theme="dark"] {
+  --bg: #1a1a1a; --panel: #262626; --ink: #e8e6e1; --muted: #8a8a8a;
+  --accent: #8fb96b; --line: #3a3a3a; --mic: #e57373; --side-bg: #202020;
+  --shadow: 0 14px 44px rgba(0,0,0,.5);
+}
+:root[data-theme="light"] {
+  --bg: #f6f4ee; --panel: #ffffff; --ink: #2b2b2b; --muted: #8a8178;
+  --accent: #6b8e4e; --line: #e3ddd0; --mic: #c0392b; --side-bg: #efece4;
+  --shadow: 0 12px 40px rgba(0,0,0,.18);
 }
 
 * { box-sizing: border-box; }
@@ -27,13 +42,22 @@ body {
 button {
   font: inherit; border: 1px solid var(--line); background: var(--panel);
   color: var(--ink); border-radius: 8px; padding: 7px 10px; cursor: pointer;
+  transition: background .12s, opacity .12s, border-color .12s, color .12s;
 }
 button:active { background: var(--line); }
 input, textarea, select {
   font: inherit; border: 1px solid var(--line); background: var(--panel);
   color: var(--ink); border-radius: 8px; padding: 8px;
+  transition: border-color .12s;
 }
+input:focus, textarea:focus, select:focus { border-color: var(--accent); outline: none; }
 .link { display: inline-block; margin-top: 10px; color: var(--accent); font-size: 14px; text-decoration: none; }
+
+/* 衬线字体（写小说更入戏；默认无衬线，顶栏「文/宋」切换） */
+html.font-serif .content,
+html.font-serif .read-text {
+  font-family: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "SimSun", serif;
+}
 
 /* 登录 */
 .screen { max-width: 360px; margin: 16vh auto; text-align: center; padding: 0 16px; }
@@ -58,12 +82,13 @@ input, textarea, select {
 .empty { color: var(--muted); font-size: 13px; padding: 6px 14px; }
 
 .work { border-bottom: 1px solid var(--line); }
-.w-row { display: flex; align-items: center; padding: 9px 12px; cursor: pointer; }
+.w-row { display: flex; align-items: center; padding: 9px 12px; cursor: pointer; transition: background .1s; }
 .w-row:hover { background: var(--panel); }
 .w-title { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chaps { padding: 2px 0 4px; }
 .chap {
   display: flex; align-items: center; padding: 7px 12px 7px 14px; cursor: pointer; gap: 4px;
+  transition: background .1s;
 }
 .chap:hover { background: var(--panel); }
 .chap.cur { background: var(--panel); border-left: 3px solid var(--accent); padding-left: 11px; }
@@ -74,7 +99,7 @@ input, textarea, select {
 .c-wc { color: var(--muted); font-size: 12px; }
 .c-del {
   border: none; background: transparent; color: var(--muted);
-  padding: 2px 5px; font-size: 13px; opacity: 0; border-radius: 4px;
+  padding: 2px 5px; font-size: 13px; opacity: 0; border-radius: 4px; transition: opacity .1s, color .1s;
 }
 .w-row:hover .c-del, .chap:hover .c-del { opacity: .7; }
 .c-del:hover { opacity: 1; color: var(--mic); }
@@ -90,10 +115,23 @@ input, textarea, select {
   background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap;
 }
 .title-input { flex: 1; min-width: 100px; font-weight: 600; border: none; background: transparent; }
-.title-input:focus { outline: 1px solid var(--line); }
+.title-input:focus { outline: 1px solid var(--line); border-radius: 4px; }
 .wc { color: var(--muted); font-size: 13px; white-space: nowrap; }
 .save-stat { color: var(--accent); font-size: 12px; min-width: 40px; }
-.ic { padding: 7px 8px; white-space: nowrap; }
+.ic { padding: 7px 8px; white-space: nowrap; opacity: .8; }
+.ic:hover { opacity: 1; }
+
+/* 顶栏「⋯更多」下拉 */
+.menu-wrap { position: relative; }
+.menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 60;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: var(--shadow); padding: 6px; min-width: 176px;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.menu button { display: flex; align-items: center; gap: 8px; justify-content: flex-start;
+  padding: 8px 10px; border: none; background: transparent; text-align: left; opacity: 1; }
+.menu button:hover { background: var(--side-bg); }
 
 .modes { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
 .mode { flex: 1; min-width: 60px; }
@@ -112,15 +150,22 @@ input, textarea, select {
 .notesbar { padding: 8px 10px; border-bottom: 1px solid var(--line); }
 .notesbar textarea { width: 100%; min-height: 56px; font-size: 14px; }
 
-.draft { margin: 10px; padding: 12px; min-height: 44px; border-radius: 8px; background: var(--panel); border: 1px dashed var(--line); color: var(--muted); font-size: 15px; }
+.draft { margin: 10px auto; padding: 12px; min-height: 44px; width: calc(100% - 20px); max-width: 760px;
+  border-radius: 8px; background: var(--panel); border: 1px dashed var(--line); color: var(--muted); font-size: 15px; }
 .draft.active { color: var(--ink); border-style: solid; }
 
-.content { flex: 1; width: calc(100% - 20px); margin: 10px; resize: none; line-height: 1.9; font-size: 17px; border-radius: 8px; }
+.content { flex: 1; width: calc(100% - 20px); max-width: 760px; margin: 10px auto; resize: none;
+  line-height: 1.9; font-size: 17px; border-radius: 8px; transition: font-size .15s; }
+
+/* 打字机模式测量镜像（隐藏，用于专注模式下把光标行滚到视口中部） */
+.tw-mirror { position: absolute; left: -9999px; top: 0; visibility: hidden;
+  white-space: pre-wrap; overflow-wrap: break-word; word-wrap: break-word; }
 
 /* 专注模式 */
 #app.focus .sidebar, #app.focus .modes, #app.focus .micbar,
 #app.focus .findbar, #app.focus .notesbar, #app.focus .draft { display: none !important; }
-#app.focus .content { font-size: 20px; }
+#app.focus .content { font-size: 21px; }
+#app.focus .main { background: var(--bg); }
 
 /* 移动端：侧栏变抽屉 */
 @media (max-width: 700px) {
@@ -130,11 +175,13 @@ input, textarea, select {
   }
   #app.side-open .sidebar { transform: none; }
   .c-del { opacity: .5; }
+  .topbar { gap: 4px; padding: 7px 8px; }
+  .title-input { min-width: 60px; }
 }
 
 /* 弹层（历史版本） */
 .overlay { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; padding: 16px; }
-.overlay-card { background: var(--panel); border-radius: 12px; width: 100%; max-width: 460px; max-height: 70vh; display: flex; flex-direction: column; }
+.overlay-card { background: var(--panel); border-radius: 12px; width: 100%; max-width: 460px; max-height: 70vh; display: flex; flex-direction: column; box-shadow: var(--shadow); }
 .overlay-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 600; }
 .rev-list { overflow-y: auto; padding: 6px; }
 .rev { display: flex; align-items: center; justify-content: space-between; padding: 9px 10px; border-bottom: 1px solid var(--line); font-size: 14px; }
@@ -200,7 +247,7 @@ input, textarea, select {
 .mention-pop {
   position: fixed; z-index: 60; width: 280px; max-width: calc(100vw - 16px);
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-  box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 10px 12px; font-size: 14px;
+  box-shadow: var(--shadow); padding: 10px 12px; font-size: 14px;
 }
 .mp-head { font-size: 14px; }
 .mp-head b { color: var(--accent); }

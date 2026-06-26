@@ -244,6 +244,7 @@ function onContentInput() {
   dirty = true; updateSaveStat("未保存"); updateWC();
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveNow, 1500);
+  typewriterCenter();
 }
 function onNotesInput() { dirty = true; clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); }
 
@@ -783,7 +784,56 @@ function readerToggleTTS() {
 /* ---------- 布局 ---------- */
 
 function toggleSidebar() { $("app").classList.toggle("side-open"); }
-function toggleFocus() { $("app").classList.toggle("focus"); }
+function toggleFocus() { $("app").classList.toggle("focus"); setTimeout(typewriterCenter, 30); }
+
+/* 顶栏「⋯更多」下拉 */
+function toggleMoreMenu(e) { e?.stopPropagation(); $("moreMenu").classList.toggle("hidden"); }
+function closeMoreMenu() { $("moreMenu").classList.add("hidden"); }
+
+/* 明暗主题：默认跟随系统，手动切换后记忆 */
+function applyTheme(t) {
+  if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+  else document.documentElement.removeAttribute("data-theme");
+  const dark = t === "dark" || (t == null && matchMedia("(prefers-color-scheme: dark)").matches);
+  const b = $("themeBtn"); if (b) b.textContent = dark ? "☀" : "🌙";
+}
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const isDark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  const next = isDark ? "light" : "dark";
+  localStorage.setItem("theme", next); applyTheme(next);
+}
+if (window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (!localStorage.getItem("theme")) applyTheme(null);
+});
+
+/* 衬线/无衬线字体（写小说更入戏） */
+function applyFont(serif) {
+  document.documentElement.classList.toggle("font-serif", !!serif);
+  const b = $("fontBtn"); if (b) b.textContent = serif ? "宋" : "文";
+}
+function toggleFont() {
+  const serif = !document.documentElement.classList.contains("font-serif");
+  localStorage.setItem("fontSerif", serif ? "1" : "0"); applyFont(serif);
+}
+
+/* 专注模式打字机：用镜像测光标前文本高度，把光标行滚到视口约中部 */
+let twMirror = null;
+function typewriterCenter() {
+  if (!$("app").classList.contains("focus")) return;
+  const el = $("content"); if (!el) return;
+  if (!twMirror) { twMirror = document.createElement("div"); twMirror.className = "tw-mirror"; document.body.appendChild(twMirror); }
+  const cs = getComputedStyle(el);
+  const sb = el.offsetWidth - el.clientWidth - 2;          // 滚动条宽（边框各 1px）
+  twMirror.style.width = Math.max(0, el.clientWidth - sb) + "px";
+  twMirror.style.fontSize = cs.fontSize;
+  twMirror.style.lineHeight = cs.lineHeight;
+  twMirror.style.fontFamily = cs.fontFamily;
+  twMirror.style.padding = cs.padding;
+  twMirror.style.boxSizing = "border-box";
+  twMirror.textContent = el.value.slice(0, el.selectionStart);
+  el.scrollTop = Math.max(0, twMirror.scrollHeight - el.clientHeight * 0.42);
+}
 
 /* ---------- 全局事件 ---------- */
 
@@ -792,12 +842,20 @@ document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); toggleFind(); }
 });
 $("content").addEventListener("input", onContentInput);
+$("content").addEventListener("keyup", typewriterCenter);
+$("content").addEventListener("click", typewriterCenter);
 $("notes").addEventListener("input", onNotesInput);
 $("chapTitle").addEventListener("input", () => { dirty = true; clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); });
+document.addEventListener("click", (e) => {
+  const m = $("moreMenu");
+  if (m && !m.classList.contains("hidden") && !e.target.closest(".menu-wrap")) m.classList.add("hidden");
+});
 
 /* ---------- 启动 ---------- */
 
 (async function start() {
+  applyTheme(localStorage.getItem("theme"));
+  applyFont(localStorage.getItem("fontSerif") === "1");
   // 根据是否开放注册，决定显示注册入口
   try {
     const s = await api("/api/signup-status", { method: "GET" });

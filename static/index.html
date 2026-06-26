@@ -50,16 +50,23 @@
           <option value="work-txt">整本TXT</option>
           <option value="work-docx">整本DOCX</option>
         </select>
-        <button class="ic" onclick="saveRevision()" title="存为版本">🗂存版</button>
-        <button class="ic" onclick="showRevisions()" title="历史版本">🕘历史</button>
-        <button class="ic" onclick="openTrash()" title="回收站">🗑回收</button>
-        <button class="ic" onclick="openAITools()" title="AI 写作工具（校验/摘要）">✦AI</button>
-        <button class="ic" onclick="openChat()" title="和 AI 探讨剧情">💬</button>
-        <button class="ic" onclick="openWiki()" title="实体卡片（人物/地点…）">👥实体</button>
+        <button class="ic" id="themeBtn" onclick="toggleTheme()" title="明暗主题">🌙</button>
+        <button class="ic" id="fontBtn" onclick="toggleFont()" title="衬线/无衬线字体">文</button>
         <button class="ic" onclick="toggleFocus()" title="专注">⊚</button>
         <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
-        <button class="ic" onclick="openSettings()" title="大模型设置">⚙</button>
-        <button class="ic" onclick="doLogout()" title="退出">⏻</button>
+        <div class="menu-wrap">
+          <button class="ic" onclick="toggleMoreMenu(event)" title="更多">⋯</button>
+          <div id="moreMenu" class="menu hidden">
+            <button onclick="saveRevision();closeMoreMenu()">🗂 存为版本</button>
+            <button onclick="showRevisions();closeMoreMenu()">🕘 历史版本</button>
+            <button onclick="openTrash();closeMoreMenu()">🗑 回收站</button>
+            <button onclick="openWiki();closeMoreMenu()">👥 实体卡片</button>
+            <button onclick="openAITools();closeMoreMenu()">✦ AI 工具</button>
+            <button onclick="openChat();closeMoreMenu()">💬 探讨剧情</button>
+            <button onclick="openSettings();closeMoreMenu()">⚙ 大模型设置</button>
+            <button onclick="doLogout();closeMoreMenu()">⏻ 退出</button>
+          </div>
+        </div>
       </header>
 
       <div class="modes">
