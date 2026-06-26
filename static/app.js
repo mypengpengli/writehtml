@@ -26,6 +26,7 @@ let dragCid = null;
 let agentMsgs = [];
 let agentBusy = false;
 let agentUndone = new Set();
+let agentSelection = null;
 
 /* ---------- 图标（内联 SVG，Lucide 风格 24×24 描边） ---------- */
 const _W = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
@@ -61,6 +62,7 @@ const ICONS = {
   play:     `<svg ${_W}><polygon points="6 3 20 12 6 21" fill="currentColor" stroke="none"/></svg>`,
   plus:     `<svg ${_W}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
   enter:    `<svg ${_W}><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>`,
+  download: `<svg ${_W}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
   feather:  `<svg ${_W}><path d="M20.2 12.2a6 6 0 0 0-8.5-8.5L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/></svg>`,
   type:     `<svg ${_W}><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><path d="M12 4v16"/></svg>`,
   grip:     `<svg ${_W}><circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none"/></svg>`,
@@ -254,6 +256,7 @@ async function loadChapters() {
 async function selectChapter(cid) {
   if (dirty) await saveNow();
   currentChapterId = cid;
+  clearAgentSelection();
   agentUndone.clear();
   await loadConversation();  // 切章：从服务端拉取该章持久化对话（刷新/切回都不丢）
   await loadChapter();
@@ -354,6 +357,7 @@ function onContentInput() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveNow, 1500);
   typewriterCenter();
+  updateSelectionTools();
 }
 function onNotesInput() { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); }
 
@@ -386,8 +390,11 @@ function updateWC() {
 
 function setMode(m) {
   mode = m;
+  const sel = $("modeSel");
+  if (sel && sel.value !== m) sel.value = m;
   document.querySelectorAll(".mode").forEach(b => b.classList.toggle("active", b.dataset.mode === m));
   $("genBtn").classList.toggle("hidden", !(m === "扩写" || m === "续写"));
+  $("genBtn").title = m === "扩写" ? "把当前语音草稿扩写到正文" : "把当前语音草稿续写到正文";
   draftBuffer = ""; showDraft("");
 }
 
@@ -435,6 +442,64 @@ function showDraft(s) {
   else { el.textContent = s; el.classList.add("active"); }
 }
 
+function updateSelectionTools() {
+  const el = $("content"), tools = $("selectionTools");
+  if (!el || !tools) return;
+  tools.classList.toggle("hidden", el.selectionStart === el.selectionEnd);
+}
+
+function getContentSelection() {
+  const el = $("content");
+  if (!el || el.selectionStart === el.selectionEnd) return null;
+  const start = el.selectionStart, end = el.selectionEnd;
+  const text = el.value.slice(start, end);
+  if (!text.trim()) return null;
+  if (text.length > 8000) {
+    showToast("选区太长，请少选一点再交给 AI", "err");
+    return null;
+  }
+  return {
+    text,
+    start,
+    end,
+    before: el.value.slice(Math.max(0, start - 300), start),
+    after: el.value.slice(end, Math.min(el.value.length, end + 300)),
+    title: $("chapTitle").value || "",
+  };
+}
+
+function selectionPreview(sel) {
+  const s = (sel?.text || "").trim().replace(/\s+/g, " ");
+  return s.length > 120 ? s.slice(0, 120) + "…" : s;
+}
+
+function renderAgentSelection() {
+  const box = $("agentSelection");
+  if (!box) return;
+  box.classList.toggle("hidden", !agentSelection);
+  if (agentSelection) $("agentSelectionText").textContent = selectionPreview(agentSelection);
+}
+
+function quoteSelectionToAgent() {
+  if (!currentChapterId) { showToast("先选择或新建一个章节", "err"); return; }
+  const sel = getContentSelection();
+  if (!sel) { showToast("先在正文里选中一段文字", "err"); return; }
+  agentSelection = sel;
+  if (!$("app").classList.contains("ai-open")) toggleAISide();
+  renderAgentSelection();
+  const input = $("agentInput");
+  input.placeholder = "告诉 AI 要怎么处理这段选区，比如：把这段改得更紧张";
+  input.focus();
+  showToast("已把选区交给 AI，本轮发送会带上这段文字", "ok");
+}
+
+function clearAgentSelection() {
+  agentSelection = null;
+  renderAgentSelection();
+  const input = $("agentInput");
+  if (input) input.placeholder = "让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）";
+}
+
 /* ---------- AI 处理（本地追加，不覆盖正文，避免丢手打内容） ---------- */
 
 async function processAndAppend(text) {
@@ -462,6 +527,7 @@ async function processSelection(m, style) {
     });
     el.setRangeText(r.result, s, e, "end");   // 原地替换选区，保留撤销历史
     onContentInput();                          // 触发自动保存（走 PUT /api/chapters/{cid}）
+    updateSelectionTools();
     setMicStatus("");
   } catch (e) { setMicStatus("出错：" + e.message); }
 }
@@ -717,7 +783,7 @@ async function aiSynopsis() {
 function toggleAISide() {
   const open = $("app").classList.toggle("ai-open");
   localStorage.setItem("aiOpen", open ? "1" : "0");
-  if (open) setTimeout(() => { setAiTtsBtn(); renderAgent(); $("agentInput").focus(); }, 50);
+  if (open) setTimeout(() => { setAiTtsBtn(); renderAgent(); renderAgentSelection(); $("agentInput").focus(); }, 50);
   else if ("speechSynthesis" in window) speechSynthesis.cancel(); // 收起侧栏时停止朗读
 }
 function renderAgent() {
@@ -763,8 +829,12 @@ async function sendAgent() {
   agentBusy = true;
   busy($("sendBtn"), true, "发送");
   renderAgent();
+  const selection = agentSelection;
+  const body = { text, chapter_id: currentChapterId };
+  if (selection) body.selection = selection;
   try {
-    const r = await api("/api/agent", { body: { text, chapter_id: currentChapterId } });
+    const r = await api("/api/agent", { body });
+    if (selection) clearAgentSelection();
     agentMsgs = Array.isArray(r.messages) ? r.messages : agentMsgs;
     if (r.compacted) showToast("已压缩早期对话，保留最近几轮", "ok");
     // 检测工具是否改动正文/侧栏，决定刷新哪块
@@ -1075,7 +1145,7 @@ function applyTheme(t) {
   if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
   else document.documentElement.removeAttribute("data-theme");
   const dark = t === "dark" || (t == null && matchMedia("(prefers-color-scheme: dark)").matches);
-  const b = $("themeBtn"); if (b) setIcon(b, dark ? "sun" : "moon");
+  const b = $("themeBtn"); if (b) setIcon(b, dark ? "sun" : "moon", dark ? "浅色主题" : "深色主题");
 }
 function toggleTheme() {
   const cur = document.documentElement.getAttribute("data-theme");
@@ -1090,7 +1160,7 @@ if (window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEven
 /* 衬线/无衬线字体（写小说更入戏） */
 function applyFont(serif) {
   document.documentElement.classList.toggle("font-serif", !!serif);
-  const b = $("fontBtn"); if (b) b.textContent = serif ? "宋" : "文";
+  const b = $("fontBtn"); if (b) setIcon(b, "type", serif ? "衬线字体" : "无衬线字体");
 }
 function toggleFont() {
   const serif = !document.documentElement.classList.contains("font-serif");
@@ -1122,8 +1192,10 @@ document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); toggleFind(); }
 });
 $("content").addEventListener("input", onContentInput);
-$("content").addEventListener("keyup", typewriterCenter);
-$("content").addEventListener("click", typewriterCenter);
+$("content").addEventListener("keyup", () => { typewriterCenter(); updateSelectionTools(); });
+$("content").addEventListener("click", () => { typewriterCenter(); updateSelectionTools(); });
+$("content").addEventListener("mouseup", updateSelectionTools);
+$("content").addEventListener("select", updateSelectionTools);
 $("notes").addEventListener("input", onNotesInput);
 $("chapTitle").addEventListener("input", () => { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); });
 document.addEventListener("click", (e) => {

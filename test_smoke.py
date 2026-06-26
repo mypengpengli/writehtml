@@ -254,6 +254,23 @@ ok(c.post(f"/api/chapters/{cid}/revisions/{_undo}/restore", headers=H(tokA)).jso
 _conv = c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()
 ok(any(m.get("role") == "user" and "把你好改成" in m.get("content", "") for m in _conv["messages"]), "对话已持久化(可取回)")
 ok(len(c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokB)).json()["messages"]) == 0, "他人章对话隔离(只看得到自己的空)")
+
+# 临时选区上下文：本轮喂给模型，但不污染持久化对话
+_seen_sel = {}
+def _capture_selection(messages, tools, **kw):
+    _seen_sel["messages"] = messages
+    return _msg("收到选区。")
+llm.agent_chat = _capture_selection
+c.post("/api/agent", json={
+    "text": "把这段改紧张",
+    "chapter_id": cid,
+    "selection": {"text": "你好", "start": 0, "end": 2, "before": "", "after": ""},
+}, headers=H(tokA))
+_sel_prompt = "\n".join(m.get("content", "") for m in _seen_sel["messages"] if m.get("role") == "system")
+ok("selected_text" in _sel_prompt and "你好" in _sel_prompt, "agent 本轮收到选区上下文")
+_conv_sel = c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()
+ok(not any("selected_text" in (m.get("content") or "") for m in _conv_sel["messages"]), "agent 选区上下文不持久化")
+
 ok(c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).status_code == 200, "清空对话 200")
 ok(len(c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()["messages"]) == 0, "清空后对话为空")
 

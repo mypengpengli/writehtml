@@ -644,6 +644,48 @@ def _agent_system(uid, cid):
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
+def _agent_selection_system(uid, cid, selection):
+    """把前端当前选区作为本轮临时上下文喂给模型，不持久化到对话历史。"""
+    if not cid or not isinstance(selection, dict):
+        return None
+    selected = selection.get("text")
+    if not isinstance(selected, str) or not selected.strip():
+        return None
+    if len(selected) > 8000:
+        raise HTTPException(400, "选区太长，请少选一点再交给 AI")
+
+    c = db.get_chapter_meta(cid, uid)
+    if not c:
+        return None
+    content = c["content"] or ""
+    start, end = selection.get("start"), selection.get("end")
+    exact_at_range = (
+        isinstance(start, int) and isinstance(end, int)
+        and 0 <= start <= end <= len(content)
+        and content[start:end] == selected
+    )
+    if exact_at_range:
+        location = f"客户端选区位置已校验：start={start}, end={end}。"
+    elif selected in content:
+        location = "客户端选区位置可能已变化，但 selected_text 仍可在当前正文中找到。"
+    else:
+        location = "注意：当前保存正文中找不到 selected_text。若要修改，必须先 read_chapter 重新定位准确原文。"
+
+    before = selection.get("before") if isinstance(selection.get("before"), str) else ""
+    after = selection.get("after") if isinstance(selection.get("after"), str) else ""
+    parts = [
+        "用户本轮在编辑器正文中选中了一个片段。这个选区只适用于本轮请求，不代表长期上下文。",
+        "如果用户说“这段”“选区”“这里”“刚才选中的内容”，就是指下面 selected_text。",
+        "若用户要求修改该选区，优先使用 edit_passage 或 replace_text；old_text 必须完整使用 selected_text 的原文，不能摘要、不能改标点、不能改空白。",
+        location,
+        "selected_text:\n" + selected,
+    ]
+    if before or after:
+        parts.append("选区前后文（仅用于理解和定位，不要把它们一起替换）：\n"
+                     + "before:\n" + before[-300:] + "\n\nafter:\n" + after[:300])
+    return {"role": "system", "content": "\n\n".join(parts)}
+
+
 def _tool_read_chapter(uid, cid, cfg, args):
     if not cid:
         return _agent_err("当前没有选中章节")
@@ -839,6 +881,7 @@ async def agent(request: Request):
     body = await request.json()
     text = (body.get("text") or "").strip()
     cid = body.get("chapter_id")
+    selection = body.get("selection")
     if not text:
         raise HTTPException(400, "没有对话内容")
     st = db.get_settings(uid) or {}
@@ -857,6 +900,9 @@ async def agent(request: Request):
 
     # 发给模型的数组：系统提示 + 早期摘要(若有) + 当前对话
     messages = [_agent_system(uid, cid)]
+    selection_msg = _agent_selection_system(uid, cid, selection)
+    if selection_msg:
+        messages.append(selection_msg)
     if summary:
         messages.append({"role": "user", "content": "[此前对话摘要]\n" + summary})
     messages.extend(msgs)
