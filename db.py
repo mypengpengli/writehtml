@@ -419,6 +419,32 @@ def update_chapter(cid, user_id, title, content, notes):
         return True
 
 
+def replace_text_in_chapter(cid, user_id, old, new):
+    """在正文里定位 old 的第一处出现并替换为 new，整章回写。
+    供 AI agent 的 replace_text 工具用——现在只有整章覆盖/末尾追加，缺"定位替换"。
+    找不到 old 返回 None（让上层提示 AI 重新读取正文再试）。"""
+    if not old:
+        return None
+    now = time.time()
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        chap = conn.execute("SELECT content FROM chapters WHERE id=?", (cid,)).fetchone()
+        if not chap:
+            return None
+        content = chap["content"] or ""
+        if old not in content:
+            return None
+        content = content.replace(old, new, 1)
+        conn.execute("UPDATE chapters SET content=?, updated_at=? WHERE id=?", (content, now, cid))
+        conn.execute(
+            "UPDATE works SET updated_at=? WHERE id="
+            "(SELECT work_id FROM chapters WHERE id=?)",
+            (now, cid),
+        )
+        return content
+
+
 def delete_chapter(cid, user_id):
     """软删（移入回收站），可恢复。"""
     now = time.time()

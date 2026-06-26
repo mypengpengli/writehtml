@@ -18,6 +18,10 @@ let saveTimer = null, dirty = false;
 let findPos = [], findIdx = -1;
 // 拖拽
 let dragCid = null;
+// AI 助手（agent）
+let agentMsgs = [];
+let agentBusy = false;
+let agentUndone = new Set();
 
 /* ---------- 通用 ---------- */
 
@@ -149,6 +153,8 @@ async function loadChapters() {
 async function selectChapter(cid) {
   if (dirty) await saveNow();
   currentChapterId = cid;
+  agentMsgs = []; agentUndone.clear();  // 切章清空 agent 上下文，避免跨章错乱
+  if ($("app").classList.contains("ai-open")) renderAgent();
   await loadChapter();
   renderTree();
   if (window.innerWidth <= 700) $("app").classList.remove("side-open");
@@ -588,34 +594,84 @@ async function aiSynopsis() {
   } catch (e) { $("aiResult").textContent = "出错：" + e.message; }
 }
 
-/* ---------- 与 AI 探讨剧情（多轮对话，不污染正文） ---------- */
+/* ---------- AI 助手（常驻侧栏，对话即操作，自动存版本可撤销） ---------- */
 
-let chatMsgs = [];
-let chatError = "";
-function openChat() { $("chatOverlay").classList.remove("hidden"); renderChat(); setTimeout(() => $("chatInput").focus(), 50); }
-function closeChat() { $("chatOverlay").classList.add("hidden"); }
-function renderChat() {
-  const el = $("chatMsgs");
-  el.innerHTML = chatMsgs.length ? chatMsgs.map(m =>
-    `<div class="cm ${m.role}">${esc(m.content)}</div>`).join("") :
-    '<div class="empty">和 AI 探讨剧情，不会动你的正文。AI 会读作品设定和本章上下文。</div>';
-  if (chatError) el.innerHTML += `<div class="cm err">${esc(chatError)}</div>`;
+function toggleAISide() {
+  const open = $("app").classList.toggle("ai-open");
+  localStorage.setItem("aiOpen", open ? "1" : "0");
+  if (open) setTimeout(() => { renderAgent(); $("agentInput").focus(); }, 50);
+}
+function renderAgent() {
+  const el = $("agentMsgs");
+  if (!agentMsgs.length && !agentBusy) {
+    el.innerHTML = '<div class="empty">让 AI 帮你改稿、续写、回退版本… 每步操作自动存版本，可撤销。</div>';
+    return;
+  }
+  let html = "";
+  for (const m of agentMsgs) {
+    if (m.role === "user") {
+      html += `<div class="cm user">${esc(m.content)}</div>`;
+    } else if (m.role === "assistant") {
+      if (m.content) html += `<div class="cm assistant">${esc(m.content)}</div>`;
+    } else if (m.role === "tool") {
+      let r = {}; try { r = JSON.parse(m.content); } catch (e) {}
+      if (r.error) {
+        html += `<div class="cm err">⚠ ${esc(r.error)}</div>`;
+      } else {
+        const sum = r.summary || "已执行操作";
+        const rid = r.undo_rid;
+        const undone = rid && agentUndone.has(rid);
+        const card = undone
+          ? `<span class="done-tag">已撤销</span>`
+          : (rid ? `<button class="undo-btn" onclick="undoAgentAction(${rid})">撤销</button>` : "");
+        html += `<div class="cm action${undone ? " done" : ""}"><div class="act-bar"><span class="act-txt">✏️ ${esc(sum)}</span>${card}</div></div>`;
+      }
+    }
+  }
+  if (agentBusy) html += '<div class="cm assistant">… 思考中</div>';
+  el.innerHTML = html;
   el.scrollTop = el.scrollHeight;
 }
-async function sendChat() {
-  const text = $("chatInput").value.trim();
+async function sendAgent() {
+  if (agentBusy) return;
+  const el = $("agentInput");
+  const text = el.value.trim();
   if (!text) return;
-  $("chatInput").value = "";
-  chatError = "";
-  chatMsgs.push({ role: "user", content: text });
-  renderChat();
+  el.value = "";
+  agentMsgs.push({ role: "user", content: text });
+  agentBusy = true;
+  renderAgent();
   try {
-    const r = await api("/api/chat", { body: { messages: chatMsgs, chapter_id: currentChapterId } });
-    chatMsgs.push({ role: "assistant", content: r.reply });
-    renderChat();
-  } catch (e) { chatError = "出错：" + e.message; renderChat(); }
+    const r = await api("/api/agent", { body: { messages: agentMsgs, chapter_id: currentChapterId } });
+    agentMsgs = Array.isArray(r.messages) ? r.messages : agentMsgs;
+    // 检测工具是否改动正文/侧栏，决定刷新哪块
+    let contentChanged = false, sidebarDirty = false;
+    for (const m of agentMsgs) {
+      if (m.role === "tool") {
+        let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
+        if (rr.changed) contentChanged = true;
+        if (rr.sidebar_dirty) sidebarDirty = true;
+      }
+    }
+    if (sidebarDirty) await loadChapters();
+    else if (contentChanged && currentChapterId) await loadChapter();
+  } catch (e) {
+    agentMsgs.push({ role: "assistant", content: "出错：" + e.message });
+  } finally {
+    agentBusy = false;
+    renderAgent();
+  }
 }
-function clearChat() { chatMsgs = []; chatError = ""; renderChat(); }
+async function undoAgentAction(rid) {
+  if (!currentChapterId || !rid) return;
+  try {
+    await api(`/api/chapters/${currentChapterId}/revisions/${rid}/restore`, { method: "POST" });
+    agentUndone.add(rid);
+    await loadChapter();
+    renderAgent();
+  } catch (e) { alert("撤销失败：" + e.message); }
+}
+function clearAgent() { agentMsgs = []; agentUndone.clear(); renderAgent(); }
 
 /* ---------- 实体卡片 wiki（人物/地点…，喂给 AI 当结构化设定） ---------- */
 
@@ -856,6 +912,7 @@ document.addEventListener("click", (e) => {
 (async function start() {
   applyTheme(localStorage.getItem("theme"));
   applyFont(localStorage.getItem("fontSerif") === "1");
+  if (localStorage.getItem("aiOpen") === "1") $("app").classList.add("ai-open");
   // 根据是否开放注册，决定显示注册入口
   try {
     const s = await api("/api/signup-status", { method: "GET" });

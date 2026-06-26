@@ -54,6 +54,7 @@
         <button class="ic" id="fontBtn" onclick="toggleFont()" title="衬线/无衬线字体">文</button>
         <button class="ic" onclick="toggleFocus()" title="专注">⊚</button>
         <button class="ic" onclick="toggleRead()" title="阅读">📖</button>
+        <button class="ic" id="aiToggleBtn" onclick="toggleAISide()" title="AI 助手（对话即操作）">🤖</button>
         <div class="menu-wrap">
           <button class="ic" onclick="toggleMoreMenu(event)" title="更多">⋯</button>
           <div id="moreMenu" class="menu hidden">
@@ -62,7 +63,6 @@
             <button onclick="openTrash();closeMoreMenu()">🗑 回收站</button>
             <button onclick="openWiki();closeMoreMenu()">👥 实体卡片</button>
             <button onclick="openAITools();closeMoreMenu()">✦ AI 工具</button>
-            <button onclick="openChat();closeMoreMenu()">💬 探讨剧情</button>
             <button onclick="openSettings();closeMoreMenu()">⚙ 大模型设置</button>
             <button onclick="doLogout();closeMoreMenu()">⏻ 退出</button>
           </div>
@@ -110,6 +110,21 @@
 
       <textarea id="content" class="content" spellcheck="true" lang="zh-CN" placeholder="正文（手打或语音都行，自动保存）"></textarea>
     </main>
+
+    <div class="ai-backdrop" onclick="toggleAISide()"></div>
+    <aside id="aiSide" class="ai-side">
+      <div class="ai-head">
+        <span>🤖 AI 助手</span>
+        <button class="ic" onclick="toggleAISide()" title="收起">✕</button>
+      </div>
+      <div id="agentMsgs" class="chat-msgs"></div>
+      <div class="chat-input-row">
+        <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
+                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
+        <button onclick="sendAgent()">发送</button>
+        <button class="ic" onclick="clearAgent()" title="清空对话">🗑</button>
+      </div>
+    </aside>
   </div>
 
   <!-- 阅读视图 -->
@@ -229,20 +244,6 @@
           <button onclick="aiSynopsis()">生成本章摘要</button>
         </div>
         <pre id="aiResult" class="ai-result"></pre>
-      </div>
-    </div>
-  </div>
-
-  <!-- 与 AI 探讨剧情（不污染正文） -->
-  <div id="chatOverlay" class="overlay hidden">
-    <div class="overlay-card chat-card">
-      <div class="overlay-head"><span>与 AI 探讨剧情</span><button class="ic" onclick="closeChat()">✕</button></div>
-      <div id="chatMsgs" class="chat-msgs"></div>
-      <div class="chat-input-row">
-        <textarea id="chatInput" rows="2" placeholder="聊剧情走向、逻辑漏洞…（Enter 发送，Shift+Enter 换行）"
-                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
-        <button onclick="sendChat()">发送</button>
-        <button class="ic" onclick="clearChat()" title="清空对话">🗑</button>
       </div>
     </div>
   </div>

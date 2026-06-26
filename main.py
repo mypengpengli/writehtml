@@ -1,4 +1,5 @@
 """FastAPI 后端：多用户鉴权 + 作品/章节 CRUD + AI 处理 + 拆分/排序/修订/导出。"""
+import json
 import secrets
 import difflib
 from urllib.parse import quote
@@ -498,6 +499,360 @@ async def chat(request: Request):
                     "当前正文末尾（供理解上下文，不要重复或改写）：\n" + tail})
     reply = llm.chat(sys_ctx + msgs, base_url=base_url, api_key=api_key, model=model)
     return {"reply": reply}
+
+
+# ---------- AI agent（对话即操作） ----------
+
+# 工具的 JSON schema（喂给模型 function calling）
+AGENT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "read_chapter",
+        "description": "读取当前章节的标题、备注和正文全文。要修改某段文字前先调它取准确原文。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "list_chapters",
+        "description": "列出当前作品的所有章节（id、标题、字数）。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "list_revisions",
+        "description": "列出当前章节的历史版本（id、标题、字数），供回退选择。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "replace_text",
+        "description": "在当前章节正文里找到 old_text 的第一处出现，替换为 new_text。old_text 必须与正文逐字一致；找不到会报错，请先 read_chapter 取准确原文。",
+        "parameters": {"type": "object", "properties": {
+            "old_text": {"type": "string", "description": "要被替换的原文，须与正文逐字一致"},
+            "new_text": {"type": "string", "description": "替换后的新文字"}},
+            "required": ["old_text", "new_text"]}}},
+    {"type": "function", "function": {
+        "name": "append_text",
+        "description": "在当前章节正文末尾追加一段文字（补段落、贴成品用）。",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "要追加的正文"}},
+            "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "edit_passage",
+        "description": "把指定段落按 instruction 重写后替换回正文（一步完成：AI 改写 + 原地替换）。old_text 须与正文逐字一致。",
+        "parameters": {"type": "object", "properties": {
+            "old_text": {"type": "string", "description": "要重写的原文段落，须与正文逐字一致"},
+            "instruction": {"type": "string", "description": "重写指令，如“更紧张”“更精炼”“改成口语化”"},
+            "style": {"type": "string", "description": "可选风格预设：更生动/更精炼/文艺风/口语化/悬疑感"}},
+            "required": ["old_text", "instruction"]}}},
+    {"type": "function", "function": {
+        "name": "continue_writing",
+        "description": "根据指令续写正文，接在当前章节末尾。无需提供原文，自动取正文末尾作前文。",
+        "parameters": {"type": "object", "properties": {
+            "instruction": {"type": "string", "description": "续写方向/要求，可空"}}}}},
+    {"type": "function", "function": {
+        "name": "set_title",
+        "description": "修改当前章节标题。",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"}}, "required": ["title"]}}},
+    {"type": "function", "function": {
+        "name": "set_notes",
+        "description": "修改当前章节的备注（作者给自己/AI 的本章设定/梗概）。",
+        "parameters": {"type": "object", "properties": {
+            "notes": {"type": "string"}}, "required": ["notes"]}}},
+    {"type": "function", "function": {
+        "name": "create_chapter",
+        "description": "在当前作品新建一章（空正文），返回新章节 id。",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string", "description": "新章节标题"}},
+            "required": ["title"]}}},
+    {"type": "function", "function": {
+        "name": "save_revision",
+        "description": "把当前章节存为一个历史版本快照，返回版本 id。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "restore_revision",
+        "description": "把当前章节回退到指定历史版本（用 list_revisions 取 rid）。回退前会自动存当前为快照，可撤销。",
+        "parameters": {"type": "object", "properties": {
+            "rid": {"type": "integer", "description": "要回退到的历史版本 id"}},
+            "required": ["rid"]}}},
+    {"type": "function", "function": {
+        "name": "summarize",
+        "description": "生成当前章节的 1-3 句剧情摘要（不改正文）。要保存可用 set_notes 写进备注。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "check_consistency",
+        "description": "对照作品设定校验当前正文，列出矛盾（人物/时间线/设定冲突）。不改正文。",
+        "parameters": {"type": "object", "properties": {}}}},
+]
+
+
+def _agent_err(msg):
+    return {"error": msg}
+
+
+def _agent_bible(wid, uid):
+    bible = db.get_work_notes(wid, uid) or ""
+    digest = db.get_entity_digest(wid, uid)
+    if digest:
+        bible = (bible + "\n\n" + digest) if bible else digest
+    return bible
+
+
+def _agent_system(uid, cid):
+    parts = [
+        "你是作者的写作 agent。你可以通过工具直接操作作者的作品：改正文、续写、"
+        "回退到历史版本、改章节标题/备注、新建章节、存版本、摘要、设定校验。"
+        "原则：1) 要改某段文字前，先 read_chapter 读准确原文，再用 replace_text 或 edit_passage，"
+        "old_text 必须与正文逐字一致；2) 每个写操作都会自动存版本，用户可一键撤销，所以放心改；"
+        "3) 不要替作者下不可逆的决定；4) 回答简洁，做完事说一句即可。"
+    ]
+    if cid:
+        c = db.get_chapter_meta(cid, uid)
+        if c:
+            parts.append(f"当前章节：#{cid}《{c['title']}》")
+            notes = c.get("notes") or ""
+            if notes:
+                parts.append("本章备注：\n" + notes)
+            content = c["content"] or ""
+            parts.append(("当前正文全文（修改时请从中逐字复制 old_text）：\n" + content)
+                         if content else "（正文为空）")
+            bible = _agent_bible(c["work_id"], uid)
+            if bible:
+                parts.append("作品设定（人物/世界观/大纲），操作时请保持一致：\n" + bible)
+    return {"role": "system", "content": "\n\n".join(parts)}
+
+
+def _tool_read_chapter(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    c = db.get_chapter_meta(cid, uid)
+    if not c:
+        return _agent_err("章节不存在")
+    return {"changed": False, "title": c["title"], "notes": c.get("notes") or "",
+            "content": c["content"] or "", "chars": len(c["content"] or "")}
+
+
+def _tool_list_chapters(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    c = db.get_chapter_meta(cid, uid)
+    if not c:
+        return _agent_err("章节不存在")
+    lst = db.list_chapters(c["work_id"], uid) or []
+    return {"changed": False, "chapters": [
+        {"id": x["id"], "title": x["title"], "chars": x["chars"]} for x in lst]}
+
+
+def _tool_list_revisions(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    lst = db.list_revisions(cid, uid)
+    if lst is None:
+        return _agent_err("章节不存在")
+    return {"changed": False, "revisions": [
+        {"id": x["id"], "title": x["title"], "chars": x["chars"]} for x in lst]}
+
+
+def _tool_replace_text(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    old, new = args.get("old_text", ""), args.get("new_text", "")
+    snap = db.add_revision(cid, uid)
+    new_content = db.replace_text_in_chapter(cid, uid, old, new)
+    if new_content is None:
+        return _agent_err("在正文里找不到这段原文，请先 read_chapter 取准确原文再试")
+    return {"changed": True, "summary": "已替换一处正文",
+            "undo_rid": snap["id"] if snap else None}
+
+
+def _tool_append_text(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    text = args.get("text", "")
+    snap = db.add_revision(cid, uid)
+    seg = db.add_segment(cid, uid, "（agent 追加）", text, "续写")
+    if seg is None:
+        return _agent_err("追加失败")
+    return {"changed": True, "summary": "已在末尾追加段落",
+            "undo_rid": snap["id"] if snap else None}
+
+
+def _tool_edit_passage(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    old = args.get("old_text", "")
+    instruction = args.get("instruction", "")
+    style = args.get("style")
+    c = db.get_chapter_meta(cid, uid)
+    if not c:
+        return _agent_err("章节不存在")
+    rewritten = llm.process("改写", old, context=(c["content"] or "")[-1500:],
+                            notes=c.get("notes") or "", bible=_agent_bible(c["work_id"], uid),
+                            base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
+                            style=(style or instruction))
+    snap = db.add_revision(cid, uid)
+    if db.replace_text_in_chapter(cid, uid, old, rewritten) is None:
+        return _agent_err("改写完成但在正文里找不到原文定位，请重新 read_chapter 取准确原文")
+    return {"changed": True, "summary": f"已按「{instruction}」重写并替换该段",
+            "undo_rid": snap["id"] if snap else None, "new_text": rewritten}
+
+
+def _tool_continue_writing(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    instruction = args.get("instruction") or "继续往下写"
+    c = db.get_chapter_meta(cid, uid)
+    if not c:
+        return _agent_err("章节不存在")
+    tail = (c["content"] or "")[-2000:]
+    text = llm.process("续写", instruction, context=tail, notes=c.get("notes") or "",
+                       bible=_agent_bible(c["work_id"], uid),
+                       base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"])
+    snap = db.add_revision(cid, uid)
+    if db.add_segment(cid, uid, "（agent 续写）", text, "续写") is None:
+        return _agent_err("续写失败")
+    return {"changed": True, "summary": "已续写并追加到末尾",
+            "undo_rid": snap["id"] if snap else None, "new_text": text}
+
+
+def _tool_set_title(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    title = args.get("title", "")
+    snap = db.add_revision(cid, uid)
+    db.update_chapter(cid, uid, title, None, None)
+    return {"changed": True, "summary": f"已改标题为「{title}」",
+            "undo_rid": snap["id"] if snap else None}
+
+
+def _tool_set_notes(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    notes = args.get("notes", "")
+    snap = db.add_revision(cid, uid)
+    db.update_chapter(cid, uid, None, None, notes)
+    return {"changed": True, "summary": "已更新本章备注",
+            "undo_rid": snap["id"] if snap else None}
+
+
+def _tool_create_chapter(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("请先在当前作品下选中任一章节（用于确定作品）")
+    c = db.get_chapter_meta(cid, uid)
+    if not c:
+        return _agent_err("章节不存在")
+    title = args.get("title", "新章节")
+    r = db.create_chapter(c["work_id"], uid, title)
+    if not r:
+        return _agent_err("新建失败")
+    return {"changed": False, "sidebar_dirty": True,
+            "summary": f"已新建章节「{title}」（id={r['id']}）", "new_chapter_id": r["id"]}
+
+
+def _tool_save_revision(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    r = db.add_revision(cid, uid)
+    if not r:
+        return _agent_err("存版本失败")
+    return {"changed": False, "summary": f"已存为版本 #{r['id']}", "revision_id": r["id"]}
+
+
+def _tool_restore_revision(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    rid = args.get("rid")
+    snap = db.add_revision(cid, uid)  # 回退前先存当前为快照，可再撤销
+    r = db.restore_revision(cid, uid, rid)
+    if r is None:
+        return _agent_err("该历史版本不存在")
+    return {"changed": True, "summary": f"已回退到版本 #{rid}",
+            "undo_rid": snap["id"] if snap else None}
+
+
+def _tool_summarize(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    c = db.get_chapter_meta(cid, uid)
+    if not c:
+        return _agent_err("章节不存在")
+    if not (c["content"] or "").strip():
+        return _agent_err("本章为空")
+    s = llm.process("摘要", c["content"], bible=_agent_bible(c["work_id"], uid),
+                    base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"])
+    return {"changed": False, "summary_text": s}
+
+
+def _tool_check_consistency(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有选中章节")
+    c = db.get_chapter_meta(cid, uid)
+    if not c:
+        return _agent_err("章节不存在")
+    if not (c["content"] or "").strip():
+        return _agent_err("本章为空")
+    s = llm.process("校验", c["content"], notes=c.get("notes") or "",
+                    bible=_agent_bible(c["work_id"], uid),
+                    base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"])
+    return {"changed": False, "issues": s}
+
+
+_AGENT_TOOLS = {
+    "read_chapter": _tool_read_chapter, "list_chapters": _tool_list_chapters,
+    "list_revisions": _tool_list_revisions, "replace_text": _tool_replace_text,
+    "append_text": _tool_append_text, "edit_passage": _tool_edit_passage,
+    "continue_writing": _tool_continue_writing, "set_title": _tool_set_title,
+    "set_notes": _tool_set_notes, "create_chapter": _tool_create_chapter,
+    "save_revision": _tool_save_revision, "restore_revision": _tool_restore_revision,
+    "summarize": _tool_summarize, "check_consistency": _tool_check_consistency,
+}
+
+
+@app.post("/api/agent")
+async def agent(request: Request):
+    """AI agent：对话即操作。模型经 function calling 调工具改稿/回退/加章，
+    每个写操作前自动存版本快照，返回 undo_rid 供前端撤销。"""
+    uid = _auth(request)
+    body = await request.json()
+    msgs = body.get("messages")
+    cid = body.get("chapter_id")
+    if not isinstance(msgs, list) or not msgs:
+        raise HTTPException(400, "没有对话内容")
+    st = db.get_settings(uid) or {}
+    base_url = st.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = st.get("llm_api_key") or config.LLM_API_KEY
+    model = st.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
+    cfg = {"base_url": base_url, "api_key": api_key, "model": model}
+
+    messages = [_agent_system(uid, cid)] + list(msgs)
+    reply = ""
+    for _ in range(6):
+        msg = llm.agent_chat(messages, AGENT_TOOLS, base_url=base_url, api_key=api_key, model=model)
+        m = {"role": "assistant", "content": msg.content}
+        if msg.tool_calls:
+            m["tool_calls"] = [
+                {"id": tc.id, "type": "function", "function": {
+                    "name": tc.function.name, "arguments": tc.function.arguments or "{}"}}
+                for tc in msg.tool_calls
+            ]
+        messages.append(m)
+        if not msg.tool_calls:
+            reply = (msg.content or "").strip()
+            break
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+            fn = _AGENT_TOOLS.get(name)
+            try:
+                result = fn(uid, cid, cfg, args) if fn else {"error": f"未知工具 {name}"}
+            except Exception as e:
+                result = {"error": f"工具执行出错：{e}"}
+            messages.append({"role": "tool", "tool_call_id": tc.id,
+                             "content": json.dumps(result, ensure_ascii=False)})
+    else:
+        reply = "操作较多，已暂停。已执行的动作见对话记录，可逐条撤销。"
+
+    out = [m for m in messages if m.get("role") != "system"]
+    return {"reply": reply, "messages": out}
 
 
 # ---------- 静态前端（放最后，避免盖住 /api） ----------

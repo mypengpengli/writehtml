@@ -1,5 +1,5 @@
 """冒烟测试：多用户隔离 + P1 新功能。转写模式不调 LLM，无需 key。"""
-import os, shutil, uuid, sqlite3, time
+import os, shutil, uuid, sqlite3, time, json, types
 
 # 用项目内临时目录放 db（系统 %TEMP% 上杀软偶发瞬时锁会让 sqlite 报只读）
 _TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".smoke_tmp", uuid.uuid4().hex[:10])
@@ -9,7 +9,7 @@ os.environ["SIGNUP_CODE"] = "testcode"   # 开放凭码注册
 os.environ["LLM_API_KEY"] = ""           # 测试不调真 LLM；校验/摘要/聊天应走"未配置"500
 
 from fastapi.testclient import TestClient
-import main, db
+import main, db, llm
 
 db.init_db()
 c = TestClient(main.app)
@@ -205,6 +205,50 @@ uidA = db.verify_user("alice", "pw1234")["id"]
 dig = db.get_entity_digest(wid, uidA)
 ok(dig.startswith("作品实体") and "[人物] 林晚" in dig and "女主角，冷静" in dig, "实体 digest 格式正确")
 ok(db.get_entity_digest(wid, uidA + 9999) == "", "他人作品 digest 为空(隔离)")
+
+# AI agent：对话即操作（monkeypatch llm.agent_chat 避免真联网）
+def _msg(content=None, tool_calls=None):
+    tcs = None
+    if tool_calls:
+        tcs = [types.SimpleNamespace(id=i, function=types.SimpleNamespace(name=n, arguments=a))
+               for i, n, a in tool_calls]
+    return types.SimpleNamespace(content=content, tool_calls=tcs)
+
+def _make_agent(stub):
+    s = {"i": 0}
+    def fake(messages, tools, **kw):
+        i = s["i"]; s["i"] += 1
+        return stub[min(i, len(stub) - 1)]
+    return fake
+
+# 入参校验 / 鉴权（carol 无 key，不触达 LLM）
+ok(c.post("/api/agent", json={"messages": [{"role": "user", "content": "hi"}], "chapter_id": ccid}, headers=H(tokC)).status_code == 500, "agent 无key 500")
+ok(c.post("/api/agent", json={"messages": []}, headers=H(tokA)).status_code == 400, "agent 空消息 400")
+ok(c.post("/api/agent", json={"messages": [{"role": "user", "content": "hi"}]}).status_code == 401, "agent 未登录 401")
+
+# replace_text 工具：cid 正文 "你好" → "你好呀"，并验证可撤销
+_orig_ac = llm.agent_chat
+llm.agent_chat = _make_agent([
+    _msg(None, [("c1", "replace_text", json.dumps({"old_text": "你好", "new_text": "你好呀"}))]),
+    _msg("已改好。"),
+])
+ag = c.post("/api/agent", json={"messages": [{"role": "user", "content": "把你好改成你好呀"}], "chapter_id": cid}, headers=H(tokA)).json()
+_tr = [m for m in ag["messages"] if m.get("role") == "tool"]
+ok(len(_tr) == 1 and json.loads(_tr[0]["content"]).get("changed") is True, "agent replace_text 执行")
+_undo = json.loads(_tr[0]["content"]).get("undo_rid")
+ok(isinstance(_undo, int), "agent 返回 undo_rid")
+ok(c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["content"] == "你好呀", "agent 改后正文=你好呀")
+ok(c.post(f"/api/chapters/{cid}/revisions/{_undo}/restore", headers=H(tokA)).json()["content"] == "你好", "agent 动作可撤销(恢复快照)")
+
+# list_revisions 工具（只读，验证分派 + JSON 往返）
+llm.agent_chat = _make_agent([
+    _msg(None, [("c2", "list_revisions", "{}")]),
+    _msg("已列出。"),
+])
+ag2 = c.post("/api/agent", json={"messages": [{"role": "user", "content": "列出版本"}], "chapter_id": cid}, headers=H(tokA)).json()
+_tr2 = [m for m in ag2["messages"] if m.get("role") == "tool"]
+ok(len(_tr2) == 1 and isinstance(json.loads(_tr2[0]["content"]).get("revisions"), list), "agent list_revisions 返回版本数组")
+llm.agent_chat = _orig_ac
 
 # 删除
 ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")

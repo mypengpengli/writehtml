@@ -71,6 +71,19 @@ def chat(messages, *, base_url=None, api_key=None, model=None):
     return (resp.choices[0].message.content or "").strip()
 
 
+def agent_chat(messages, tools, *, base_url=None, api_key=None, model=None):
+    """Agent 循环的单步调用：带 tools（function calling）发出去，返回完整 message。
+    调用方根据 message.tool_calls 决定是分派工具还是收尾。"""
+    base_url = base_url or config.LLM_BASE_URL
+    api_key = api_key or config.LLM_API_KEY
+    model = model or config.LLM_MODEL
+    resp = _get_client(base_url, api_key).chat.completions.create(
+        model=model, messages=messages, tools=tools, tool_choice="auto",
+        temperature=0.6,
+    )
+    return resp.choices[0].message
+
+
 def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None, style=None):
     """按模式调用 LLM，返回生成文本。
     notes 为本章备注；bible 为作品级设定（人物/世界观/大纲），全文记忆。
