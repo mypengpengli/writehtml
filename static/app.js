@@ -10,7 +10,7 @@ let mode = "转写";
 
 // 语音
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, micOn = false, draftBuffer = "";
+let rec = null, micOn = false, draftBuffer = "", recFatal = false;
 // AI 侧栏：语音输入 + 自动朗读（浏览器原生，无需模型 ID）
 let agentRec = null, agentMicOn = false, agentFinalText = "", agentInterim = "", _agentPH = null;
 let voiceAutoSend = localStorage.getItem("voiceAutoSend") !== "0"; // 默认自动发
@@ -400,6 +400,20 @@ function setMode(m) {
 
 /* ---------- 语音 ---------- */
 
+// 致命错误：停麦克风且不让 onend 自动重启，避免无手势重启→not-allowed 死循环
+const FATAL_REC_ERRORS = new Set(["not-allowed", "service-not-allowed", "audio-capture", "network"]);
+function explainRecError(err) {
+  const m = {
+    "not-allowed": "麦克风被拒(not-allowed)：HTTPS 下仍报此错，多半是浏览器站点麦克风权限未真正「允许」、或处于无痕模式、或麦克风被别的程序占用",
+    "service-not-allowed": "识别服务被拒(service-not-allowed)：Chrome 转写服务连不上（国内网络够不着 Google），需改用自有/自托管 ASR",
+    "audio-capture": "麦克风硬件不可用或被占用(audio-capture)",
+    "network": "识别服务网络中断(network)",
+    "no-speech": "没听到声音(no-speech)",
+    "aborted": "已中止(aborted)",
+  };
+  return m[err] || ("语音错误：" + err);
+}
+
 function setupRec() {
   if (!SR) { $("micStatus").textContent = "不支持语音识别（用安卓 Chrome）"; return; }
   if (rec) return;
@@ -413,8 +427,16 @@ function setupRec() {
     }
     showDraft(draftBuffer + interim);
   };
-  rec.onend = () => { if (micOn) { try { rec.start(); } catch (e) {} } else setMic(false); };
-  rec.onerror = (e) => { $("micStatus").textContent = "错误：" + e.error; };
+  rec.onend = () => {
+    // 连续重听：仅在未致命报错时才程序化重启；否则停麦克风（无手势重启会被拒 not-allowed）
+    if (micOn && !recFatal) { try { rec.start(); } catch (e) {} }
+    else { micOn = false; setMic(false); }
+  };
+  rec.onerror = (e) => {
+    // no-speech/aborted 不致命，保持连续重听；其余一律停麦克风、不再自动重启
+    const fatal = !["no-speech", "aborted"].includes(e.error);
+    if (fatal) { recFatal = true; micOn = false; setMic(false); $("micStatus").textContent = explainRecError(e.error); }
+  };
 }
 
 function toggleMic() {
@@ -422,7 +444,7 @@ function toggleMic() {
   if (micOn) { micOn = false; try { rec.stop(); } catch (e) {} setMic(false); }
   else {
     if (agentMicOn) { agentMicOn = false; try { agentRec.stop(); } catch (e) {} setAgentMic(false); } // 互斥
-    micOn = true; draftBuffer = ""; try { rec.start(); } catch (e) {} setMic(true);
+    micOn = true; recFatal = false; draftBuffer = ""; try { rec.start(); } catch (e) {} setMic(true);
   }
 }
 function setMic(on) {
@@ -921,7 +943,7 @@ function setupAgentRec() {
   agentRec.onerror = (e) => {
     agentMicOn = false; setAgentMic(false);
     if (!_agentPH) _agentPH = $("agentInput").placeholder;
-    $("agentInput").placeholder = "语音错误：" + e.error + "；再按语音键重试";
+    $("agentInput").placeholder = explainRecError(e.error) + "；再按语音键重试";
   };
 }
 function toggleAgentMic() {
