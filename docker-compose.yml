@@ -17,5 +17,7 @@ services:
       # - LLM_BASE_URL=https://api.deepseek.com/v1
       # - LLM_API_KEY=sk-xxx
       # - LLM_MODEL=deepseek-chat
+      # 智能体语音默认转写模型；用户也可在「设置」里覆盖
+      # - ASR_MODEL=whisper-1
     volumes:
       - ./data:/data

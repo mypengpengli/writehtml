@@ -13,6 +13,14 @@ import config, db, llm
 app = FastAPI(title="写作")
 db.init_db()
 
+
+@app.middleware("http")
+async def add_browser_permission_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("Permissions-Policy", "microphone=(self)")
+    return response
+
+
 # 内存里的登录态：token -> user_id（单进程、重启即失效，需重登）
 _sessions = {}
 
@@ -105,6 +113,7 @@ async def get_settings(request: Request):
         "api_key_masked": masked,
         "has_key": bool(key),
         "model": s.get("llm_model") or config.LLM_MODEL,
+        "asr_model": s.get("asr_model") or config.ASR_MODEL,
     }
 
 
@@ -117,6 +126,7 @@ async def save_settings(request: Request):
         (body.get("base_url") or "").strip(),
         (body.get("api_key") or "").strip(),
         (body.get("model") or "").strip(),
+        (body.get("asr_model") or "").strip(),
     )
     return {"ok": True}
 
@@ -513,6 +523,41 @@ async def chat(request: Request):
                     "当前正文末尾（供理解上下文，不要重复或改写）：\n" + tail})
     reply = llm.chat(sys_ctx + msgs, base_url=base_url, api_key=api_key, model=model)
     return {"reply": reply}
+
+
+@app.post("/api/asr")
+async def transcribe_audio(request: Request):
+    """智能体语音入口：浏览器录音上传，后端走 OpenAI 兼容音频转写。"""
+    uid = _auth(request)
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(400, "没有收到录音")
+    if len(audio) > 15 * 1024 * 1024:
+        raise HTTPException(413, "录音太长，请控制在一分钟内")
+    s = db.get_settings(uid) or {}
+    base_url = s.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = s.get("llm_api_key") or config.LLM_API_KEY
+    model = s.get("asr_model") or config.ASR_MODEL
+    if not api_key:
+        raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 语音转写模型")
+    mime = (request.headers.get("content-type") or "audio/webm").split(";")[0]
+    ext = "webm"
+    if "mp4" in mime:
+        ext = "mp4"
+    elif "mpeg" in mime or "mp3" in mime:
+        ext = "mp3"
+    elif "wav" in mime:
+        ext = "wav"
+    try:
+        text = llm.transcribe(audio, filename=f"speech.{ext}", mime_type=mime,
+                              base_url=base_url, api_key=api_key, model=model)
+    except Exception as e:
+        raise HTTPException(500, "语音转写失败：当前接口可能不支持 /audio/transcriptions，"
+                            "请在设置里使用支持 Whisper/音频转写的 OpenAI 兼容接口。"
+                            f"原始错误：{e}")
+    if not text:
+        raise HTTPException(500, "语音转写没有返回文字")
+    return {"text": text}
 
 
 # ---------- AI agent（对话即操作） ----------

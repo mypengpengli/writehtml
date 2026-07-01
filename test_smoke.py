@@ -87,9 +87,9 @@ ok(chap["content"] == "你好世界", "正文已追加")
 ok(len(chap["segments"]) == 1, "段落历史 1 条")
 
 # 每用户大模型设置
-c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a"}, headers=H(tokA))
+c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a", "asr_model": "whisper-test"}, headers=H(tokA))
 s = c.get("/api/settings", headers=H(tokA)).json()
-ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a", "设置读回 base_url/model")
+ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a" and s["asr_model"] == "whisper-test", "设置读回 base_url/model/asr_model")
 ok(s["has_key"] is True and "secret" not in s["api_key_masked"] and s["api_key_masked"].startswith("****"), "key 掩码不泄露明文")
 # 空 key 提交应保留旧 key
 c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "", "model": "m-a2"}, headers=H(tokA))
@@ -111,6 +111,17 @@ ok(c.post("/api/process", json={"mode": "瞎写", "text": "x"}, headers=H(tokC))
 ok(c.post("/api/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=H(tokC)).status_code == 500, "chat 走 LLM(无key 500)")
 ok(c.post("/api/chat", json={"messages": []}, headers=H(tokC)).status_code == 400, "chat 空消息 400")
 ok(c.post("/api/chat", json={"messages": [{"role": "user", "content": "hi"}]}).status_code == 401, "chat 未登录 401")
+ok(c.post("/api/asr", content=b"", headers={**H(tokA), "Content-Type": "audio/webm"}).status_code == 400, "ASR 空音频 400")
+ok(c.post("/api/asr", content=b"fakeaudio", headers=H(tokC)).status_code == 500, "ASR 无key 500")
+_orig_transcribe = llm.transcribe
+_seen_asr = {}
+def _fake_transcribe(audio, **kw):
+    _seen_asr.update(kw)
+    return "请帮我续写一段"
+llm.transcribe = _fake_transcribe
+_asr = c.post("/api/asr", content=b"fakeaudio", headers={**H(tokA), "Content-Type": "audio/webm"}).json()
+ok(_asr["text"] == "请帮我续写一段" and _seen_asr.get("model") == config.ASR_MODEL, "ASR 成功返回文字")
+llm.transcribe = _orig_transcribe
 
 # 备注保存
 ok(c.put(f"/api/chapters/{cid}", json={"notes": "设定X"}, headers=H(tokA)).status_code == 200, "存备注")

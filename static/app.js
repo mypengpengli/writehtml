@@ -11,8 +11,8 @@ let mode = "转写";
 // 语音
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, micOn = false, draftBuffer = "", recFatal = false;
-// AI 侧栏：语音输入 + 自动朗读（浏览器原生，无需模型 ID）
-let agentRec = null, agentMicOn = false, agentFinalText = "", agentInterim = "", _agentPH = null;
+// AI 侧栏：录音上传转写 + 自动朗读
+let agentRecorder = null, agentMicOn = false, agentChunks = [], agentStream = null, _agentPH = null;
 let voiceAutoSend = localStorage.getItem("voiceAutoSend") !== "0"; // 默认自动发
 let aiTts = localStorage.getItem("aiTts") !== "0"; // 默认开
 
@@ -191,7 +191,6 @@ async function doLogout() {
 
 async function init() {
   showApp();
-  setupRec();
   const me = await api("/api/me", { method: "GET" });
   $("meName").textContent = me.username ? `${me.username} · 目录` : "目录";
   if (me.is_admin) $("adminBtn").classList.remove("hidden");
@@ -393,8 +392,11 @@ function setMode(m) {
   const sel = $("modeSel");
   if (sel && sel.value !== m) sel.value = m;
   document.querySelectorAll(".mode").forEach(b => b.classList.toggle("active", b.dataset.mode === m));
-  $("genBtn").classList.toggle("hidden", !(m === "扩写" || m === "续写"));
-  $("genBtn").title = m === "扩写" ? "把当前语音草稿扩写到正文" : "把当前语音草稿续写到正文";
+  const gen = $("genBtn");
+  if (gen) {
+    gen.classList.toggle("hidden", !(m === "扩写" || m === "续写"));
+    gen.title = m === "扩写" ? "把当前语音草稿扩写到正文" : "把当前语音草稿续写到正文";
+  }
   draftBuffer = ""; showDraft("");
 }
 
@@ -440,14 +442,17 @@ function setupRec() {
 }
 
 function toggleMic() {
+  showToast("连续转写已停用，请用右侧 AI 助手的语音按钮", "err");
+  return;
   if (!rec) { showToast("浏览器不支持语音识别，请用安卓 Chrome", "err"); return; }
   if (micOn) { micOn = false; try { rec.stop(); } catch (e) {} setMic(false); }
   else {
-    if (agentMicOn) { agentMicOn = false; try { agentRec.stop(); } catch (e) {} setAgentMic(false); } // 互斥
+    if (agentMicOn) { agentMicOn = false; try { agentRecorder?.stop(); } catch (e) {} setAgentMic(false); } // 互斥
     micOn = true; recFatal = false; draftBuffer = ""; try { rec.start(); } catch (e) {} setMic(true);
   }
 }
 function setMic(on) {
+  if (!$("micBtn")) return;
   setIcon($("micBtn"), on ? "square" : "mic", on ? "停止" : "开始说");
   $("micBtn").classList.toggle("on", on);
   $("micStatus").textContent = on ? "正在听…" : "";
@@ -557,8 +562,9 @@ async function processSelection(m, style) {
 async function generate() {
   if (!draftBuffer) { setMicStatus("先说点内容再生成"); return; }
   const text = draftBuffer; draftBuffer = ""; showDraft("");
-  busy($("genBtn"), true);
-  try { await processAndAppend(text); } finally { busy($("genBtn"), false); }
+  const gen = $("genBtn");
+  busy(gen, true);
+  try { await processAndAppend(text); } finally { busy(gen, false); }
 }
 
 async function undo() {
@@ -726,6 +732,7 @@ async function openSettings() {
     const s = await api("/api/settings", { method: "GET" });
     $("setBaseUrl").value = s.base_url || "";
     $("setModel").value = s.model || "";
+    $("setAsrModel").value = s.asr_model || "whisper-1";
     // key 不回传明文：已填则用掩码占位提示，留空表示不改
     $("setApiKey").value = s.api_key_masked || "";
     $("setApiKey").placeholder = s.has_key ? `${s.api_key_masked}（留空=不改）` : "sk-…";
@@ -738,6 +745,7 @@ function closeSettings() { $("setOverlay").classList.add("hidden"); }
 async function saveSettings() {
   const base_url = $("setBaseUrl").value.trim();
   const model = $("setModel").value.trim();
+  const asr_model = $("setAsrModel").value.trim();
   let api_key = $("setApiKey").value.trim();
   // 若用户没动 key 输入框（仍是掩码占位），传空让后端保留旧值
   if (api_key.startsWith("****")) api_key = "";
@@ -745,7 +753,7 @@ async function saveSettings() {
   voiceAutoSend = $("setVoiceAuto").checked;
   localStorage.setItem("voiceAutoSend", voiceAutoSend ? "1" : "0");
   try {
-    await api("/api/settings", { body: { base_url, api_key, model } });
+    await api("/api/settings", { body: { base_url, api_key, model, asr_model } });
     $("setMsg").textContent = "已保存";
     setTimeout(closeSettings, 600);
   } catch (e) { $("setMsg").textContent = e.message; }
@@ -917,49 +925,92 @@ async function loadConversation() {
 }
 function openAdmin() { location.href = "admin.html"; }
 
-/* 语音输入 + 自动朗读（浏览器原生 speechRecognition / speechSynthesis，零配置） */
+/* 智能体语音：浏览器只录音，后端走 OpenAI 兼容 ASR，避开 Chrome/Google SpeechRecognition */
 
-function setupAgentRec() {
-  if (!SR || agentRec) return;
-  agentRec = new SR();
-  agentRec.lang = "zh-CN"; agentRec.continuous = false; agentRec.interimResults = true;
-  agentRec.onresult = (e) => {
-    agentFinalText = ""; agentInterim = "";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const r = e.results[i];
-      if (r.isFinal) agentFinalText = r[0].transcript; else agentInterim += r[0].transcript;
-    }
-    $("agentInput").value = (agentFinalText + agentInterim).trim();
-  };
-  agentRec.onend = () => {
-    const was = agentMicOn; agentMicOn = false; setAgentMic(false);
-    const el = $("agentInput");
-    if (agentFinalText) el.value = agentFinalText.trim();
-    if (was && el.value.trim()) {
-      if (voiceAutoSend) sendAgent();        // 默认：说完自动发给 AI
-      else el.focus();                       // 关掉自动发：填进去等你确认
-    }
-  };
-  agentRec.onerror = (e) => {
-    agentMicOn = false; setAgentMic(false);
-    if (!_agentPH) _agentPH = $("agentInput").placeholder;
-    $("agentInput").placeholder = explainRecError(e.error) + "；再按语音键重试";
-  };
+function bestAudioMime() {
+  const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+  return types.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
 }
-function toggleAgentMic() {
-  if (!SR) { showToast("浏览器不支持语音识别，请用安卓 Chrome", "err"); return; }
-  setupAgentRec();
-  if (agentMicOn) { agentMicOn = false; try { agentRec.stop(); } catch (e) {} setAgentMic(false); return; }
-  if (micOn) { micOn = false; try { rec.stop(); } catch (e) {} setMic(false); } // 同一时刻只允许一个识别
-  agentFinalText = ""; agentInterim = "";
-  const el = $("agentInput"); el.value = "";
-  if (_agentPH) el.placeholder = _agentPH;
-  agentMicOn = true;
-  try { agentRec.start(); setAgentMic(true); }
-  catch (e) { // start() 同步抛出（如权限被拒）：别让按钮假装在录音
+async function transcribeAgentAudio(blob) {
+  const btn = $("agentMicBtn");
+  btn.classList.add("is-busy");
+  setIcon(btn, "mic");
+  btn.title = "转写中…";
+  const el = $("agentInput");
+  if (!_agentPH) _agentPH = el.placeholder;
+  el.placeholder = "语音转写中…";
+  try {
+    const res = await fetch("/api/asr", {
+      method: "POST",
+      headers: {
+        "Content-Type": blob.type || "audio/webm",
+        ...(token ? { Authorization: "Bearer " + token } : {}),
+      },
+      body: blob,
+    });
+    if (res.status === 401) { showLogin(); throw new Error("未登录"); }
+    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    const r = await res.json();
+    const text = (r.text || "").trim();
+    if (!text) throw new Error("没有识别到文字");
+    el.value = text;
+    el.placeholder = _agentPH || "";
+    if (voiceAutoSend) await sendAgent();
+    else el.focus();
+  } catch (e) {
+    el.placeholder = "语音转写失败：" + e.message;
+    showToast("语音转写失败：" + e.message, "err");
+  } finally {
+    btn.classList.remove("is-busy");
+    if (!agentMicOn) setAgentMic(false);
+  }
+}
+async function toggleAgentMic() {
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    showToast("浏览器不支持录音上传，请用新版 Chrome/Edge", "err");
+    return;
+  }
+  if (agentMicOn) {
     agentMicOn = false;
-    if (!_agentPH) _agentPH = $("agentInput").placeholder;
-    $("agentInput").placeholder = "语音无法启动：" + (e.name || "错误") + "；再按语音键重试";
+    try { agentRecorder?.stop(); } catch (e) {}
+    setAgentMic(false);
+    return;
+  }
+  if (micOn) { micOn = false; try { rec?.stop(); } catch (e) {} setMic(false); }
+  const el = $("agentInput");
+  el.value = "";
+  if (_agentPH) el.placeholder = _agentPH;
+  try {
+    agentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = bestAudioMime();
+    agentChunks = [];
+    agentRecorder = new MediaRecorder(agentStream, mimeType ? { mimeType } : undefined);
+    agentRecorder.ondataavailable = e => { if (e.data && e.data.size) agentChunks.push(e.data); };
+    agentRecorder.onstop = () => {
+      agentStream?.getTracks().forEach(t => t.stop());
+      agentStream = null;
+      const blob = new Blob(agentChunks, { type: mimeType || "audio/webm" });
+      agentChunks = [];
+      if (blob.size < 300) { showToast("录音太短", "err"); return; }
+      transcribeAgentAudio(blob);
+    };
+    agentRecorder.onerror = e => {
+      agentMicOn = false;
+      setAgentMic(false);
+      agentStream?.getTracks().forEach(t => t.stop());
+      showToast("录音失败：" + (e.error?.message || e.error?.name || "未知错误"), "err");
+    };
+    agentMicOn = true;
+    setAgentMic(true);
+    agentRecorder.start();
+  } catch (e) {
+    agentMicOn = false;
+    setAgentMic(false);
+    const msg = e.name === "NotAllowedError"
+      ? "麦克风权限被拒：请点地址栏左侧图标，把麦克风改为允许后刷新"
+      : "无法启动录音：" + (e.message || e.name || "未知错误");
+    el.placeholder = msg;
+    showToast(msg, "err");
   }
 }
 function setAgentMic(on) {

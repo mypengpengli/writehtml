@@ -130,6 +130,21 @@ def summarize(messages, prev="", *, base_url=None, api_key=None, model=None):
     return (resp.choices[0].message.content or "").strip()
 
 
+def transcribe(audio, *, filename="speech.webm", mime_type="audio/webm",
+               base_url=None, api_key=None, model=None):
+    """走 OpenAI 兼容 /audio/transcriptions，把浏览器录音转成文字。"""
+    base_url = base_url or config.LLM_BASE_URL
+    api_key = api_key or config.LLM_API_KEY
+    model = model or config.ASR_MODEL
+    resp = _get_client(base_url, api_key).audio.transcriptions.create(
+        model=model,
+        file=(filename, audio, mime_type),
+    )
+    if isinstance(resp, str):
+        return resp.strip()
+    return (getattr(resp, "text", "") or "").strip()
+
+
 def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None, style=None):
     """按模式调用 LLM，返回生成文本。
     notes 为本章备注；bible 为作品级设定（人物/世界观/大纲），全文记忆。

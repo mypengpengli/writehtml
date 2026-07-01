@@ -199,6 +199,8 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .status { color: var(--muted); font-size: 13px; flex: 1; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tool-group { display: inline-flex; align-items: center; gap: 4px; }
 .edit-tools { margin-left: auto; }
+.editorbar .edit-tools { margin-left: 0; }
+.editorbar .status { flex: 1; min-width: 80px; }
 .selection-tools {
   padding: 3px; border: 1px solid var(--line); border-radius: var(--r-md);
   background: var(--side-bg);

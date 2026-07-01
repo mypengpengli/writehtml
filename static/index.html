@@ -71,25 +71,14 @@
         </div>
       </header>
 
-      <div class="micbar">
-        <button id="micBtn" class="mic" data-ic="mic" data-label="开始说" onclick="toggleMic()"></button>
-        <label class="mode-picker" title="语音处理模式">
-          <span>模式</span>
-          <select id="modeSel" onchange="setMode(this.value)">
-            <option>转写</option>
-            <option>润色</option>
-            <option>扩写</option>
-            <option>续写</option>
-          </select>
-        </label>
-        <button id="genBtn" class="gen hidden" data-ic="enter" data-label="生成" onclick="generate()" title="把当前语音草稿生成到正文"></button>
-        <span id="micStatus" class="status"></span>
+      <div class="micbar editorbar">
         <span class="tool-group edit-tools">
           <button class="ic" data-ic="undo" onclick="undo()" title="撤销最近一段"></button>
           <button class="ic" data-ic="search" onclick="toggleFind()" title="查找替换"></button>
           <button class="ic" data-ic="scissors" onclick="splitChapter()" title="在光标处拆分章节"></button>
           <button class="ic" data-ic="note" onclick="toggleNotes()" title="本章备注"></button>
         </span>
+        <span id="micStatus" class="status"></span>
         <span id="selectionTools" class="tool-group selection-tools hidden">
           <span class="tool-hint">选区</span>
           <button class="ic" data-ic="bot" data-label="问 AI" onclick="quoteSelectionToAgent()" title="把选中文字交给右侧 AI 助手"></button>
@@ -117,7 +106,7 @@
 
       <div id="draft" class="draft">这里显示你正在说的话…</div>
 
-      <textarea id="content" class="content" spellcheck="true" lang="zh-CN" placeholder="正文（手打或语音都行，自动保存）"></textarea>
+      <textarea id="content" class="content" spellcheck="true" lang="zh-CN" placeholder="正文（手打或让右侧 AI 助手写，自动保存）"></textarea>
     </main>
 
     <div class="ai-backdrop" onclick="toggleAISide()"></div>
@@ -221,13 +210,15 @@
     <div class="overlay-card">
       <div class="overlay-head"><span>大模型设置</span><button class="ic" data-ic="x" onclick="closeSettings()"></button></div>
       <div class="set-form">
-        <p class="set-hint">填好你的 OpenAI 兼容接口，润色/扩写/续写才会生效。每人用自己的 key，互不影响。</p>
+        <p class="set-hint">填好 OpenAI 兼容接口后，AI 助手、改写和智能体语音才会生效。语音需要接口支持 /audio/transcriptions。</p>
         <label>Base URL</label>
         <input id="setBaseUrl" placeholder="https://api.deepseek.com/v1">
         <label>API Key</label>
         <input id="setApiKey" type="password" placeholder="sk-…（已设置则显示 ****，留空=不改）">
         <label>模型 ID</label>
         <input id="setModel" placeholder="deepseek-chat">
+        <label>语音转写模型</label>
+        <input id="setAsrModel" placeholder="whisper-1">
         <label class="set-row"><input id="setVoiceAuto" type="checkbox"> 语音说完自动发送给 AI（关掉则填进输入框等你确认）</label>
         <div class="set-actions">
           <button onclick="saveSettings()">保存</button>
