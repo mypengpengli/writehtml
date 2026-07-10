@@ -1,5 +1,5 @@
 """冒烟测试：多用户隔离 + P1 新功能。转写模式不调 LLM，无需 key。"""
-import os, shutil, uuid, sqlite3, time, json, types
+import os, shutil, uuid, sqlite3, time, json, types, base64
 
 # 用项目内临时目录放 db（系统 %TEMP% 上杀软偶发瞬时锁会让 sqlite 报只读）
 _TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".smoke_tmp", uuid.uuid4().hex[:10])
@@ -87,10 +87,15 @@ ok(chap["content"] == "你好世界", "正文已追加")
 ok(len(chap["segments"]) == 1, "段落历史 1 条")
 
 # 每用户大模型设置
-c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a", "asr_model": "whisper-test"}, headers=H(tokA))
+c.post("/api/settings", json={
+    "base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a",
+    "asr_base_url": "https://asr.test/v1", "asr_api_key": "sk-asr-secret", "asr_model": "whisper-test",
+}, headers=H(tokA))
 s = c.get("/api/settings", headers=H(tokA)).json()
-ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a" and s["asr_model"] == "whisper-test", "设置读回 base_url/model/asr_model")
+ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a" and s["asr_model"] == "whisper-test"
+   and s["asr_base_url"] == "https://asr.test/v1", "设置读回文字/转写配置")
 ok(s["has_key"] is True and "secret" not in s["api_key_masked"] and s["api_key_masked"].startswith("****"), "key 掩码不泄露明文")
+ok(s["asr_has_key"] is True and "secret" not in s["asr_api_key_masked"], "转写 key 掩码不泄露明文")
 # 空 key 提交应保留旧 key
 c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "", "model": "m-a2"}, headers=H(tokA))
 ok(c.get("/api/settings", headers=H(tokA)).json()["has_key"] is True, "空 key 不清空已存 key")
@@ -246,9 +251,25 @@ def _put_conv(tok, chapter_id, text="hi"):
 ok(c.post("/api/agent", json={"text": "hi", "chapter_id": ccid}, headers=H(tokC)).status_code == 500, "agent 无key 500")
 ok(c.post("/api/agent", json={"text": ""}, headers=H(tokA)).status_code == 400, "agent 空文本 400")
 ok(c.post("/api/agent", json={"text": "hi"}).status_code == 401, "agent 未登录 401")
+ok(c.post("/api/agent/audio", json={"audio": "", "format": "wav"}, headers=H(tokA)).status_code == 400, "语音直发空录音 400")
+
+# 直发语音：本轮模型收到 input_audio，但持久化记录只保存语音占位文本，不存 Base64。
+_orig_ac = llm.agent_chat
+_seen_voice = {}
+def _capture_voice(messages, tools, **kw):
+    _seen_voice["messages"] = messages
+    return _msg("已理解语音指令。")
+llm.agent_chat = _capture_voice
+_voice = c.post("/api/agent/audio", json={
+    "audio": base64.b64encode(b"fake-wav-audio").decode(), "format": "wav", "chapter_id": cid,
+}, headers=H(tokA)).json()
+_voice_turn = next(m for m in _seen_voice["messages"] if m.get("role") == "user" and isinstance(m.get("content"), list))
+ok(any(x.get("type") == "input_audio" and x.get("input_audio", {}).get("format") == "wav" for x in _voice_turn["content"]), "语音直发本轮带 input_audio")
+ok(any(m.get("content") == "[voice] 语音指令" for m in _voice["messages"]), "语音对话持久化仅存占位")
+ok(not any("ZmFrZS13YXY" in str(m) for m in _voice["messages"]), "语音 Base64 不写入对话历史")
+llm.agent_chat = _orig_ac
 
 # replace_text 工具：cid 正文 "你好" → "你好呀"，并验证可撤销
-_orig_ac = llm.agent_chat
 llm.agent_chat = _make_agent([
     _msg(None, [("c1", "replace_text", json.dumps({"old_text": "你好", "new_text": "你好呀"}))]),
     _msg("已改好。"),

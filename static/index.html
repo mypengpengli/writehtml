@@ -44,14 +44,21 @@
         <input id="chapTitle" class="title-input" placeholder="章节标题">
         <span id="wc" class="wc">0 字</span>
         <span id="saveStat" class="save-stat"></span>
-        <button class="ic top-ai" id="aiToggleBtn" data-ic="bot" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
+        <button class="ic top-ai" id="aiToggleBtn" data-ic="bot" data-label="AI 助手" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
         <div class="menu-wrap">
           <button class="ic" data-ic="more" onclick="toggleMoreMenu(event)" title="更多"></button>
           <div id="moreMenu" class="menu hidden">
+            <div class="menu-label">视图</div>
             <button id="themeBtn" data-ic="moon" data-label="明暗主题" onclick="toggleTheme();closeMoreMenu()"></button>
             <button id="fontBtn" data-ic="type" data-label="衬线字体" onclick="toggleFont();closeMoreMenu()"></button>
             <button data-ic="focus" data-label="专注模式" onclick="toggleFocus();closeMoreMenu()"></button>
             <button data-ic="book" data-label="阅读模式" onclick="toggleRead();closeMoreMenu()"></button>
+            <div class="menu-sep"></div>
+            <div class="menu-label">本章</div>
+            <button data-ic="note" data-label="本章备注" onclick="toggleNotes();closeMoreMenu()"></button>
+            <button data-ic="scissors" data-label="在光标处拆章" onclick="splitChapter();closeMoreMenu()"></button>
+            <button data-ic="bookmark" data-label="存为版本" onclick="saveRevision();closeMoreMenu()"></button>
+            <button data-ic="clock" data-label="历史版本" onclick="showRevisions();closeMoreMenu()"></button>
             <div class="menu-sep"></div>
             <div class="menu-label">导出</div>
             <button data-ic="download" data-label="本章 TXT" onclick="exportChap('txt');closeMoreMenu()"></button>
@@ -59,8 +66,7 @@
             <button data-ic="download" data-label="整本 TXT" onclick="exportChap('work-txt');closeMoreMenu()"></button>
             <button data-ic="download" data-label="整本 DOCX" onclick="exportChap('work-docx');closeMoreMenu()"></button>
             <div class="menu-sep"></div>
-            <button data-ic="bookmark" data-label="存为版本" onclick="saveRevision();closeMoreMenu()"></button>
-            <button data-ic="clock" data-label="历史版本" onclick="showRevisions();closeMoreMenu()"></button>
+            <div class="menu-label">作品与账户</div>
             <button data-ic="trash" data-label="回收站" onclick="openTrash();closeMoreMenu()"></button>
             <button data-ic="users" data-label="人物/设定" onclick="openWiki();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI 工具" onclick="openAITools();closeMoreMenu()"></button>
@@ -75,8 +81,6 @@
         <span class="tool-group edit-tools">
           <button class="ic" data-ic="undo" onclick="undo()" title="撤销最近一段"></button>
           <button class="ic" data-ic="search" onclick="toggleFind()" title="查找替换"></button>
-          <button class="ic" data-ic="scissors" onclick="splitChapter()" title="在光标处拆分章节"></button>
-          <button class="ic" data-ic="note" onclick="toggleNotes()" title="本章备注"></button>
         </span>
         <span id="micStatus" class="status"></span>
         <span id="selectionTools" class="tool-group selection-tools hidden">
@@ -104,9 +108,10 @@
         <textarea id="notes" placeholder="本章备注/梗概/设定（会作为 AI 续写、扩写的上下文）"></textarea>
       </div>
 
-      <div id="draft" class="draft">这里显示你正在说的话…</div>
-
-      <textarea id="content" class="content" spellcheck="true" lang="zh-CN" placeholder="正文（手打或让右侧 AI 助手写，自动保存）"></textarea>
+      <div class="editor-surface">
+        <div id="draft" class="draft">这里显示你正在说的话…</div>
+        <textarea id="content" class="content" spellcheck="true" lang="zh-CN" placeholder="从这里开始写…"></textarea>
+      </div>
     </main>
 
     <div class="ai-backdrop" onclick="toggleAISide()"></div>
@@ -115,6 +120,7 @@
         <span data-ic="bot" data-label="AI 助手"></span>
         <span class="ai-head-tools">
           <button class="ic" id="aiTtsBtn" data-ic="mute" onclick="toggleAiTts()" title="自动朗读"></button>
+          <button class="ic" data-ic="trash" onclick="clearAgent()" title="清空对话"></button>
           <button class="ic" data-ic="x" onclick="toggleAISide()" title="收起"></button>
         </span>
       </div>
@@ -131,7 +137,6 @@
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
         <button class="ic" id="agentMicBtn" data-ic="mic" onclick="toggleAgentMic()" title="语音输入"></button>
         <button id="sendBtn" onclick="sendAgent()">发送</button>
-        <button class="ic" data-ic="trash" onclick="clearAgent()" title="清空对话"></button>
       </div>
     </aside>
   </div>
@@ -210,16 +215,24 @@
     <div class="overlay-card">
       <div class="overlay-head"><span>大模型设置</span><button class="ic" data-ic="x" onclick="closeSettings()"></button></div>
       <div class="set-form">
-        <p class="set-hint">填好 OpenAI 兼容接口后，AI 助手、改写和智能体语音才会生效。语音需要接口支持 /audio/transcriptions。</p>
+        <p class="set-hint">文字模型用于 AI 助手和改稿。勾选“直接发送语音”时，录音会原样交给当前模型；不勾选才使用下方独立的转写服务。</p>
         <label>Base URL</label>
         <input id="setBaseUrl" placeholder="https://api.deepseek.com/v1">
         <label>API Key</label>
         <input id="setApiKey" type="password" placeholder="sk-…（已设置则显示 ****，留空=不改）">
         <label>模型 ID</label>
         <input id="setModel" placeholder="deepseek-chat">
-        <label>语音转写模型</label>
+        <label class="set-row voice-mode-row"><input id="setVoiceDirect" type="checkbox" onchange="updateVoiceSettingHint()"> 直接发送语音给 AI（不转写）</label>
+        <p id="voiceModeHint" class="set-hint voice-mode-hint"></p>
+        <div id="asrSettings">
+        <label>转写服务 Base URL</label>
+        <input id="setAsrBaseUrl" placeholder="留空则沿用文字模型的 Base URL">
+        <label>转写服务 API Key</label>
+        <input id="setAsrApiKey" type="password" placeholder="留空则沿用文字模型的 Key">
+        <label>转写模型</label>
         <input id="setAsrModel" placeholder="whisper-1">
-        <label class="set-row"><input id="setVoiceAuto" type="checkbox"> 语音说完自动发送给 AI（关掉则填进输入框等你确认）</label>
+        <label class="set-row"><input id="setVoiceAuto" type="checkbox"> 转写完成后自动发送给 AI</label>
+        </div>
         <div class="set-actions">
           <button onclick="saveSettings()">保存</button>
           <button class="ic" onclick="closeSettings()">取消</button>

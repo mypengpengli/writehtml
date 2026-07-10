@@ -119,6 +119,8 @@ def init_db():
         _add_col(conn, "chapters", "notes", "TEXT DEFAULT ''")
         _add_col(conn, "chapters", "deleted_at", "REAL")  # 软删时间戳；NULL=正常在册
         _add_col(conn, "user_settings", "asr_model", "TEXT")
+        _add_col(conn, "user_settings", "asr_base_url", "TEXT")
+        _add_col(conn, "user_settings", "asr_api_key", "TEXT")
         _add_col(conn, "works", "user_id", "INTEGER DEFAULT 0")
         _add_col(conn, "works", "notes", "TEXT DEFAULT ''")  # 作品设定(人物/世界观/大纲)
         _add_col(conn, "users", "is_admin", "INTEGER DEFAULT 0")  # 后台管理员标记
@@ -357,28 +359,35 @@ def get_settings(user_id):
     """返回该用户的 LLM 设置；没存过返回 None（调用方用 .env 兜底）。"""
     with get_conn() as conn:
         r = conn.execute(
-            "SELECT llm_base_url, llm_api_key, llm_model, asr_model FROM user_settings WHERE user_id=?",
+            "SELECT llm_base_url, llm_api_key, llm_model, asr_base_url, asr_api_key, asr_model "
+            "FROM user_settings WHERE user_id=?",
             (user_id,),
         ).fetchone()
         return dict(r) if r else None
 
 
-def save_settings(user_id, base_url, api_key, model, asr_model=None):
+def save_settings(user_id, base_url, api_key, model, asr_model=None,
+                  asr_base_url=None, asr_api_key=None):
     """保存设置。api_key 为空或为掩码占位时保留旧值，避免清空已填的 key。"""
     now = time.time()
     with get_conn() as conn:
         old = conn.execute(
-            "SELECT llm_api_key FROM user_settings WHERE user_id=?", (user_id,)
+            "SELECT llm_api_key, asr_api_key FROM user_settings WHERE user_id=?", (user_id,)
         ).fetchone()
         if not api_key or api_key.startswith("****"):
             api_key = old["llm_api_key"] if old else ""
+        if not asr_api_key or asr_api_key.startswith("****"):
+            asr_api_key = old["asr_api_key"] if old else ""
         conn.execute(
-            "INSERT INTO user_settings(user_id, llm_base_url, llm_api_key, llm_model, asr_model, updated_at) "
-            "VALUES(?,?,?,?,?,?) "
+            "INSERT INTO user_settings(user_id, llm_base_url, llm_api_key, llm_model, "
+            "asr_base_url, asr_api_key, asr_model, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "llm_base_url=excluded.llm_base_url, llm_api_key=excluded.llm_api_key, "
-            "llm_model=excluded.llm_model, asr_model=excluded.asr_model, updated_at=excluded.updated_at",
-            (user_id, base_url, api_key, model, asr_model, now),
+            "llm_model=excluded.llm_model, asr_base_url=excluded.asr_base_url, "
+            "asr_api_key=excluded.asr_api_key, asr_model=excluded.asr_model, updated_at=excluded.updated_at",
+            (user_id, base_url, api_key, model, asr_base_url or "", asr_api_key,
+             asr_model, now),
         )
         return True
 

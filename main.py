@@ -2,6 +2,7 @@
 import json
 import secrets
 import difflib
+import base64
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException
@@ -45,6 +46,32 @@ def _qparam_int(request: Request, name):
     """从 query string 取一个可选整数，缺省/空返回 None。"""
     v = request.query_params.get(name)
     return int(v) if v else None
+
+
+def _mask_key(key):
+    return ("****" + key[-4:]) if key else ""
+
+
+def _asr_config(settings):
+    """转写可使用独立服务；未填写独立项时回退到文字模型配置。"""
+    settings = settings or {}
+    return {
+        "base_url": (
+            settings.get("asr_base_url") or config.ASR_BASE_URL
+            or settings.get("llm_base_url") or config.LLM_BASE_URL
+        ),
+        "api_key": (
+            settings.get("asr_api_key") or config.ASR_API_KEY
+            or settings.get("llm_api_key") or config.LLM_API_KEY
+        ),
+        "model": settings.get("asr_model") or config.ASR_MODEL,
+    }
+
+
+def _provider_error(exc, limit=260):
+    """保留可诊断的信息，但不把供应商的整段 JSON 直接塞进手机 toast。"""
+    text = " ".join(str(exc).split())
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 # ---------- 鉴权 / 注册 ----------
@@ -106,6 +133,8 @@ async def get_settings(request: Request):
     uid = _auth(request)
     s = db.get_settings(uid) or {}
     key = s.get("llm_api_key") or ""
+    # 设置页只展示“显式配置”的转写项；留空即代表沿用文字模型，不把回退值写死。
+    asr_key = s.get("asr_api_key") or config.ASR_API_KEY
     # 明文 key 不回传，只给掩码提示是否已填
     masked = ("****" + key[-4:]) if key else ""
     return {
@@ -113,6 +142,9 @@ async def get_settings(request: Request):
         "api_key_masked": masked,
         "has_key": bool(key),
         "model": s.get("llm_model") or config.LLM_MODEL,
+        "asr_base_url": s.get("asr_base_url") or config.ASR_BASE_URL,
+        "asr_api_key_masked": _mask_key(asr_key),
+        "asr_has_key": bool(asr_key),
         "asr_model": s.get("asr_model") or config.ASR_MODEL,
     }
 
@@ -127,6 +159,8 @@ async def save_settings(request: Request):
         (body.get("api_key") or "").strip(),
         (body.get("model") or "").strip(),
         (body.get("asr_model") or "").strip(),
+        (body.get("asr_base_url") or "").strip(),
+        (body.get("asr_api_key") or "").strip(),
     )
     return {"ok": True}
 
@@ -534,12 +568,9 @@ async def transcribe_audio(request: Request):
         raise HTTPException(400, "没有收到录音")
     if len(audio) > 15 * 1024 * 1024:
         raise HTTPException(413, "录音太长，请控制在一分钟内")
-    s = db.get_settings(uid) or {}
-    base_url = s.get("llm_base_url") or config.LLM_BASE_URL
-    api_key = s.get("llm_api_key") or config.LLM_API_KEY
-    model = s.get("asr_model") or config.ASR_MODEL
-    if not api_key:
-        raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 语音转写模型")
+    asr = _asr_config(db.get_settings(uid))
+    if not asr["api_key"]:
+        raise HTTPException(500, "未配置转写服务，请在「设置」里填语音转写的 Base URL、Key 和模型")
     mime = (request.headers.get("content-type") or "audio/webm").split(";")[0]
     ext = "webm"
     if "mp4" in mime:
@@ -550,11 +581,11 @@ async def transcribe_audio(request: Request):
         ext = "wav"
     try:
         text = llm.transcribe(audio, filename=f"speech.{ext}", mime_type=mime,
-                              base_url=base_url, api_key=api_key, model=model)
+                              base_url=asr["base_url"], api_key=asr["api_key"], model=asr["model"])
     except Exception as e:
-        raise HTTPException(500, "语音转写失败：当前接口可能不支持 /audio/transcriptions，"
-                            "请在设置里使用支持 Whisper/音频转写的 OpenAI 兼容接口。"
-                            f"原始错误：{e}")
+        raise HTTPException(502, "语音转写服务不可用。请检查转写专用 Base URL、Key、模型；"
+                            "当前文字模型不一定提供 /audio/transcriptions。"
+                            f" 详情：{_provider_error(e)}")
     if not text:
         raise HTTPException(500, "语音转写没有返回文字")
     return {"text": text}
@@ -917,18 +948,12 @@ _AGENT_TOOLS = {
 }
 
 
-@app.post("/api/agent")
-async def agent(request: Request):
-    """AI agent：对话即操作。模型经 function calling 调工具改稿/回退/加章，
-    每个写操作前自动存版本快照，返回 undo_rid 供前端撤销。
-    服务端按 用户×章节 持久化对话；超长时把早期轮次 LLM 摘要压缩，保留最近几轮。"""
-    uid = _auth(request)
-    body = await request.json()
-    text = (body.get("text") or "").strip()
-    cid = body.get("chapter_id")
-    selection = body.get("selection")
-    if not text:
-        raise HTTPException(400, "没有对话内容")
+def _run_agent(uid, cid, history_text, selection=None, model_turn=None):
+    """执行一轮 agent。
+
+    history_text 是持久化到 SQLite 的安全文本；model_turn 可在本轮替换成音频等
+    多模态内容，避免把 Base64 音频塞进后续每一轮对话上下文。
+    """
     st = db.get_settings(uid) or {}
     base_url = st.get("llm_base_url") or config.LLM_BASE_URL
     api_key = st.get("llm_api_key") or config.LLM_API_KEY
@@ -937,11 +962,11 @@ async def agent(request: Request):
         raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
     cfg = {"base_url": base_url, "api_key": api_key, "model": model}
 
-    # 加载持久化对话（服务端权威），追加本轮用户消息
+    # 加载持久化对话（服务端权威）。音频只进入本轮模型消息，不保存原始内容。
     conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
     msgs = list(conv["messages"])
     summary = conv["summary"] or ""
-    msgs.append({"role": "user", "content": text})
+    stored_turn = {"role": "user", "content": history_text}
 
     # 发给模型的数组：系统提示 + 早期摘要(若有) + 当前对话
     messages = [_agent_system(uid, cid)]
@@ -951,6 +976,8 @@ async def agent(request: Request):
     if summary:
         messages.append({"role": "user", "content": "[此前对话摘要]\n" + summary})
     messages.extend(msgs)
+    messages.append(model_turn or stored_turn)
+    msgs.append(stored_turn)
 
     reply = ""
     for _ in range(6):
@@ -1002,6 +1029,63 @@ async def agent(request: Request):
 
     db.save_conversation(uid, cid, msgs, summary)
     return {"reply": reply, "messages": msgs, "compacted": compacted}
+
+
+@app.post("/api/agent")
+async def agent(request: Request):
+    """文字指令进入 agent。"""
+    uid = _auth(request)
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "没有对话内容")
+    return _run_agent(uid, body.get("chapter_id"), text, body.get("selection"))
+
+
+@app.post("/api/agent/audio")
+async def agent_audio(request: Request):
+    """语音直发模式：把 WAV/MP3 作为多模态用户消息交给当前 Agent 模型。"""
+    uid = _auth(request)
+    body = await request.json()
+    audio_b64 = body.get("audio")
+    audio_format = (body.get("format") or "").lower().strip()
+    if not isinstance(audio_b64, str) or not audio_b64:
+        raise HTTPException(400, "没有收到录音")
+    if audio_format not in {"wav", "mp3"}:
+        raise HTTPException(400, "语音直发仅接受 WAV 或 MP3 录音")
+    try:
+        audio = base64.b64decode(audio_b64, validate=True)
+    except Exception:
+        raise HTTPException(400, "录音数据无效")
+    if not audio:
+        raise HTTPException(400, "没有收到录音")
+    if len(audio) > 5 * 1024 * 1024:
+        raise HTTPException(413, "录音太长，请控制在一分钟内")
+
+    # OpenAI Chat Completions 的音频内容格式；不兼容的网关会返回明确的直发失败提示。
+    model_turn = {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "以下是一条作者的语音指令。请直接理解音频内容并按要求执行；"
+                        "若语义不清楚，简短追问。不要要求用户先转写。",
+            },
+            {
+                "type": "input_audio",
+                "input_audio": {"data": audio_b64, "format": audio_format},
+            },
+        ],
+    }
+    try:
+        return _run_agent(uid, body.get("chapter_id"), "[voice] 语音指令",
+                          body.get("selection"), model_turn=model_turn)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, "语音已直接发送给模型，但当前模型或网关不支持音频输入/工具调用。"
+                            "可关闭「直接发送语音给 AI」后改用转写模式。"
+                            f" 详情：{_provider_error(e)}")
 
 
 @app.get("/api/agent/conversation")

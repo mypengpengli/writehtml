@@ -11,9 +11,10 @@ let mode = "转写";
 // 语音
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, micOn = false, draftBuffer = "", recFatal = false;
-// AI 侧栏：录音上传转写 + 自动朗读
-let agentRecorder = null, agentMicOn = false, agentChunks = [], agentStream = null, _agentPH = null;
-let voiceAutoSend = localStorage.getItem("voiceAutoSend") !== "0"; // 默认自动发
+// AI 侧栏：录音直发或转写 + 自动朗读
+let agentRecorder = null, agentMicOn = false, agentChunks = [], agentStream = null, _agentPH = null, agentMicTimer = null;
+let voiceDirectToModel = localStorage.getItem("voiceDirectToModel") !== "0"; // 默认直发语音
+let voiceAsrAutoSend = localStorage.getItem("voiceAsrAutoSend") === "1";
 let aiTts = localStorage.getItem("aiTts") !== "0"; // 默认开
 
 // 自动保存
@@ -136,8 +137,19 @@ async function api(path, opts = {}) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   if (res.status === 401) { showLogin(); throw new Error("未登录"); }
-  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  if (!res.ok) throw new Error(await responseError(res));
   return res.json();
+}
+
+async function responseError(res) {
+  const raw = (await res.text()).trim();
+  let msg = raw || res.statusText || "请求失败";
+  try {
+    const data = JSON.parse(raw);
+    msg = data.detail || data.message || msg;
+  } catch (e) {}
+  msg = String(msg).replace(/\s+/g, " ");
+  return msg.length > 260 ? msg.slice(0, 260) + "…" : msg;
 }
 
 const tail = (s, n) => (!s ? "" : s.length > n ? s.slice(-n) : s);
@@ -732,28 +744,47 @@ async function openSettings() {
     const s = await api("/api/settings", { method: "GET" });
     $("setBaseUrl").value = s.base_url || "";
     $("setModel").value = s.model || "";
+    $("setAsrBaseUrl").value = s.asr_base_url || "";
     $("setAsrModel").value = s.asr_model || "whisper-1";
     // key 不回传明文：已填则用掩码占位提示，留空表示不改
     $("setApiKey").value = s.api_key_masked || "";
     $("setApiKey").placeholder = s.has_key ? `${s.api_key_masked}（留空=不改）` : "sk-…";
-    $("setVoiceAuto").checked = voiceAutoSend;
+    $("setAsrApiKey").value = s.asr_api_key_masked || "";
+    $("setAsrApiKey").placeholder = s.asr_has_key ? `${s.asr_api_key_masked}（留空=不改）` : "留空则沿用文字模型的 Key";
+    $("setVoiceDirect").checked = voiceDirectToModel;
+    $("setVoiceAuto").checked = voiceAsrAutoSend;
     $("setMsg").textContent = "";
   } catch (e) { $("setMsg").textContent = e.message; }
+  updateVoiceSettingHint();
   $("setOverlay").classList.remove("hidden");
 }
 function closeSettings() { $("setOverlay").classList.add("hidden"); }
+function updateVoiceSettingHint() {
+  const direct = $("setVoiceDirect")?.checked;
+  const box = $("asrSettings");
+  if (box) box.classList.toggle("hidden", !!direct);
+  const hint = $("voiceModeHint");
+  if (hint) hint.textContent = direct
+    ? "录音会直接发送给当前 AI 模型，不调用 Whisper。当前模型必须支持音频输入。"
+    : "录音会先调用下方转写服务，得到文字后再发送给 AI。";
+}
 async function saveSettings() {
   const base_url = $("setBaseUrl").value.trim();
   const model = $("setModel").value.trim();
+  const asr_base_url = $("setAsrBaseUrl").value.trim();
   const asr_model = $("setAsrModel").value.trim();
   let api_key = $("setApiKey").value.trim();
+  let asr_api_key = $("setAsrApiKey").value.trim();
   // 若用户没动 key 输入框（仍是掩码占位），传空让后端保留旧值
   if (api_key.startsWith("****")) api_key = "";
-  // 语音自动发送是纯前端偏好（麦克风是设备本地能力），存 localStorage 即可
-  voiceAutoSend = $("setVoiceAuto").checked;
-  localStorage.setItem("voiceAutoSend", voiceAutoSend ? "1" : "0");
+  if (asr_api_key.startsWith("****")) asr_api_key = "";
+  voiceDirectToModel = $("setVoiceDirect").checked;
+  voiceAsrAutoSend = $("setVoiceAuto").checked;
+  localStorage.setItem("voiceDirectToModel", voiceDirectToModel ? "1" : "0");
+  localStorage.setItem("voiceAsrAutoSend", voiceAsrAutoSend ? "1" : "0");
+  setAgentMic(false);
   try {
-    await api("/api/settings", { body: { base_url, api_key, model, asr_model } });
+    await api("/api/settings", { body: { base_url, api_key, model, asr_base_url, asr_api_key, asr_model } });
     $("setMsg").textContent = "已保存";
     setTimeout(closeSettings, 600);
   } catch (e) { $("setMsg").textContent = e.message; }
@@ -825,7 +856,9 @@ function renderAgent() {
   let html = "";
   for (const m of agentMsgs) {
     if (m.role === "user") {
-      html += `<div class="cm user">${esc(m.content)}</div>`;
+      html += m.content === "[voice] 语音指令"
+        ? `<div class="cm user voice">${svg("mic")} 语音指令</div>`
+        : `<div class="cm user">${esc(m.content)}</div>`;
     } else if (m.role === "assistant") {
       if (m.content) html += `<div class="cm assistant">${esc(m.content)}</div>`;
     } else if (m.role === "tool") {
@@ -847,6 +880,35 @@ function renderAgent() {
   el.innerHTML = html;
   el.scrollTop = el.scrollHeight;
 }
+async function applyAgentResult(r, selection) {
+  if (selection) clearAgentSelection();
+  agentMsgs = Array.isArray(r.messages) ? r.messages : agentMsgs;
+  if (r.compacted) showToast("已压缩早期对话，保留最近几轮", "ok");
+  let contentChanged = false, sidebarDirty = false;
+  for (const m of agentMsgs) {
+    if (m.role === "tool") {
+      let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
+      if (rr.changed) contentChanged = true;
+      if (rr.sidebar_dirty) sidebarDirty = true;
+    }
+  }
+  if (sidebarDirty) await loadChapters();
+  else if (contentChanged && currentChapterId) await loadChapter();
+}
+function speakLatestAgentTurn() {
+  const uIdx = agentMsgs.map(m => m.role).lastIndexOf("user");
+  let spoken = "";
+  for (let i = (uIdx < 0 ? 0 : uIdx + 1); i < agentMsgs.length; i++) {
+    const m = agentMsgs[i];
+    if (m.role === "assistant" && m.content) spoken += m.content + " ";
+    else if (m.role === "tool") {
+      let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
+      if (rr.summary) spoken += rr.summary + " ";
+      else if (rr.error) spoken += "操作出错，" + rr.error + "。";
+    }
+  }
+  speakAgentText(spoken);
+}
 async function sendAgent() {
   if (agentBusy) return;
   const el = $("agentInput");
@@ -864,39 +926,14 @@ async function sendAgent() {
   if (selection) body.selection = selection;
   try {
     const r = await api("/api/agent", { body });
-    if (selection) clearAgentSelection();
-    agentMsgs = Array.isArray(r.messages) ? r.messages : agentMsgs;
-    if (r.compacted) showToast("已压缩早期对话，保留最近几轮", "ok");
-    // 检测工具是否改动正文/侧栏，决定刷新哪块
-    let contentChanged = false, sidebarDirty = false;
-    for (const m of agentMsgs) {
-      if (m.role === "tool") {
-        let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
-        if (rr.changed) contentChanged = true;
-        if (rr.sidebar_dirty) sidebarDirty = true;
-      }
-    }
-    if (sidebarDirty) await loadChapters();
-    else if (contentChanged && currentChapterId) await loadChapter();
+    await applyAgentResult(r, selection);
   } catch (e) {
     agentMsgs.push({ role: "assistant", content: "出错：" + e.message });
   } finally {
     agentBusy = false;
     busy($("sendBtn"), false, "发送");
     renderAgent();
-    // 自动朗读本轮 AI 的回复与操作摘要（朗读开关 🔊 开启时）
-    const uIdx = agentMsgs.map(m => m.role).lastIndexOf("user");
-    let spoken = "";
-    for (let i = (uIdx < 0 ? 0 : uIdx + 1); i < agentMsgs.length; i++) {
-      const m = agentMsgs[i];
-      if (m.role === "assistant" && m.content) spoken += m.content + " ";
-      else if (m.role === "tool") {
-        let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
-        if (rr.summary) spoken += rr.summary + " ";
-        else if (rr.error) spoken += "操作出错，" + rr.error + "。";
-      }
-    }
-    speakAgentText(spoken);
+    speakLatestAgentTurn();
     $("agentInput").focus(); // 发完聚焦输入框，方便连续对话
   }
 }
@@ -925,11 +962,52 @@ async function loadConversation() {
 }
 function openAdmin() { location.href = "admin.html"; }
 
-/* 智能体语音：浏览器只录音，后端走 OpenAI 兼容 ASR，避开 Chrome/Google SpeechRecognition */
+/* 智能体语音：默认直发当前模型；关闭直发时才走独立 ASR。 */
 
 function bestAudioMime() {
   const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
   return types.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+}
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("无法读取录音"));
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.readAsDataURL(blob);
+  });
+}
+function writeWavText(view, offset, text) {
+  for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+}
+async function recordToMonoWav(blob) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) throw new Error("浏览器无法转换录音格式，请关闭直发语音后使用转写模式");
+  const ctx = new Ctx();
+  try {
+    const source = await ctx.decodeAudioData(await blob.arrayBuffer());
+    const rate = 16000;
+    const frames = Math.ceil(source.duration * rate);
+    const wav = new ArrayBuffer(44 + frames * 2);
+    const view = new DataView(wav);
+    writeWavText(view, 0, "RIFF"); view.setUint32(4, 36 + frames * 2, true);
+    writeWavText(view, 8, "WAVEfmt "); view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    writeWavText(view, 36, "data"); view.setUint32(40, frames * 2, true);
+    const channels = Array.from({ length: source.numberOfChannels }, (_, i) => source.getChannelData(i));
+    for (let i = 0; i < frames; i++) {
+      const at = i * source.sampleRate / rate;
+      const left = Math.floor(at), right = Math.min(left + 1, source.length - 1), mix = at - left;
+      let sample = 0;
+      for (const ch of channels) sample += ch[left] * (1 - mix) + ch[right] * mix;
+      sample = Math.max(-1, Math.min(1, sample / channels.length));
+      view.setInt16(44 + i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    }
+    return new Blob([wav], { type: "audio/wav" });
+  } finally {
+    try { await ctx.close(); } catch (e) {}
+  }
 }
 async function transcribeAgentAudio(blob) {
   const btn = $("agentMicBtn");
@@ -949,21 +1027,66 @@ async function transcribeAgentAudio(blob) {
       body: blob,
     });
     if (res.status === 401) { showLogin(); throw new Error("未登录"); }
-    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    if (!res.ok) throw new Error(await responseError(res));
     const r = await res.json();
     const text = (r.text || "").trim();
     if (!text) throw new Error("没有识别到文字");
     el.value = text;
     el.placeholder = _agentPH || "";
-    if (voiceAutoSend) await sendAgent();
+    if (voiceAsrAutoSend) await sendAgent();
     else el.focus();
   } catch (e) {
-    el.placeholder = "语音转写失败：" + e.message;
-    showToast("语音转写失败：" + e.message, "err");
+    el.placeholder = "转写失败：" + e.message;
+    showToast("转写失败：" + e.message, "err");
   } finally {
     btn.classList.remove("is-busy");
     if (!agentMicOn) setAgentMic(false);
   }
+}
+async function sendAgentAudio(blob) {
+  if (agentBusy) return;
+  const btn = $("agentMicBtn"), el = $("agentInput"), selection = agentSelection;
+  if (dirty) await saveNow();
+  agentMsgs.push({ role: "user", content: "[voice] 语音指令" });
+  agentBusy = true;
+  btn.classList.add("is-busy");
+  if (!_agentPH) _agentPH = el.placeholder;
+  el.placeholder = "正在把语音发送给 AI…";
+  renderAgent();
+  try {
+    const wav = await recordToMonoWav(blob);
+    if (wav.size > 5 * 1024 * 1024) throw new Error("录音太长，请控制在一分钟内");
+    const audio = await blobToBase64(wav);
+    const res = await fetch("/api/agent/audio", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: "Bearer " + token } : {}),
+      },
+      body: JSON.stringify({ audio, format: "wav", chapter_id: currentChapterId, selection }),
+    });
+    if (res.status === 401) { showLogin(); throw new Error("未登录"); }
+    if (!res.ok) throw new Error(await responseError(res));
+    await applyAgentResult(await res.json(), selection);
+  } catch (e) {
+    agentMsgs.push({ role: "assistant", content: "语音直发失败：" + e.message });
+    showToast("语音直发失败：" + e.message, "err");
+  } finally {
+    agentBusy = false;
+    btn.classList.remove("is-busy");
+    el.placeholder = _agentPH || "让 AI 帮你改稿、续写、回退版本…";
+    renderAgent();
+    speakLatestAgentTurn();
+    el.focus();
+  }
+}
+function explainMicStartError(e) {
+  if (e?.name === "NotAllowedError") {
+    return "麦克风未获允许：请检查手机系统是否允许 Chrome 使用麦克风，并在浏览器站点设置中重置 xs.jiazhuangai.com 的麦克风权限";
+  }
+  if (e?.name === "NotReadableError") return "麦克风正被其他通话或录音应用占用";
+  if (e?.name === "NotFoundError") return "没有检测到可用麦克风";
+  return "无法启动录音：" + (e?.message || e?.name || "未知错误");
 }
 async function toggleAgentMic() {
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
@@ -972,6 +1095,7 @@ async function toggleAgentMic() {
   }
   if (agentMicOn) {
     agentMicOn = false;
+    clearTimeout(agentMicTimer); agentMicTimer = null;
     try { agentRecorder?.stop(); } catch (e) {}
     setAgentMic(false);
     return;
@@ -987,15 +1111,18 @@ async function toggleAgentMic() {
     agentRecorder = new MediaRecorder(agentStream, mimeType ? { mimeType } : undefined);
     agentRecorder.ondataavailable = e => { if (e.data && e.data.size) agentChunks.push(e.data); };
     agentRecorder.onstop = () => {
+      clearTimeout(agentMicTimer); agentMicTimer = null;
       agentStream?.getTracks().forEach(t => t.stop());
       agentStream = null;
       const blob = new Blob(agentChunks, { type: mimeType || "audio/webm" });
       agentChunks = [];
       if (blob.size < 300) { showToast("录音太短", "err"); return; }
-      transcribeAgentAudio(blob);
+      if (voiceDirectToModel) sendAgentAudio(blob);
+      else transcribeAgentAudio(blob);
     };
     agentRecorder.onerror = e => {
       agentMicOn = false;
+      clearTimeout(agentMicTimer); agentMicTimer = null;
       setAgentMic(false);
       agentStream?.getTracks().forEach(t => t.stop());
       showToast("录音失败：" + (e.error?.message || e.error?.name || "未知错误"), "err");
@@ -1003,12 +1130,15 @@ async function toggleAgentMic() {
     agentMicOn = true;
     setAgentMic(true);
     agentRecorder.start();
+    agentMicTimer = setTimeout(() => {
+      if (!agentMicOn) return;
+      showToast("已录满一分钟，正在结束录音", "ok");
+      toggleAgentMic();
+    }, 60000);
   } catch (e) {
     agentMicOn = false;
     setAgentMic(false);
-    const msg = e.name === "NotAllowedError"
-      ? "麦克风权限被拒：请点地址栏左侧图标，把麦克风改为允许后刷新"
-      : "无法启动录音：" + (e.message || e.name || "未知错误");
+    const msg = explainMicStartError(e);
     el.placeholder = msg;
     showToast(msg, "err");
   }
@@ -1017,7 +1147,7 @@ function setAgentMic(on) {
   const b = $("agentMicBtn"); if (!b) return;
   setIcon(b, on ? "square" : "mic");
   b.classList.toggle("on", on);
-  b.title = on ? "正在听…再按结束" : "语音输入";
+  b.title = on ? "正在录音，再按结束" : (voiceDirectToModel ? "语音直发给 AI" : "录音后转写");
 }
 function toggleAiTts() {
   aiTts = !aiTts;
@@ -1282,7 +1412,10 @@ document.addEventListener("click", (e) => {
   applyIcons();
   // 移动端键盘适配：跟随可视视口高度，避免输入框被键盘遮挡
   if (window.visualViewport) {
-    const onVp = () => document.documentElement.style.setProperty("--vp-h", window.visualViewport.height + "px");
+    const onVp = () => {
+      document.documentElement.style.setProperty("--vp-h", window.visualViewport.height + "px");
+      document.documentElement.style.setProperty("--vp-top", window.visualViewport.offsetTop + "px");
+    };
     window.visualViewport.addEventListener("resize", onVp);
     window.visualViewport.addEventListener("scroll", onVp);
     onVp();
@@ -1291,6 +1424,7 @@ document.addEventListener("click", (e) => {
   applyFont(localStorage.getItem("fontSerif") === "1");
   if (localStorage.getItem("aiOpen") === "1") $("app").classList.add("ai-open");
   setAiTtsBtn(); // 朗读开关按钮图标按上次状态显示
+  setAgentMic(false);
   // 根据是否开放注册，决定显示注册入口
   try {
     const s = await api("/api/signup-status", { method: "GET" });

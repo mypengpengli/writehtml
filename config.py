@@ -8,6 +8,9 @@ load_dotenv()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+# 转写服务可单独配置；留空时自动沿用文字模型的 base_url / key。
+ASR_BASE_URL = os.getenv("ASR_BASE_URL", "")
+ASR_API_KEY = os.getenv("ASR_API_KEY", "")
 ASR_MODEL = os.getenv("ASR_MODEL", "whisper-1")
 
 # SQLite 路径（Docker 里挂到数据卷）
