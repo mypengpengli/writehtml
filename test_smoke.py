@@ -1,5 +1,6 @@
 """冒烟测试：多用户隔离 + P1 新功能。转写模式不调 LLM，无需 key。"""
-import os, shutil, uuid, sqlite3, time, json, types, base64
+import os, shutil, uuid, sqlite3, time, json, types, base64, io, zipfile, sys
+from concurrent.futures import ThreadPoolExecutor
 
 # 用项目内临时目录放 db（系统 %TEMP% 上杀软偶发瞬时锁会让 sqlite 报只读）
 _TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".smoke_tmp", uuid.uuid4().hex[:10])
@@ -99,6 +100,49 @@ ok(s["asr_has_key"] is True and "secret" not in s["asr_api_key_masked"], "转写
 # 空 key 提交应保留旧 key
 c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "", "model": "m-a2"}, headers=H(tokA))
 ok(c.get("/api/settings", headers=H(tokA)).json()["has_key"] is True, "空 key 不清空已存 key")
+
+# AI Skills：通用/作品专用 CRUD、作用域和用户隔离
+ok(c.post("/api/agent/skills", json={"name": "", "instruction": "规则"}, headers=H(tokA)).status_code == 400, "Skill 空名称 400")
+ok(c.post("/api/agent/skills", json={"name": "坏范围", "instruction": "规则", "work_id": "x"}, headers=H(tokA)).status_code == 400, "Skill 非法范围 400")
+global_skill = c.post("/api/agent/skills", json={
+    "name": "克制叙事", "description": "少形容词", "instruction": "使用克制、具体的叙事，避免空泛形容词。",
+    "work_id": None,
+}, headers=H(tokA)).json()
+work_skill = c.post("/api/agent/skills", json={
+    "name": "本书悬疑节奏", "instruction": "每段结尾保留一个未解信息。", "work_id": wid,
+}, headers=H(tokA)).json()
+_skills = c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokA)).json()
+ok({x["id"] for x in _skills} == {global_skill["id"], work_skill["id"]}, "Skill 列表含通用和作品专用")
+ok(c.get("/api/agent/skills", headers=H(tokA)).json()[0]["id"] == global_skill["id"], "无作品时只列通用 Skill")
+ok(c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokB)).status_code == 404, "bob 看 alice 作品 Skill 404")
+ok(c.put(f"/api/agent/skills/{global_skill['id']}", json={
+    "name": "hack", "instruction": "hack", "work_id": None,
+}, headers=H(tokB)).status_code == 404, "bob 改 alice Skill 404")
+ok(c.put(f"/api/agent/skills/{global_skill['id']}", json={
+    "name": "克制叙事", "description": "少形容词", "instruction": "使用克制、具体的叙事，避免空泛形容词。",
+    "work_id": None, "enabled": False,
+}, headers=H(tokA)).status_code == 200, "Skill 可停用")
+ok(not c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokA)).json()[0]["enabled"], "Skill 停用状态读回")
+ok(c.put(f"/api/agent/skills/{global_skill['id']}", json={
+    "name": "克制叙事", "description": "少形容词", "instruction": "使用克制、具体的叙事，避免空泛形容词。",
+    "work_id": None, "enabled": True,
+}, headers=H(tokA)).status_code == 200, "Skill 可重新启用")
+
+# 标准 Agent Skills：导入 SKILL.md / ZIP，读取 YAML 元数据与 references，忽略脚本。
+ok(c.post("/api/agent/skills/import", json={
+    "filename": "SKILL.md", "data": base64.b64encode(b"# not a skill").decode(), "work_id": None,
+}, headers=H(tokA)).status_code == 400, "非标准 SKILL.md 拒绝导入")
+_skill_zip = io.BytesIO()
+with zipfile.ZipFile(_skill_zip, "w", zipfile.ZIP_DEFLATED) as _z:
+    _z.writestr("dialogue-polish/SKILL.md", "---\nname: dialogue-polish\ndescription: Use when polishing Chinese dialogue, dialogue rhythm, or subtext.\n---\n\n# Workflow\n先保留人物说话习惯，再压缩解释性台词；需要范例时读取 references/dialogue-style.md。")
+    _z.writestr("dialogue-polish/references/dialogue-style.md", "引用资料：对话中让动作承担一部分解释，避免连续三句直白说明。")
+    _z.writestr("dialogue-polish/scripts/format.py", "raise RuntimeError('must not execute')")
+skill_pkg = c.post("/api/agent/skills/import", json={
+    "filename": "dialogue-polish.zip", "data": base64.b64encode(_skill_zip.getvalue()).decode(), "work_id": wid,
+}, headers=H(tokA)).json()
+ok(skill_pkg["name"] == "dialogue-polish" and skill_pkg["source_kind"] == "skill_md" and skill_pkg["resource_count"] == 1, "ZIP 导入标准 SKILL.md 和引用资料")
+ok(skill_pkg["skipped_files"] == ["scripts/format.py"], "Skill 脚本不会被导入或执行")
+ok(any(x["id"] == skill_pkg["id"] and x["source_kind"] == "skill_md" for x in c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokA)).json()), "导入 Skill 出现在当前作品目录")
 # bob 与 alice 设置隔离
 c.post("/api/settings", json={"base_url": "https://b.test/v1", "api_key": "sk-bob", "model": "m-b"}, headers=H(tokB))
 sb = c.get("/api/settings", headers=H(tokB)).json()
@@ -262,11 +306,15 @@ def _capture_voice(messages, tools, **kw):
 llm.agent_chat = _capture_voice
 _voice = c.post("/api/agent/audio", json={
     "audio": base64.b64encode(b"fake-wav-audio").decode(), "format": "wav", "chapter_id": cid,
+    "skill_ids": [global_skill["id"], work_skill["id"]],
 }, headers=H(tokA)).json()
 _voice_turn = next(m for m in _seen_voice["messages"] if m.get("role") == "user" and isinstance(m.get("content"), list))
 ok(any(x.get("type") == "input_audio" and x.get("input_audio", {}).get("format") == "wav" for x in _voice_turn["content"]), "语音直发本轮带 input_audio")
+_voice_skill_prompt = "\n".join(m.get("content", "") for m in _seen_voice["messages"] if m.get("role") == "system")
+ok("克制叙事" in _voice_skill_prompt and "本书悬疑节奏" in _voice_skill_prompt, "语音直发本轮收到 Skill")
 ok(any(m.get("content") == "[voice] 语音指令" for m in _voice["messages"]), "语音对话持久化仅存占位")
 ok(not any("ZmFrZS13YXY" in str(m) for m in _voice["messages"]), "语音 Base64 不写入对话历史")
+ok(not any("本书悬疑节奏" in (m.get("content") or "") for m in _voice["messages"]), "Skill 规则不写入语音对话历史")
 llm.agent_chat = _orig_ac
 
 # replace_text 工具：cid 正文 "你好" → "你好呀"，并验证可撤销
@@ -297,14 +345,56 @@ c.post("/api/agent", json={
     "text": "把这段改紧张",
     "chapter_id": cid,
     "selection": {"text": "你好", "start": 0, "end": 2, "before": "", "after": ""},
+    "skill_ids": [global_skill["id"], work_skill["id"]],
 }, headers=H(tokA))
 _sel_prompt = "\n".join(m.get("content", "") for m in _seen_sel["messages"] if m.get("role") == "system")
 ok("selected_text" in _sel_prompt and "你好" in _sel_prompt, "agent 本轮收到选区上下文")
+ok("克制叙事" in _sel_prompt and "本书悬疑节奏" in _sel_prompt, "选区对话本轮收到 Skill")
 _conv_sel = c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()
 ok(not any("selected_text" in (m.get("content") or "") for m in _conv_sel["messages"]), "agent 选区上下文不持久化")
+ok(not any("本书悬疑节奏" in (m.get("content") or "") for m in _conv_sel["messages"]), "Skill 规则不写入选区对话历史")
 
 ok(c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).status_code == 200, "清空对话 200")
 ok(len(c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()["messages"]) == 0, "清空后对话为空")
+
+# Agent 的二次写作工具也必须继承本轮 Skill，不能只影响工具选择。
+_orig_process = llm.process
+_seen_process_skill = {}
+def _capture_process_skill(mode, text, **kw):
+    _seen_process_skill.update(kw)
+    return text
+llm.process = _capture_process_skill
+llm.agent_chat = _make_agent([
+    _msg(None, [("c-skill", "edit_passage", json.dumps({"old_text": "你好", "instruction": "改写"}))]),
+    _msg("已按规则改写。"),
+])
+c.post("/api/agent", json={
+    "text": "按 Skill 改这段", "chapter_id": cid,
+    "skill_ids": [global_skill["id"], work_skill["id"]],
+}, headers=H(tokA))
+ok("克制叙事" in (_seen_process_skill.get("skill_instructions") or "") and "本书悬疑节奏" in (_seen_process_skill.get("skill_instructions") or ""), "Agent 二次改写继承 Skill")
+llm.process = _orig_process
+c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA))
+
+# 标准 Skill 的渐进加载：首轮只给目录，命中后加载 SKILL.md，再按需读 references。
+_auto_calls = []
+def _auto_skill_agent(messages, tools, **kw):
+    _auto_calls.append([dict(m) for m in messages])
+    if len(_auto_calls) == 1:
+        return _msg(None, [("auto-1", "activate_skill", json.dumps({"skill_id": skill_pkg["id"]}))])
+    if len(_auto_calls) == 2:
+        return _msg(None, [("auto-2", "read_skill_resource", json.dumps({"skill_id": skill_pkg["id"], "path": "references/dialogue-style.md"}))])
+    return _msg("已按对话润色 Skill 完成。")
+llm.agent_chat = _auto_skill_agent
+_auto = c.post("/api/agent", json={"text": "把这段对话更有潜台词", "chapter_id": cid}, headers=H(tokA)).json()
+_auto_first = "\n".join(m.get("content", "") for m in _auto_calls[0] if m.get("role") == "system")
+_auto_second = "\n".join(m.get("content", "") for m in _auto_calls[1] if m.get("role") == "system")
+_auto_third = "\n".join(m.get("content", "") for m in _auto_calls[2] if m.get("role") == "system")
+ok("dialogue-polish" in _auto_first and "先保留人物说话习惯" not in _auto_first, "Agent 首轮只收到 Skill 元数据目录")
+ok("先保留人物说话习惯" in _auto_second, "Agent activate_skill 后收到完整 SKILL.md")
+ok("让动作承担一部分解释" in _auto_third, "Agent 可按需读取 Skill references")
+ok(not any("先保留人物说话习惯" in (m.get("content") or "") or "让动作承担一部分解释" in (m.get("content") or "") for m in _auto["messages"]), "Skill 正文和资料不写入对话历史")
+c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA))
 
 # list_revisions 工具（只读，验证分派 + JSON 往返）
 llm.agent_chat = _make_agent([
@@ -335,6 +425,92 @@ config.AGENT_COMPACT_CHARS = _orig_cc
 config.AGENT_PRESERVE_RECENT = _orig_pr
 llm.agent_chat = _orig_ac
 # cid 此刻留有一条压缩后的对话，供后面删作品级联清理验证
+
+# 本机 meta-memory + launcher：每轮读 SKILL.md、生命周期使用同一 turn_id、回答先落盘再确认。
+_skill_root = os.path.join(_TMP, "local-skills")
+_meta_dir = os.path.join(_skill_root, "meta-memory")
+os.makedirs(_meta_dir, exist_ok=True)
+with open(os.path.join(_meta_dir, "SKILL.md"), "w", encoding="utf-8", newline="\n") as _f:
+    _f.write("---\nname: meta-memory\ndescription: local memory\n---\n# Local rule\n每回合先读取本机记忆。\n")
+_launcher = os.path.join(_TMP, "fake_launcher.py")
+with open(_launcher, "w", encoding="utf-8", newline="\n") as _f:
+    _f.write(r'''import json, pathlib, sys
+args = sys.argv[1:]
+phase = " ".join(args[:2]) if args[:2] == ["turn", "touch"] or args[:2] == ["recovery", "replay"] else args[0]
+def opt(name):
+    return args[args.index(name) + 1] if name in args else ""
+turn_id = opt("--turn-id") or (args[2] if phase == "turn touch" else "")
+request_file = pathlib.Path(opt("--request-file")) if opt("--request-file") else None
+if request_file:
+    req = json.loads(request_file.read_text(encoding="utf-8"))
+    marker = request_file.parent / ("recovery-" + req["turn_id"])
+    request_file.parent.joinpath("launcher.log").open("a", encoding="utf-8").write(json.dumps({"phase": phase, "turn_id": turn_id, "cwd": opt("--cwd")}, ensure_ascii=False) + "\n")
+else:
+    req = {}
+if phase == "before":
+    print(json.dumps({"status": "degraded", "context": "来自 launcher 的记忆上下文"}, ensure_ascii=False))
+elif phase == "after":
+    print(json.dumps({"status": "error", "message": "模拟 after 失败"}, ensure_ascii=False))
+    sys.exit(7)
+elif phase == "recovery replay":
+    if req.get("request", {}).get("input") == "manual-recover" and not marker.exists():
+        marker.write_text("1", encoding="utf-8")
+        print(json.dumps({"status": "error", "message": "第一次恢复失败"}, ensure_ascii=False))
+        sys.exit(8)
+    print(json.dumps({"status": "spooled"}, ensure_ascii=False))
+else:
+    print(json.dumps({"status": "ok"}, ensure_ascii=False))
+''')
+_old_runtime = {
+    "dir": config.AGENT_SKILL_DIR, "launcher": config.AGENT_SKILL_LAUNCHER,
+    "cwd": config.AGENT_SKILL_CWD, "runtime_dir": config.AGENT_SKILL_RUNTIME_DIR,
+    "touch": config.AGENT_SKILL_TOUCH_SECONDS, "timeout": config.AGENT_SKILL_COMMAND_TIMEOUT,
+}
+config.AGENT_SKILL_DIR = _skill_root
+config.AGENT_SKILL_LAUNCHER = [sys.executable, _launcher]
+config.AGENT_SKILL_CWD = os.path.dirname(os.path.abspath(__file__))
+config.AGENT_SKILL_RUNTIME_DIR = os.path.join(_TMP, "skill-turns")
+config.AGENT_SKILL_TOUCH_SECONDS = 0.05
+config.AGENT_SKILL_COMMAND_TIMEOUT = 5
+_seen_runtime = {}
+def _runtime_agent(messages, tools, **kw):
+    _seen_runtime["messages"] = messages
+    time.sleep(0.14)  # 让后台心跳至少触发一次
+    return _msg("本地运行时已确认。")
+llm.agent_chat = _runtime_agent
+_runtime_result = c.post("/api/agent", json={"text": "测试本机 Skill", "chapter_id": cid}, headers=H(tokA)).json()
+_runtime_meta = _runtime_result.get("skill_runtime") or {}
+ok(_runtime_meta.get("state") == "spooled" and _runtime_meta.get("recovered") is True, "launcher 识别 after 命令错误并自动 recovery replay")
+_runtime_prompt = "\n".join(m.get("content", "") for m in _seen_runtime["messages"] if m.get("role") == "system")
+ok("每回合先读取本机记忆" in _runtime_prompt and "来自 launcher 的记忆上下文" in _runtime_prompt, "每回合读取本机 meta-memory/SKILL.md 和 before 上下文")
+_turn_dir = os.path.join(config.AGENT_SKILL_RUNTIME_DIR, _runtime_meta["turn_id"])
+with open(os.path.join(_turn_dir, "request.json"), encoding="utf-8") as _f:
+    _runtime_request = json.load(_f)
+with open(os.path.join(_turn_dir, "answer.json"), encoding="utf-8") as _f:
+    _runtime_answer = json.load(_f)
+with open(os.path.join(_turn_dir, "manifest.json"), encoding="utf-8") as _f:
+    _runtime_manifest = json.load(_f)
+ok(_runtime_request["turn_id"] == _runtime_meta["turn_id"] and _runtime_answer["state"] == "model_complete", "每回合创建独立 UTF-8 请求和回答文件")
+ok(_runtime_manifest["confirmed"] is True and any(e["phase"] == "touch" and e["state"] == "ok" for e in _runtime_manifest["events"]), "长任务执行 turn touch，识别 ok/degraded/spooled")
+ok(not any("每回合先读取本机记忆" in (m.get("content") or "") for m in _runtime_result["messages"]), "本机 Skill 规则不写入对话历史")
+
+# 并发 turn 不共享临时目录或 turn_id；未确认回答保留后可再次 recovery replay。
+def _new_turn(n):
+    return main.skill_runtime.start_turn({"user_id": uidA, "chapter_id": cid, "input": f"parallel-{n}"})
+with ThreadPoolExecutor(max_workers=2) as _pool:
+    _parallel_turns = list(_pool.map(_new_turn, (1, 2)))
+ok(_parallel_turns[0].turn_id != _parallel_turns[1].turn_id and _parallel_turns[0].dir != _parallel_turns[1].dir, "并发回合隔离 turn_id 和临时文件")
+for _turn in _parallel_turns:
+    _turn.complete({"reply": "并发回答"})
+_manual_failed = c.post("/api/agent", json={"text": "manual-recover", "chapter_id": cid}, headers=H(tokA))
+_manual_detail = _manual_failed.json().get("detail") or {}
+_manual_turn_id = _manual_detail.get("turn_id")
+ok(_manual_failed.status_code == 502 and _manual_turn_id and os.path.exists(os.path.join(config.AGENT_SKILL_RUNTIME_DIR, _manual_turn_id, "answer.json")), "未确认时回答文件保留，不会删除")
+_replayed = c.post(f"/api/agent/runtime/recover/{_manual_turn_id}", headers=H(tokA)).json()
+ok(_replayed["reply"] == "本地运行时已确认。" and _replayed["skill_runtime"]["state"] == "spooled", "中断后可用 recovery replay 重放")
+llm.agent_chat = _orig_ac
+for _key, _value in _old_runtime.items():
+    setattr(config, "AGENT_SKILL_" + {"dir": "DIR", "launcher": "LAUNCHER", "cwd": "CWD", "runtime_dir": "RUNTIME_DIR", "touch": "TOUCH_SECONDS", "timeout": "COMMAND_TIMEOUT"}[_key], _value)
 
 # _compact_split 纯函数：保留最近 N、切在 user 边界、不切断工具对
 _m = [
@@ -405,6 +581,12 @@ ok(c.delete(f"/api/works/{wid}", headers=H(tokA)).status_code == 200, "删作品
 with db.get_conn() as conn:
     _nent = conn.execute("SELECT COUNT(*) FROM entities WHERE work_id=?", (wid,)).fetchone()[0]
 ok(_nent == 0, "删作品级联清空实体")
+with db.get_conn() as conn:
+    _nskill = conn.execute("SELECT COUNT(*) FROM agent_skills WHERE work_id=?", (wid,)).fetchone()[0]
+ok(_nskill == 0, "删作品级联清空作品 Skill")
+with db.get_conn() as conn:
+    _nres = conn.execute("SELECT COUNT(*) FROM agent_skill_resources WHERE skill_id=?", (skill_pkg["id"],)).fetchone()[0]
+ok(_nres == 0, "删作品级联清空 Skill 资料")
 # 同样应级联清掉该作品各章节的 agent 对话（cid 上留有一条压缩后的对话）
 ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 

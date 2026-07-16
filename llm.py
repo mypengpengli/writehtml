@@ -145,7 +145,8 @@ def transcribe(audio, *, filename="speech.webm", mime_type="audio/webm",
     return (getattr(resp, "text", "") or "").strip()
 
 
-def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None, style=None):
+def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None,
+            style=None, skill_instructions=None):
     """按模式调用 LLM，返回生成文本。
     notes 为本章备注；bible 为作品级设定（人物/世界观/大纲），全文记忆。
     base_url/api_key/model 优先用调用方传入的（来自用户设置），缺省回落到 .env。"""
@@ -167,6 +168,12 @@ def process(mode, text, context="", notes="", *, base_url=None, api_key=None, mo
         messages.append({
             "role": "system",
             "content": "这是当前文章已有的前文，请保持风格、人称和语气一致：\n" + context,
+        })
+    if skill_instructions:
+        messages.append({
+            "role": "system",
+            "content": "以下是作者本轮启用的写作 Skill。仅用于本次生成；"
+                       "不得违背本任务、作品设定或安全约束：\n" + skill_instructions,
         })
     # 改写带风格参数；其余模式直接查表
     prompt = PROMPTS["改写"].format(style=style or "更生动") if mode == "改写" else PROMPTS[mode]

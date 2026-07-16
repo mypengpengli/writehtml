@@ -70,6 +70,7 @@
             <button data-ic="trash" data-label="回收站" onclick="openTrash();closeMoreMenu()"></button>
             <button data-ic="users" data-label="人物/设定" onclick="openWiki();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI 工具" onclick="openAITools();closeMoreMenu()"></button>
+            <button data-ic="sparkles" data-label="AI Skills" onclick="openSkills();closeMoreMenu()"></button>
             <button id="adminBtn" class="hidden" data-ic="shield" data-label="后台管理" onclick="openAdmin();closeMoreMenu()"></button>
             <button data-ic="settings" data-label="大模型设置" onclick="openSettings();closeMoreMenu()"></button>
             <button data-ic="logout" data-label="退出" onclick="doLogout();closeMoreMenu()"></button>
@@ -119,6 +120,7 @@
       <div class="ai-head">
         <span data-ic="bot" data-label="AI 助手"></span>
         <span class="ai-head-tools">
+          <button class="ic" data-ic="sparkles" onclick="openSkillPicker()" title="选择本轮 AI Skill"></button>
           <button class="ic" id="aiTtsBtn" data-ic="mute" onclick="toggleAiTts()" title="自动朗读"></button>
           <button class="ic" data-ic="trash" onclick="clearAgent()" title="清空对话"></button>
           <button class="ic" data-ic="x" onclick="toggleAISide()" title="收起"></button>
@@ -132,6 +134,7 @@
         </div>
         <div id="agentSelectionText" class="agent-selection-text"></div>
       </div>
+      <div id="agentSkills" class="agent-skills hidden"></div>
       <div class="chat-input-row">
         <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
@@ -202,6 +205,58 @@
             <button id="entInsBtn" onclick="insertEntity()" title="在正文光标处插入 @名">插入到正文</button>
           </div>
           <span id="entMsg" class="msg"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI Skills：可复用的 agent 写作规则，通用或当前作品专用 -->
+  <div id="skillsOverlay" class="overlay hidden">
+    <div class="overlay-card chat-card">
+      <div class="overlay-head">
+        <span>AI Skills</span>
+        <span class="overlay-head-actions">
+          <button class="ic" data-ic="upload" onclick="chooseSkillImport()" title="导入 SKILL.md 或 Skill ZIP 包"></button>
+          <button class="ic" data-ic="x" onclick="closeSkills()"></button>
+        </span>
+      </div>
+      <div class="set-form">
+        <p class="set-hint">支持标准 `SKILL.md` 或包含它的 ZIP 包。Agent 先按说明识别匹配的 Skill，再按需加载完整规则和 references 文本。</p>
+        <input id="skillImportInput" class="hidden" type="file" accept=".md,.zip,text/markdown,application/zip" onchange="importSkillFile()">
+        <div id="skillList" class="skill-list"></div>
+        <hr class="sep">
+        <div class="skill-edit">
+          <input id="skillName" maxlength="64" placeholder="Skill 名称，例如：悬疑节奏润色">
+          <select id="skillScope" class="ic"><option value="work">当前作品专用</option><option value="global">所有作品可用</option></select>
+          <input id="skillDescription" maxlength="1024" placeholder="说明 AI 何时应调用这个 Skill（可选）">
+          <textarea id="skillInstruction" rows="7" maxlength="8000" placeholder="写清楚 AI 应遵循的规则，例如：保持第三人称限知；每段结尾留一个未解信息；避免华丽比喻。"></textarea>
+          <label class="set-row"><input id="skillEnabled" type="checkbox" checked> 启用（允许 AI 按需调用）</label>
+          <div class="set-actions">
+            <button id="skillSaveBtn" onclick="saveSkill()">新增 Skill</button>
+            <button class="ic" id="skillCancelBtn" onclick="resetSkillForm()" title="取消编辑">取消</button>
+          </div>
+          <span id="skillMsg" class="msg"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI 侧栏的本轮 Skill 选择器 -->
+  <div id="skillPickerOverlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-head">
+        <span>本轮 AI Skills</span>
+        <span class="overlay-head-actions">
+          <button class="ic" data-ic="settings" onclick="closeSkillPicker();openSkills()" title="管理 Skills"></button>
+          <button class="ic" data-ic="x" onclick="closeSkillPicker()"></button>
+        </span>
+      </div>
+      <div class="set-form">
+        <p class="set-hint">最多选择 4 个。它们只影响下一次发送，不会永久改变 Agent。</p>
+        <div id="skillPickerList" class="skill-picker-list"></div>
+        <div class="set-actions">
+          <button class="ic" onclick="clearActiveSkills()">清除选择</button>
+          <button onclick="closeSkillPicker()">完成</button>
         </div>
       </div>
     </div>

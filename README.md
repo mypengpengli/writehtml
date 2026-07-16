@@ -9,8 +9,9 @@
 - **可视化 Diff**：历史版本里点「对比」，把某版本与当前正文逐行比对，红删绿增，一眼看清改了什么。
 - **回收站**：删章节是软删（移到回收站），🗑回收 里可恢复或彻底清空，找回不丢稿。
 - **实体卡片 Wiki**：👥实体 里建人物 / 地点 / 物品 / 组织 / 概念卡片（名 / 一句话摘要 / 详细设定）；「插入到正文」在光标处插入 `@名`；阅读视图里 `@名` 可悬浮点开看卡片。这些实体还会自动拼进 AI 的设定（bible），保证全文人设/地名一致。
+- **AI Skills**：在「⋯」→「AI Skills」中创建可复用的写作规则，或导入标准 `SKILL.md` / ZIP Skill 包（支持按需读取 `references/` 文本）。可设为所有作品通用或当前作品专用；Agent 会先看到元数据，任务匹配时再加载完整 Skill。规则会同时传给文字、选区和直发语音请求，也会传给 Agent 后续的续写/改写工具，但不会存入聊天历史。
 - **找回**：从历史版本把旧草稿找回成正文。
-- **AI 助手（agent）**：🤖 常驻右侧侧栏，用自然语言让 AI 直接动手——改某段文字、续写、回退到历史版本、改标题/备注、加章、摘要、设定校验。每个写操作前自动存版本快照，对话里每步带「撤销」按钮，错了秒回。支持**语音指令**（🎤 录音转写后发送）与**自动朗读**（🔊 把 AI 的回复与操作念给你听）；「说完是否自动发送」在设置里开关，默认自动发。
+- **AI 助手（agent）**：🤖 常驻右侧侧栏，用自然语言让 AI 直接动手——改某段文字、续写、回退到历史版本、改标题/备注、加章、摘要、设定校验。每个写操作前自动存版本快照，对话里每步带「撤销」按钮，错了秒回。支持**语音指令**（🎤 默认直发模型，关闭直发后才转写）与**自动朗读**（🔊 把 AI 的回复与操作念给你听）。
 - **AI 工具**：✦AI 做一致性校验（只列问题不改字）、生成本章摘要（填进备注当后续上下文）。
 - **作品设定（bible）**：人物表 / 世界观 / 大纲，本作品下所有 AI 都会读到。
 - **撤销 / 查找替换 / 拆分章节 / 存版 / 导出（txt、docx）/ 专注模式 / 阅读视图（夜间适配、朗读）**。
@@ -45,6 +46,41 @@ cd /opt/1panel/docker/compose/writehtml && bash deploy.sh
 
 数据（`writehtml.db`）在 `./data/` 卷里，容器重建不丢稿；删这个目录才会丢。
 
+### 本机 meta-memory launcher（可选）
+
+这是**服务端**能力，不是让网页用户执行服务器命令。只有同时配置了本机 Skill 目录和安装器生成的 launcher 后才启用；未配置时，原有 Agent 行为不变。
+
+目录必须包含：
+
+```text
+<skill-dir>/meta-memory/SKILL.md
+```
+
+每个 Agent 回合都会重新读取这个文件，并将其作为仅本轮有效的系统规则。服务会以固定身份 `writehtml-writing-agent-v1`（可用环境变量改名）执行 launcher，工作目录为项目目录，同时显式传入 `--cwd`。launcher 协议为：
+
+```text
+launcher before --agent-id ... --turn-id ... --request-file ... --answer-file ... --cwd ...
+launcher turn touch <turn-id> --agent-id ... --cwd ...
+launcher after --agent-id ... --turn-id ... --request-file ... --answer-file ... --cwd ...
+launcher recovery replay --agent-id ... --turn-id ... --request-file ... --answer-file ... --cwd ...
+```
+
+`stdout` 最后一条 JSON 应返回 `{"status":"ok"}`、`degraded` 或 `spooled`；非零退出码、未知状态和超时会被识别为命令错误。每轮在 `AGENT_SKILL_RUNTIME_DIR/<turn_id>/` 保留 UTF-8 的 `request.json`、`answer.json` 和 `manifest.json`。模型回答先写入 `answer.json`，只有 `after` 或 `recovery replay` 确认后才返回浏览器；确认前文件不会删除。自动重放仍失败时，可带原 id 调用 `POST /api/agent/runtime/recover/<turn_id>`，不会再次调用模型。
+
+Docker 部署时把安装器产物和 Skill 目录挂进容器，再在 `docker-compose.yml` 的 `environment` 取消相应配置注释：
+
+```yaml
+environment:
+  - AGENT_SKILL_DIR=/opt/meta-skills
+  - AGENT_SKILL_LAUNCHER=/opt/meta-runtime/launcher
+  - AGENT_SKILL_CWD=/app
+volumes:
+  - /opt/meta-skills:/opt/meta-skills:ro
+  - /opt/meta-runtime:/opt/meta-runtime:ro
+```
+
+运行时请求和回答会包含作品指令和 Agent 回复，应只挂载到受控的服务器目录并定期按你的审计策略清理。
+
 ### 不用 Docker 也行
 
 ```bash
@@ -78,9 +114,9 @@ caddy reverse-proxy --from your.domain --to localhost:9123
 
 1. 浏览器打开网址 → 注册账号（或登录）。
 2. 「⋯」里的 ⚙ 填好自己的 OpenAI 兼容接口（base_url / api_key / 模型ID）。默认勾选「直接发送语音给 AI」；只有关闭它时才需要配置转写 Base URL、Key 和模型。
-3. 「＋作品」「＋章」建好目标；可顺手在「⋯」👥实体 建人物/地点卡片、在作品设定写大纲。
+3. 「＋作品」「＋章」建好目标；可顺手在「⋯」👥实体 建人物/地点卡片、在作品设定写大纲。常用文风或审稿要求可在「⋯」→「AI Skills」存成模板。
 4. 直接手写正文，或打开右侧 🤖 AI 助手。
-5. 用大白话让它干活：「把第三段改紧张点」「续写一段雨景」「退回昨晚那版」「这章摘要一下」。也可以先在正文里选中一段，点「问 AI」，再说「把这段改紧张点」。
+5. 打开右侧 🤖 AI 助手，点标题栏 ✦ 为本轮选择需要的 Skill，再用大白话让它干活：「把第三段改紧张点」「续写一段雨景」「退回昨晚那版」「这章摘要一下」。也可以先在正文里选中一段，点「问 AI」，再说「把这段改紧张点」。
 6. 点 AI 助手输入框旁的 🎤 录音。默认会直接交给 AI 模型处理；关闭直发后才会转写成文字，可设置转写后自动发送或先放入输入框确认。
 7. 每步自动存版本，点「撤销」秒回。想精修切到正文框手改（自动保存）。删章先进回收站，可找回。
 8. 点 📖 进入阅读视图通读，`@名` 悬浮看卡片；「⋯」🕘历史 里可对比版本、找回旧稿。
@@ -88,5 +124,6 @@ caddy reverse-proxy --from your.domain --to localhost:9123
 ## 说明
 
 - **语音直发与转写**：默认直发语音时，当前 AI 模型必须支持音频输入；不支持会明确提示，关闭直发即可改用转写。转写服务要求 `/audio/transcriptions`，可以与文字模型使用不同的 Base URL、Key 和模型；因此文字 AI 可用但转写服务不可用时，两者互不影响。
+- **AI Skills 的执行边界**：网页导入的 `SKILL.md` / ZIP 只作为文本规则和文本资料，包内脚本永不执行。只有服务管理员通过环境变量配置的本机 `meta-memory` launcher 才能执行 CLI；Agent 可执行的作品动作仍受内置工具和账号权限限制。
 - API key 只存在服务器数据库里（按用户隔离，前端只调自家后端，不暴露 key）。
 - 数据库为 `./data/writehtml.db`，定期备份即可。

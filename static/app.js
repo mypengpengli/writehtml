@@ -28,6 +28,10 @@ let agentMsgs = [];
 let agentBusy = false;
 let agentUndone = new Set();
 let agentSelection = null;
+let agentSkills = [];
+let agentSkillsWorkId = undefined;
+let activeAgentSkillIds = new Set();
+let currentUsername = "";
 
 /* ---------- 图标（内联 SVG，Lucide 风格 24×24 描边） ---------- */
 const _W = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
@@ -64,6 +68,7 @@ const ICONS = {
   plus:     `<svg ${_W}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
   enter:    `<svg ${_W}><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>`,
   download: `<svg ${_W}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+  upload:   `<svg ${_W}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`,
   feather:  `<svg ${_W}><path d="M20.2 12.2a6 6 0 0 0-8.5-8.5L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/></svg>`,
   type:     `<svg ${_W}><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><path d="M12 4v16"/></svg>`,
   grip:     `<svg ${_W}><circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none"/></svg>`,
@@ -146,7 +151,12 @@ async function responseError(res) {
   let msg = raw || res.statusText || "请求失败";
   try {
     const data = JSON.parse(raw);
-    msg = data.detail || data.message || msg;
+    if (data.detail && typeof data.detail === "object") {
+      msg = data.detail.message || msg;
+      if (data.detail.turn_id) msg += `（恢复编号：${data.detail.turn_id}）`;
+    } else {
+      msg = data.detail || data.message || msg;
+    }
   } catch (e) {}
   msg = String(msg).replace(/\s+/g, " ");
   return msg.length > 260 ? msg.slice(0, 260) + "…" : msg;
@@ -204,6 +214,10 @@ async function doLogout() {
 async function init() {
   showApp();
   const me = await api("/api/me", { method: "GET" });
+  if (currentUsername && currentUsername !== me.username) {
+    agentSkills = []; agentSkillsWorkId = undefined; activeAgentSkillIds = new Set();
+  }
+  currentUsername = me.username || "";
   $("meName").textContent = me.username ? `${me.username} · 目录` : "目录";
   if (me.is_admin) $("adminBtn").classList.remove("hidden");
   await loadWorks();
@@ -254,7 +268,11 @@ async function selectWork(wid) {
 }
 
 async function loadChapters() {
-  if (!currentWorkId) { chapters = []; renderTree(); updateWC(); return; }
+  if (!currentWorkId) {
+    chapters = []; renderTree(); updateWC();
+    await loadAgentSkills();
+    return;
+  }
   chapters = await api(`/api/works/${currentWorkId}/chapters`, { method: "GET" });
   if (!chapters.find(c => c.id === currentChapterId)) {
     currentChapterId = chapters.length ? chapters[chapters.length - 1].id : null;
@@ -262,6 +280,7 @@ async function loadChapters() {
   if (currentChapterId) await loadChapter();
   else { $("content").value = ""; $("chapTitle").value = ""; $("notes").value = ""; }
   renderTree(); updateWC();
+  await loadAgentSkills();
 }
 
 async function selectChapter(cid) {
@@ -839,12 +858,205 @@ async function aiSynopsis() {
   finally { busy($("aiSynBtn"), false); }
 }
 
+/* ---------- AI Skills（可复用的 Agent 写作规则） ---------- */
+
+function agentSkillStorageKey() { return `agentSkillIds:${currentUsername || "anonymous"}:${currentWorkId || "global"}`; }
+function restoreActiveSkills() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(agentSkillStorageKey()) || "[]");
+    activeAgentSkillIds = new Set(Array.isArray(saved) ? saved.filter(Number.isInteger) : []);
+  } catch (e) { activeAgentSkillIds = new Set(); }
+}
+function persistActiveSkills() {
+  localStorage.setItem(agentSkillStorageKey(), JSON.stringify([...activeAgentSkillIds]));
+}
+function enabledSkills() { return agentSkills.filter(s => Number(s.enabled)); }
+function selectedSkills() {
+  const active = activeAgentSkillIds;
+  return enabledSkills().filter(s => active.has(s.id));
+}
+async function loadAgentSkills() {
+  const changedWork = agentSkillsWorkId !== currentWorkId;
+  try {
+    const q = currentWorkId ? `?work_id=${encodeURIComponent(currentWorkId)}` : "";
+    agentSkills = await api(`/api/agent/skills${q}`, { method: "GET" });
+    agentSkillsWorkId = currentWorkId;
+    if (changedWork) restoreActiveSkills();
+    const allowed = new Set(enabledSkills().map(s => s.id));
+    activeAgentSkillIds = new Set([...activeAgentSkillIds].filter(id => allowed.has(id)));
+    persistActiveSkills();
+  } catch (e) {
+    agentSkills = [];
+    if (changedWork) activeAgentSkillIds = new Set();
+  }
+  renderAgentSkills();
+  if (!$("skillPickerOverlay").classList.contains("hidden")) renderSkillPickerList();
+  if (!$("skillsOverlay").classList.contains("hidden")) renderSkillList();
+}
+function renderAgentSkills() {
+  const host = $("agentSkills");
+  const skills = selectedSkills();
+  if (!skills.length) { host.innerHTML = ""; host.classList.add("hidden"); return; }
+  host.innerHTML = skills.map(s => `
+    <button class="agent-skill-chip" onclick="removeActiveSkill(${s.id})" title="取消本轮 Skill：${esc(s.name)}">
+      ${svg("sparkles")}<span>${esc(s.name)}</span>${svg("x")}
+    </button>`).join("");
+  host.classList.remove("hidden");
+}
+function toggleActiveSkill(skillId) {
+  if (activeAgentSkillIds.has(skillId)) activeAgentSkillIds.delete(skillId);
+  else {
+    if (activeAgentSkillIds.size >= 4) { showToast("一次最多选择 4 个 Skill", "err"); return; }
+    activeAgentSkillIds.add(skillId);
+  }
+  persistActiveSkills();
+  renderAgentSkills();
+  renderSkillPickerList();
+}
+function removeActiveSkill(skillId) {
+  activeAgentSkillIds.delete(skillId);
+  persistActiveSkills();
+  renderAgentSkills();
+  if (!$("skillPickerOverlay").classList.contains("hidden")) renderSkillPickerList();
+}
+function clearActiveSkills() {
+  activeAgentSkillIds.clear();
+  persistActiveSkills();
+  renderAgentSkills();
+  renderSkillPickerList();
+}
+async function openSkillPicker() {
+  await loadAgentSkills();
+  renderSkillPickerList();
+  $("skillPickerOverlay").classList.remove("hidden");
+}
+function closeSkillPicker() { $("skillPickerOverlay").classList.add("hidden"); }
+function renderSkillPickerList() {
+  const host = $("skillPickerList");
+  const skills = enabledSkills();
+  host.innerHTML = skills.length ? skills.map(s => `
+    <label class="skill-pick-row">
+      <input type="checkbox" ${activeAgentSkillIds.has(s.id) ? "checked" : ""} onchange="toggleActiveSkill(${s.id})">
+      <span class="skill-pick-copy"><b>${esc(s.name)}</b>${s.description ? `<small>${esc(s.description)}</small>` : ""}</span>
+      <span class="skill-pick-tags"><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "skill_md" ? '<span class="skill-source">MD</span>' : ""}</span>
+    </label>`).join("") : '<div class="empty">还没有可用的 Skill。点右上角设置图标新建。</div>';
+}
+
+let editingSkillId = null;
+async function openSkills() {
+  await loadAgentSkills();
+  renderSkillList();
+  resetSkillForm();
+  $("skillsOverlay").classList.remove("hidden");
+}
+function closeSkills() { $("skillsOverlay").classList.add("hidden"); }
+function chooseSkillImport() {
+  const input = $("skillImportInput");
+  input.value = "";
+  input.click();
+}
+async function importSkillFile() {
+  const input = $("skillImportInput"), file = input.files?.[0];
+  if (!file) return;
+  const workScope = $("skillScope").value === "work";
+  if (workScope && !currentWorkId) { $("skillMsg").textContent = "当前没有可关联的作品"; return; }
+  if (file.size > 2 * 1024 * 1024) { $("skillMsg").textContent = "Skill 文件不能超过 2MB"; return; }
+  $("skillMsg").textContent = "正在导入…";
+  try {
+    const r = await api("/api/agent/skills/import", { body: {
+      filename: file.name, data: await blobToBase64(file),
+      work_id: workScope ? currentWorkId : null, enabled: $("skillEnabled").checked,
+    } });
+    await loadAgentSkills();
+    renderSkillList();
+    resetSkillForm();
+    const skipped = Array.isArray(r.skipped_files) ? r.skipped_files.length : 0;
+    showToast(skipped ? `已导入 ${r.name}；${skipped} 个脚本或非文本文件未加载` : `已导入 ${r.name}`, "ok");
+  } catch (e) { $("skillMsg").textContent = "导入失败：" + e.message; }
+  finally { input.value = ""; }
+}
+function renderSkillList() {
+  const host = $("skillList");
+  host.innerHTML = agentSkills.length ? agentSkills.map(s => `
+    <div class="skill-row${Number(s.enabled) ? "" : " disabled"}">
+      <div class="skill-row-main">
+        <div class="skill-row-head"><b>${esc(s.name)}</b><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "skill_md" ? '<span class="skill-source">SKILL.md</span>' : ""}${Number(s.resource_count) ? `<span class="skill-source">${Number(s.resource_count)} 资料</span>` : ""}${Number(s.enabled) ? "" : '<span class="skill-off">已停用</span>'}</div>
+        ${s.description ? `<div class="skill-desc">${esc(s.description)}</div>` : ""}
+        <div class="skill-rule">${esc(s.instruction)}</div>
+      </div>
+      <div class="skill-row-actions">
+        <button class="ic" onclick="startEditSkill(${s.id})" title="编辑 Skill">${svg("pen")}</button>
+        <button class="ic" onclick="delSkill(${s.id})" title="删除 Skill">${svg("trash")}</button>
+      </div>
+    </div>`).join("") : '<div class="empty">还没有 Skill。先为常用写作要求建一个模板。</div>';
+}
+function resetSkillForm() {
+  editingSkillId = null;
+  $("skillName").value = "";
+  $("skillDescription").value = "";
+  $("skillInstruction").value = "";
+  $("skillEnabled").checked = true;
+  const scope = $("skillScope");
+  scope.disabled = !currentWorkId;
+  scope.value = currentWorkId ? "work" : "global";
+  $("skillSaveBtn").textContent = "新增 Skill";
+  $("skillCancelBtn").classList.add("hidden");
+  $("skillMsg").textContent = "";
+}
+function startEditSkill(skillId) {
+  const s = agentSkills.find(x => x.id === skillId);
+  if (!s) return;
+  editingSkillId = skillId;
+  $("skillName").value = s.name || "";
+  $("skillDescription").value = s.description || "";
+  $("skillInstruction").value = s.instruction || "";
+  $("skillEnabled").checked = Boolean(Number(s.enabled));
+  const scope = $("skillScope");
+  scope.disabled = !currentWorkId;
+  scope.value = s.work_id == null ? "global" : "work";
+  $("skillSaveBtn").textContent = "保存修改";
+  $("skillCancelBtn").classList.remove("hidden");
+  $("skillMsg").textContent = "";
+  $("skillName").focus();
+}
+async function saveSkill() {
+  const name = $("skillName").value.trim();
+  const instruction = $("skillInstruction").value.trim();
+  if (!name || !instruction) { $("skillMsg").textContent = "请填写名称和规则"; return; }
+  const workScope = $("skillScope").value === "work";
+  if (workScope && !currentWorkId) { $("skillMsg").textContent = "当前没有可关联的作品"; return; }
+  const body = {
+    name, instruction, work_id: workScope ? currentWorkId : null,
+    description: $("skillDescription").value.trim(), enabled: $("skillEnabled").checked,
+  };
+  const btn = $("skillSaveBtn");
+  busy(btn, true, editingSkillId ? "保存" : "新增");
+  try {
+    if (editingSkillId) await api(`/api/agent/skills/${editingSkillId}`, { method: "PUT", body });
+    else await api("/api/agent/skills", { body });
+    await loadAgentSkills();
+    renderSkillList();
+    resetSkillForm();
+  } catch (e) { $("skillMsg").textContent = e.message; }
+  finally { busy(btn, false, editingSkillId ? "保存修改" : "新增 Skill"); }
+}
+async function delSkill(skillId) {
+  if (!await askCard({ title: "删除这个 Skill？", msg: "已删除的规则不能恢复。", okText: "删除", danger: true })) return;
+  try {
+    await api(`/api/agent/skills/${skillId}`, { method: "DELETE" });
+    activeAgentSkillIds.delete(skillId);
+    persistActiveSkills();
+    await loadAgentSkills();
+    if (editingSkillId === skillId) resetSkillForm();
+  } catch (e) { showToast("删除失败：" + e.message, "err"); }
+}
+
 /* ---------- AI 助手（常驻侧栏，对话即操作，自动存版本可撤销） ---------- */
 
 function toggleAISide() {
   const open = $("app").classList.toggle("ai-open");
   localStorage.setItem("aiOpen", open ? "1" : "0");
-  if (open) setTimeout(() => { setAiTtsBtn(); renderAgent(); renderAgentSelection(); $("agentInput").focus(); }, 50);
+  if (open) setTimeout(() => { setAiTtsBtn(); renderAgent(); renderAgentSelection(); renderAgentSkills(); $("agentInput").focus(); }, 50);
   else if ("speechSynthesis" in window) speechSynthesis.cancel(); // 收起侧栏时停止朗读
 }
 function renderAgent() {
@@ -924,6 +1136,7 @@ async function sendAgent() {
   const selection = agentSelection;
   const body = { text, chapter_id: currentChapterId };
   if (selection) body.selection = selection;
+  if (activeAgentSkillIds.size) body.skill_ids = [...activeAgentSkillIds];
   try {
     const r = await api("/api/agent", { body });
     await applyAgentResult(r, selection);
@@ -1063,7 +1276,10 @@ async function sendAgentAudio(blob) {
         "Content-Type": "application/json",
         ...(token ? { Authorization: "Bearer " + token } : {}),
       },
-      body: JSON.stringify({ audio, format: "wav", chapter_id: currentChapterId, selection }),
+      body: JSON.stringify({
+        audio, format: "wav", chapter_id: currentChapterId, selection,
+        ...(activeAgentSkillIds.size ? { skill_ids: [...activeAgentSkillIds] } : {}),
+      }),
     });
     if (res.status === 401) { showLogin(); throw new Error("未登录"); }
     if (!res.ok) throw new Error(await responseError(res));

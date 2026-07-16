@@ -16,6 +16,23 @@ ASR_MODEL = os.getenv("ASR_MODEL", "whisper-1")
 # SQLite 路径（Docker 里挂到数据卷）
 DB_PATH = os.getenv("DB_PATH", "writehtml.db")
 
+# 本机 Skill / launcher 运行时（可选，默认关闭）。
+# 仅服务管理员配置；用户上传的 SKILL.md 不会获得执行服务器命令的权限。
+# AGENT_SKILL_DIR 下必须存在 meta-memory/SKILL.md；每一个 Agent 回合都会重新读取它。
+AGENT_SKILL_DIR = os.getenv("AGENT_SKILL_DIR", "")
+# 安装器生成的 launcher 路径或命令，例如 /opt/meta-memory/bin/launcher。
+AGENT_SKILL_LAUNCHER = os.getenv("AGENT_SKILL_LAUNCHER", "")
+# launcher 的工作目录；为空时使用当前项目目录。执行时同时传入 --cwd。
+AGENT_SKILL_CWD = os.getenv("AGENT_SKILL_CWD", "")
+# 请求、回答和 manifest 的持久化目录。回复经 launcher 确认前绝不删除。
+AGENT_SKILL_RUNTIME_DIR = os.getenv(
+    "AGENT_SKILL_RUNTIME_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "skill-turns")
+)
+# 每种 Agent 固定、唯一的身份。变更此值会形成一个新的 launcher 身份。
+AGENT_SKILL_AGENT_ID = os.getenv("AGENT_SKILL_AGENT_ID", "writehtml-writing-agent-v1")
+AGENT_SKILL_COMMAND_TIMEOUT = float(os.getenv("AGENT_SKILL_COMMAND_TIMEOUT", "30"))
+AGENT_SKILL_TOUCH_SECONDS = float(os.getenv("AGENT_SKILL_TOUCH_SECONDS", "20"))
+
 # 服务端口（选了个基本不用的 9123，可自行改）
 PORT = int(os.getenv("PORT", "9123"))
 

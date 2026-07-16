@@ -4,3 +4,4 @@ openai
 python-dotenv
 python-docx
 httpx
+PyYAML

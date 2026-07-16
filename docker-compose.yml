@@ -21,5 +21,13 @@ services:
       # - ASR_BASE_URL=https://api.openai.com/v1
       # - ASR_API_KEY=sk-xxx
       # - ASR_MODEL=whisper-1
+      # 可选：本机 meta-memory launcher。取消注释前，先将安装器产物挂载到容器（见下方 volumes）。
+      # - AGENT_SKILL_DIR=/opt/meta-skills
+      # - AGENT_SKILL_LAUNCHER=/opt/meta-runtime/launcher
+      # - AGENT_SKILL_CWD=/app
+      # - AGENT_SKILL_RUNTIME_DIR=/data/skill-turns
+      # - AGENT_SKILL_AGENT_ID=writehtml-writing-agent-v1
     volumes:
       - ./data:/data
+      # - /opt/meta-skills:/opt/meta-skills:ro
+      # - /opt/meta-runtime:/opt/meta-runtime:ro

@@ -108,12 +108,37 @@ def init_db():
                 updated_at REAL,
                 UNIQUE(user_id, chapter_id)  -- 一个用户一个章节一行
             );
+            CREATE TABLE IF NOT EXISTS agent_skills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                work_id INTEGER,             -- NULL 表示可用于所有作品
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                instruction TEXT NOT NULL,
+                source_kind TEXT DEFAULT 'manual',
+                source_markdown TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 1,
+                created_at REAL,
+                updated_at REAL,
+                FOREIGN KEY(work_id) REFERENCES works(id)
+            );
+            CREATE TABLE IF NOT EXISTS agent_skill_resources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skill_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL,
+                UNIQUE(skill_id, path),
+                FOREIGN KEY(skill_id) REFERENCES agent_skills(id)
+            );
             CREATE INDEX IF NOT EXISTS idx_works_user ON works(user_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_chapters_work ON chapters(work_id, ord);
             CREATE INDEX IF NOT EXISTS idx_segments_chapter ON segments(chapter_id);
             CREATE INDEX IF NOT EXISTS idx_revisions_chapter ON chapter_revisions(chapter_id);
             CREATE INDEX IF NOT EXISTS idx_entities_work ON entities(work_id);
             CREATE INDEX IF NOT EXISTS idx_conv_user ON agent_conversations(user_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_skills_user_work ON agent_skills(user_id, work_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_skill_resources_skill ON agent_skill_resources(skill_id, path);
             """
         )
         _add_col(conn, "chapters", "notes", "TEXT DEFAULT ''")
@@ -124,6 +149,8 @@ def init_db():
         _add_col(conn, "works", "user_id", "INTEGER DEFAULT 0")
         _add_col(conn, "works", "notes", "TEXT DEFAULT ''")  # 作品设定(人物/世界观/大纲)
         _add_col(conn, "users", "is_admin", "INTEGER DEFAULT 0")  # 后台管理员标记
+        _add_col(conn, "agent_skills", "source_kind", "TEXT DEFAULT 'manual'")
+        _add_col(conn, "agent_skills", "source_markdown", "TEXT DEFAULT ''")
         _bootstrap_admin(conn)
 
 
@@ -318,6 +345,8 @@ def admin_delete_user(user_id):
         # 章节以上的作品级数据 + 该用户的无章节对话 + 设置 + 账号本身
         conn.execute("DELETE FROM chapters WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM agent_skills WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM works WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM agent_conversations WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM user_settings WHERE user_id=?", (user_id,))
@@ -440,6 +469,8 @@ def delete_work(wid, user_id):
             conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE work_id=?)", (wid,))
+        conn.execute("DELETE FROM agent_skills WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM works WHERE id=?", (wid,))
         return True
 
@@ -549,6 +580,138 @@ def get_entity_digest(wid, user_id):
     return "作品实体（写作时保持一致）：\n" + "\n".join(
         f"[{r['kind']}] {r['name']}" + (f"：{r['summary']}" if r['summary'] else "") for r in rows
     )
+
+
+# ---------- AI Skills（用户可复用的 agent 指令模板）----------
+
+def list_agent_skills(user_id, work_id=None):
+    """取用户可见的 Skill：通用 Skill 加当前作品专用 Skill。"""
+    with get_conn() as conn:
+        if work_id is not None and not _work_owned(conn, work_id, user_id):
+            return None
+        if work_id is None:
+            rows = conn.execute(
+                "SELECT s.id, s.user_id, s.work_id, s.name, s.description, s.instruction, s.source_kind, s.enabled, s.created_at, s.updated_at, "
+                "(SELECT COUNT(*) FROM agent_skill_resources r WHERE r.skill_id=s.id) AS resource_count "
+                "FROM agent_skills s WHERE s.user_id=? AND s.work_id IS NULL ORDER BY s.updated_at DESC, s.id DESC",
+                (user_id,),
+            )
+        else:
+            rows = conn.execute(
+                "SELECT s.id, s.user_id, s.work_id, s.name, s.description, s.instruction, s.source_kind, s.enabled, s.created_at, s.updated_at, "
+                "(SELECT COUNT(*) FROM agent_skill_resources r WHERE r.skill_id=s.id) AS resource_count "
+                "FROM agent_skills s WHERE s.user_id=? AND (s.work_id IS NULL OR s.work_id=?) "
+                "ORDER BY CASE WHEN s.work_id IS NULL THEN 0 ELSE 1 END, s.updated_at DESC, s.id DESC",
+                (user_id, work_id),
+            )
+        return [dict(r) for r in rows]
+
+
+def create_agent_skill(user_id, work_id, name, description, instruction, enabled=True,
+                       source_kind="manual", source_markdown="", resources=None):
+    now = time.time()
+    with get_conn() as conn:
+        if work_id is not None and not _work_owned(conn, work_id, user_id):
+            return None
+        cur = conn.execute(
+            "INSERT INTO agent_skills(user_id,work_id,name,description,instruction,source_kind,source_markdown,enabled,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (user_id, work_id, name, description or "", instruction, source_kind, source_markdown or "",
+             int(bool(enabled)), now, now),
+        )
+        for resource in resources or []:
+            conn.execute(
+                "INSERT INTO agent_skill_resources(skill_id,path,content,created_at) VALUES(?,?,?,?)",
+                (cur.lastrowid, resource["path"], resource["content"], now),
+            )
+        return {
+            "id": cur.lastrowid, "user_id": user_id, "work_id": work_id, "name": name,
+            "description": description or "", "instruction": instruction, "source_kind": source_kind,
+            "resource_count": len(resources or []), "enabled": int(bool(enabled)), "created_at": now, "updated_at": now,
+        }
+
+
+def _agent_skill_owned(conn, skill_id, user_id):
+    return conn.execute(
+        "SELECT 1 FROM agent_skills WHERE id=? AND user_id=?", (skill_id, user_id)
+    ).fetchone() is not None
+
+
+def update_agent_skill(skill_id, user_id, work_id, name, description, instruction, enabled):
+    now = time.time()
+    with get_conn() as conn:
+        if not _agent_skill_owned(conn, skill_id, user_id):
+            return False
+        if work_id is not None and not _work_owned(conn, work_id, user_id):
+            return False
+        conn.execute(
+            "UPDATE agent_skills SET work_id=?, name=?, description=?, instruction=?, enabled=?, updated_at=? WHERE id=?",
+            (work_id, name, description or "", instruction, int(bool(enabled)), now, skill_id),
+        )
+        return True
+
+
+def delete_agent_skill(skill_id, user_id):
+    with get_conn() as conn:
+        if not _agent_skill_owned(conn, skill_id, user_id):
+            return False
+        conn.execute("DELETE FROM agent_skill_resources WHERE skill_id=?", (skill_id,))
+        conn.execute("DELETE FROM agent_skills WHERE id=?", (skill_id,))
+        return True
+
+
+def get_agent_skills_for_turn(user_id, work_id, skill_ids):
+    """为一次 Agent 请求取已启用且作用域合法的 Skill，保持调用方的选中顺序。"""
+    if not skill_ids:
+        return []
+    ids = list(dict.fromkeys(skill_ids))
+    placeholders = ",".join("?" for _ in ids)
+    with get_conn() as conn:
+        if work_id is None:
+            rows = conn.execute(
+                f"SELECT id, name, description, instruction FROM agent_skills "
+                f"WHERE user_id=? AND enabled=1 AND work_id IS NULL AND id IN ({placeholders})",
+                (user_id, *ids),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT id, name, description, instruction FROM agent_skills "
+                f"WHERE user_id=? AND enabled=1 AND (work_id IS NULL OR work_id=?) AND id IN ({placeholders})",
+                (user_id, work_id, *ids),
+            ).fetchall()
+    by_id = {r["id"]: dict(r) for r in rows}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def list_agent_skill_catalog(user_id, work_id, limit=30):
+    """提供给 Agent 的轻量 Skill 目录，只含元数据，不提前塞入完整规则。"""
+    with get_conn() as conn:
+        if work_id is None:
+            rows = conn.execute(
+                "SELECT id, name, description, source_kind FROM agent_skills "
+                "WHERE user_id=? AND enabled=1 AND work_id IS NULL "
+                "ORDER BY updated_at DESC, id DESC LIMIT ?",
+                (user_id, limit),
+            )
+        else:
+            rows = conn.execute(
+                "SELECT id, name, description, source_kind FROM agent_skills "
+                "WHERE user_id=? AND enabled=1 AND (work_id IS NULL OR work_id=?) "
+                "ORDER BY CASE WHEN work_id IS NULL THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT ?",
+                (user_id, work_id, limit),
+            )
+        return [dict(r) for r in rows]
+
+
+def get_agent_skill_resource(user_id, skill_id, path):
+    with get_conn() as conn:
+        if not _agent_skill_owned(conn, skill_id, user_id):
+            return None
+        r = conn.execute(
+            "SELECT path, content FROM agent_skill_resources WHERE skill_id=? AND path=?",
+            (skill_id, path),
+        ).fetchone()
+        return dict(r) if r else None
 
 
 # ---------- 章节 ----------

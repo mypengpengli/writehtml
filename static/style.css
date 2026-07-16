@@ -278,6 +278,7 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .overlay { position: fixed; inset: 0; z-index: 50; background: var(--scrim); display: flex; align-items: center; justify-content: center; padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); }
 .overlay-card { background: var(--panel); border-radius: var(--r-lg); width: 100%; max-width: 460px; max-height: 80vh; display: flex; flex-direction: column; box-shadow: var(--shadow); }
 .overlay-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 600; }
+.overlay-head-actions { display: inline-flex; align-items: center; gap: 4px; }
 .rev-list { overflow-y: auto; padding: 6px; }
 .rev { display: flex; align-items: center; justify-content: space-between; padding: 9px 10px; border-bottom: 1px solid var(--line); font-size: 14px; }
 
@@ -340,11 +341,46 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
   margin-top: 4px; color: var(--muted); font-size: 13px; line-height: 1.5;
   max-height: 4.5em; overflow: hidden; white-space: pre-wrap; word-break: break-word;
 }
+.agent-skills { display: flex; gap: 6px; margin: 8px 10px 0; overflow-x: auto; padding-bottom: 1px; }
+.agent-skill-chip {
+  display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; min-height: 30px;
+  padding: 4px 7px; border-color: var(--accent); background: var(--success-bg); color: var(--accent-text);
+  font-size: 13px; line-height: 1.2;
+}
+.agent-skill-chip svg { width: 14px; height: 14px; display: block; }
+.agent-skill-chip svg:last-child { color: var(--muted); }
 .set-form .set-row { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; margin-top: 10px; cursor: pointer; }
 .set-form .set-row input { width: auto; }
 .voice-mode-row { color: var(--ink) !important; font-weight: 600; }
 .voice-mode-hint { margin: 2px 0 4px; }
 #asrSettings { display: flex; flex-direction: column; gap: 4px; }
+
+/* AI Skills */
+.skill-list, .skill-picker-list { display: flex; flex-direction: column; max-height: 34vh; overflow-y: auto; border-top: 1px solid var(--line); }
+.skill-row { display: flex; align-items: flex-start; gap: 8px; padding: 10px 2px; border-bottom: 1px solid var(--line); }
+.skill-row.disabled { opacity: .58; }
+.skill-row-main { flex: 1; min-width: 0; }
+.skill-row-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 14px; }
+.skill-row-head b { color: var(--accent-text); }
+.skill-scope, .skill-source, .skill-off { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 1px 5px; color: var(--muted); font-size: 12px; line-height: 1.35; white-space: nowrap; }
+.skill-source { color: var(--accent-text); border-color: var(--accent); }
+.skill-off { color: var(--danger); border-color: var(--danger); }
+.skill-desc { margin-top: 2px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.skill-rule { margin-top: 5px; color: var(--ink); font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 4.5em; overflow: hidden; }
+.skill-row-actions { display: flex; gap: 2px; }
+.skill-row-actions .ic { min-width: 32px; min-height: 32px; padding: 6px; }
+.skill-edit { display: flex; flex-direction: column; gap: 6px; }
+.skill-edit textarea { min-height: 126px; resize: vertical; }
+.skill-pick-row { display: flex; align-items: center; gap: 9px; padding: 10px 2px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.skill-pick-row input { width: auto; flex: 0 0 auto; }
+.skill-pick-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; line-height: 1.35; }
+.skill-pick-copy b { color: var(--accent-text); font-size: 14px; }
+.skill-pick-copy small { margin-top: 2px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-pick-tags { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+@media (max-width: 700px) {
+  .skill-list, .skill-picker-list { max-height: 38vh; }
+  .skill-row-actions .ic { min-width: 40px; min-height: 40px; }
+}
 
 /* micbar 分隔条 */
 .vbar { width: 1px; align-self: stretch; margin: 4px 2px; background: var(--line); }

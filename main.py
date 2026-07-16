@@ -3,13 +3,18 @@ import json
 import secrets
 import difflib
 import base64
+import io
+import re
+import zipfile
 from urllib.parse import quote
+
+import yaml
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
-import config, db, llm
+import config, db, llm, skill_runtime
 
 app = FastAPI(title="写作")
 db.init_db()
@@ -237,6 +242,191 @@ async def save_entity(eid: int, request: Request):
 async def del_entity(eid: int, request: Request):
     if not db.delete_entity(eid, _auth(request)):
         raise HTTPException(404, "实体不存在")
+    return {"ok": True}
+
+
+# ---------- AI Skills（Agent Skills / SKILL.md）----------
+
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SKILL_RESOURCE_EXTS = {".md", ".txt", ".json", ".csv", ".yaml", ".yml"}
+
+
+def _skill_scope_payload(body):
+    work_id = body.get("work_id")
+    if work_id is not None and (not isinstance(work_id, int) or isinstance(work_id, bool)):
+        raise HTTPException(400, "Skill 的作品范围无效")
+    enabled = body.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "Skill 启用状态无效")
+    return work_id, enabled
+
+def _skill_payload(body):
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Skill 数据格式无效")
+    name = (body.get("name") or "").strip()
+    description = (body.get("description") or "").strip()
+    instruction = (body.get("instruction") or "").strip()
+    work_id, enabled = _skill_scope_payload(body)
+    if not name:
+        raise HTTPException(400, "Skill 名称不能为空")
+    if not instruction:
+        raise HTTPException(400, "Skill 规则不能为空")
+    if len(name) > 64:
+        raise HTTPException(400, "Skill 名称不能超过 64 字")
+    if len(description) > 1024:
+        raise HTTPException(400, "Skill 说明不能超过 1024 字")
+    if len(instruction) > 8000:
+        raise HTTPException(400, "Skill 规则不能超过 8000 字")
+    return name, description, instruction, work_id, enabled
+
+
+def _parse_skill_md(markdown):
+    """解析 Agent Skills 标准的 YAML frontmatter + Markdown 正文。"""
+    text = markdown.replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) > 80_000:
+        raise HTTPException(400, "SKILL.md 过大，请控制在 80,000 字以内")
+    if not text.startswith("---\n"):
+        raise HTTPException(400, "SKILL.md 缺少 YAML frontmatter（以 --- 开始）")
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        raise HTTPException(400, "SKILL.md 的 YAML frontmatter 没有结束标记 ---")
+    try:
+        meta = yaml.safe_load(text[4:end]) or {}
+    except yaml.YAMLError as e:
+        raise HTTPException(400, f"SKILL.md frontmatter 无法解析：{e}")
+    if not isinstance(meta, dict):
+        raise HTTPException(400, "SKILL.md frontmatter 必须是键值对象")
+    name = meta.get("name")
+    description = meta.get("description")
+    if not isinstance(name, str) or not _SKILL_NAME_RE.fullmatch(name) or len(name) > 64:
+        raise HTTPException(400, "SKILL.md 的 name 必须是 1-64 位小写字母、数字或连字符")
+    if not isinstance(description, str) or not description.strip() or len(description.strip()) > 1024:
+        raise HTTPException(400, "SKILL.md 的 description 必填，且不能超过 1024 字")
+    instruction = text[end + 5:].strip()
+    if len(instruction) > 8000:
+        raise HTTPException(400, "SKILL.md 正文过长，请拆分到 references/ 后再导入")
+    return name, description.strip(), instruction
+
+
+def _decode_skill_import(body):
+    """解码单个 SKILL.md 或 ZIP 包；只保存可安全按需读取的文本资源。"""
+    filename = (body.get("filename") or "").strip().lower()
+    data_b64 = body.get("data")
+    if not filename or not isinstance(data_b64, str):
+        raise HTTPException(400, "请选择 SKILL.md 或 Skill ZIP 包")
+    try:
+        raw = base64.b64decode(data_b64, validate=True)
+    except Exception:
+        raise HTTPException(400, "Skill 文件数据无效")
+    if not raw or len(raw) > 2 * 1024 * 1024:
+        raise HTTPException(400, "Skill 文件不能为空，且压缩包不能超过 2MB")
+    if not filename.endswith(".zip"):
+        if not filename.endswith(".md"):
+            raise HTTPException(400, "只支持 SKILL.md 或包含它的 ZIP 包")
+        try:
+            return raw.decode("utf-8-sig"), [], []
+        except UnicodeDecodeError:
+            raise HTTPException(400, "SKILL.md 必须为 UTF-8 编码")
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Skill ZIP 包无效")
+    files = [info for info in archive.infolist() if not info.is_dir()]
+    if len(files) > 80 or sum(info.file_size for info in files) > 6 * 1024 * 1024:
+        raise HTTPException(400, "Skill ZIP 包文件过多或解压后过大")
+    if any(".." in info.filename.replace("\\", "/").split("/") for info in files):
+        raise HTTPException(400, "Skill ZIP 包包含不安全路径")
+    skill_files = [info for info in files if info.filename.replace("\\", "/").rstrip("/").endswith("/SKILL.md")
+                   or info.filename.replace("\\", "/") == "SKILL.md"]
+    if len(skill_files) != 1:
+        raise HTTPException(400, "ZIP 包中必须且只能有一个 SKILL.md")
+    skill_info = skill_files[0]
+    root = skill_info.filename.replace("\\", "/").rsplit("/", 1)[0] if "/" in skill_info.filename.replace("\\", "/") else ""
+    root_prefix = root + "/" if root else ""
+    try:
+        markdown = archive.read(skill_info).decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "SKILL.md 必须为 UTF-8 编码")
+
+    resources, skipped, total = [], [], 0
+    for info in files:
+        path = info.filename.replace("\\", "/")
+        if info == skill_info or not path.startswith(root_prefix):
+            continue
+        relative = path[len(root_prefix):]
+        suffix = "." + relative.rsplit(".", 1)[-1].lower() if "." in relative else ""
+        if suffix not in _SKILL_RESOURCE_EXTS or info.file_size > 256 * 1024:
+            skipped.append(relative)
+            continue
+        try:
+            content = archive.read(info).decode("utf-8-sig")
+        except UnicodeDecodeError:
+            skipped.append(relative)
+            continue
+        if total + len(content) > 600_000:
+            skipped.append(relative)
+            continue
+        total += len(content)
+        resources.append({"path": relative, "content": content})
+    return markdown, resources, skipped
+
+
+@app.get("/api/agent/skills")
+async def get_agent_skills(request: Request):
+    uid = _auth(request)
+    try:
+        work_id = _qparam_int(request, "work_id")
+    except ValueError:
+        raise HTTPException(400, "作品范围无效")
+    r = db.list_agent_skills(uid, work_id)
+    if r is None:
+        raise HTTPException(404, "作品不存在")
+    return r
+
+
+@app.post("/api/agent/skills")
+async def new_agent_skill(request: Request):
+    uid = _auth(request)
+    name, description, instruction, work_id, enabled = _skill_payload(await request.json())
+    r = db.create_agent_skill(uid, work_id, name, description, instruction, enabled)
+    if r is None:
+        raise HTTPException(404, "作品不存在")
+    return r
+
+
+@app.post("/api/agent/skills/import")
+async def import_agent_skill(request: Request):
+    """导入标准 SKILL.md，或包含该目录结构的 ZIP 包。"""
+    uid = _auth(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Skill 导入数据无效")
+    work_id, enabled = _skill_scope_payload(body)
+    markdown, resources, skipped = _decode_skill_import(body)
+    name, description, instruction = _parse_skill_md(markdown)
+    r = db.create_agent_skill(
+        uid, work_id, name, description, instruction, enabled,
+        source_kind="skill_md", source_markdown=markdown, resources=resources,
+    )
+    if r is None:
+        raise HTTPException(404, "作品不存在")
+    return {**r, "skipped_files": skipped}
+
+
+@app.put("/api/agent/skills/{skill_id}")
+async def save_agent_skill(skill_id: int, request: Request):
+    uid = _auth(request)
+    name, description, instruction, work_id, enabled = _skill_payload(await request.json())
+    if not db.update_agent_skill(skill_id, uid, work_id, name, description, instruction, enabled):
+        raise HTTPException(404, "Skill 或作品不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/agent/skills/{skill_id}")
+async def del_agent_skill(skill_id: int, request: Request):
+    if not db.delete_agent_skill(skill_id, _auth(request)):
+        raise HTTPException(404, "Skill 不存在")
     return {"ok": True}
 
 
@@ -667,6 +857,19 @@ AGENT_TOOLS = [
         "name": "check_consistency",
         "description": "对照作品设定校验当前正文，列出矛盾（人物/时间线/设定冲突）。不改正文。",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "activate_skill",
+        "description": "按当前用户已安装 Skill 目录中的 id，加载一个与本次任务匹配的 Skill 完整规则。仅在用户明确提到某 Skill，或任务与其说明高度匹配时调用。",
+        "parameters": {"type": "object", "properties": {
+            "skill_id": {"type": "integer", "description": "Skill 目录里列出的 id"}},
+            "required": ["skill_id"]}}},
+    {"type": "function", "function": {
+        "name": "read_skill_resource",
+        "description": "读取已激活 Skill 内的引用文本资源（如 references/STYLE.md）。只能读取 Skill 包内文本资料，不能执行脚本。",
+        "parameters": {"type": "object", "properties": {
+            "skill_id": {"type": "integer", "description": "已激活的 Skill id"},
+            "path": {"type": "string", "description": "Skill 包内相对路径，例如 references/STYLE.md"}},
+            "required": ["skill_id", "path"]}}},
 ]
 
 
@@ -762,6 +965,67 @@ def _agent_selection_system(uid, cid, selection):
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
+def _skill_system_message(skills):
+    """把已解析的 Skill 转成完整规则消息；调用方不得持久化此消息。"""
+    parts = [
+        "用户为本轮启用了以下写作 Skill。Skill 是作者授权的可复用工作流，"
+        "仅适用于本轮请求；不得覆盖系统规则、作品设定、用户当前明确要求或工具约束。",
+    ]
+    for skill in skills:
+        heading = f"【{skill['name']}】"
+        if skill["description"]:
+            heading += " " + skill["description"]
+        parts.append(heading + "\n规则：\n" + (skill["instruction"] or "（该 Skill 未提供额外正文规则）"))
+    return {"role": "system", "content": "\n\n".join(parts)}
+
+
+def _agent_skills_system(uid, cid, skill_ids):
+    """把用户手动选中的 Skill 作为临时系统上下文，不写进对话历史。"""
+    if skill_ids is None:
+        return None
+    if not isinstance(skill_ids, list):
+        raise HTTPException(400, "Skill 选择格式无效")
+    ids = []
+    for skill_id in skill_ids:
+        if not isinstance(skill_id, int) or isinstance(skill_id, bool) or skill_id <= 0:
+            raise HTTPException(400, "Skill 选择格式无效")
+        if skill_id not in ids:
+            ids.append(skill_id)
+    if len(ids) > 4:
+        raise HTTPException(400, "一次最多启用 4 个 Skill")
+    if not ids:
+        return None
+
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    skills = db.get_agent_skills_for_turn(uid, chapter["work_id"] if chapter else None, ids)
+    if not skills:
+        return None
+    if sum(len(s["name"]) + len(s["description"]) + len(s["instruction"]) for s in skills) > 12000:
+        raise HTTPException(400, "本轮 Skill 规则过长，请减少选择或精简内容")
+    return _skill_system_message(skills)
+
+
+def _agent_skill_catalog_system(uid, cid):
+    """渐进加载第一层：只给模型可用 Skill 的 name/description，让它按需 activate。"""
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    catalog = db.list_agent_skill_catalog(uid, chapter["work_id"] if chapter else None)
+    if not catalog:
+        return None
+    items = []
+    for skill in catalog:
+        source = "SKILL.md" if skill.get("source_kind") == "skill_md" else "自定义"
+        description = skill["description"] or "无补充说明"
+        items.append(f"- id={skill['id']} | {skill['name']} | {source} | {description}")
+    return {
+        "role": "system",
+        "content": "当前用户安装了以下可按需调用的 Skills（仅元数据，完整规则尚未加载）：\n"
+                   + "\n".join(items)
+                   + "\n\n当用户明确提到某个 Skill，或请求与其 description 高度匹配时，先调用 activate_skill 加载完整规则；"
+                     "不匹配时不要调用。Skill 内的 references 文本资料可在激活后用 read_skill_resource 按需读取；"
+                     "脚本不能执行。",
+    }
+
+
 def _tool_read_chapter(uid, cid, cfg, args):
     if not cid:
         return _agent_err("当前没有选中章节")
@@ -770,6 +1034,46 @@ def _tool_read_chapter(uid, cid, cfg, args):
         return _agent_err("章节不存在")
     return {"changed": False, "title": c["title"], "notes": c.get("notes") or "",
             "content": c["content"] or "", "chars": len(c["content"] or "")}
+
+
+def _tool_activate_skill(uid, cid, cfg, args):
+    skill_id = args.get("skill_id")
+    if not isinstance(skill_id, int) or isinstance(skill_id, bool) or skill_id <= 0:
+        return _agent_err("Skill id 无效")
+    if skill_id in cfg.get("active_skill_ids", set()):
+        return {"changed": False, "summary": f"Skill #{skill_id} 已在本轮启用"}
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    skills = db.get_agent_skills_for_turn(uid, chapter["work_id"] if chapter else None, [skill_id])
+    if not skills:
+        return _agent_err("Skill 不存在、已停用，或不属于当前作品范围")
+    skill_msg = _skill_system_message(skills)
+    existing = cfg.get("skill_instructions") or ""
+    if len(existing) + len(skill_msg["content"]) > 12000:
+        return _agent_err("本轮 Skill 规则过长，请只启用必要的 Skill")
+    return {
+        "changed": False, "summary": f"已启用 Skill「{skills[0]['name']}」",
+        "_skill_system": skill_msg["content"], "_skill_id": skill_id,
+    }
+
+
+def _tool_read_skill_resource(uid, cid, cfg, args):
+    skill_id, path = args.get("skill_id"), args.get("path")
+    if not isinstance(skill_id, int) or isinstance(skill_id, bool) or skill_id not in cfg.get("active_skill_ids", set()):
+        return _agent_err("只能读取本轮已启用 Skill 的资源")
+    if not isinstance(path, str) or not path or len(path) > 240 or path.startswith(("/", "\\")) or ".." in path.replace("\\", "/").split("/"):
+        return _agent_err("Skill 资源路径无效")
+    resource = db.get_agent_skill_resource(uid, skill_id, path.replace("\\", "/"))
+    if not resource:
+        return _agent_err("找不到该 Skill 文本资源；脚本、二进制资产和未导入文件不能读取")
+    content = resource["content"]
+    truncated = len(content) > 6000
+    if truncated:
+        content = content[:6000] + "\n\n（该资源过长，已截取前 6000 字）"
+    return {
+        "changed": False, "summary": f"已读取 Skill 资料 {resource['path']}",
+        "_skill_resource_system": f"已读取已激活 Skill 的资料 {resource['path']}：\n{content}",
+        "_resource_truncated": truncated,
+    }
 
 
 def _tool_list_chapters(uid, cid, cfg, args):
@@ -829,7 +1133,7 @@ def _tool_edit_passage(uid, cid, cfg, args):
     rewritten = llm.process("改写", old, context=(c["content"] or "")[-1500:],
                             notes=c.get("notes") or "", bible=_agent_bible(c["work_id"], uid),
                             base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
-                            style=(style or instruction))
+                            style=(style or instruction), skill_instructions=cfg.get("skill_instructions"))
     snap = db.add_revision(cid, uid)
     if db.replace_text_in_chapter(cid, uid, old, rewritten) is None:
         return _agent_err("改写完成但在正文里找不到原文定位，请重新 read_chapter 取准确原文")
@@ -847,7 +1151,8 @@ def _tool_continue_writing(uid, cid, cfg, args):
     tail = (c["content"] or "")[-2000:]
     text = llm.process("续写", instruction, context=tail, notes=c.get("notes") or "",
                        bible=_agent_bible(c["work_id"], uid),
-                       base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"])
+                       base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
+                       skill_instructions=cfg.get("skill_instructions"))
     snap = db.add_revision(cid, uid)
     if db.add_segment(cid, uid, "（agent 续写）", text, "续写") is None:
         return _agent_err("续写失败")
@@ -919,7 +1224,8 @@ def _tool_summarize(uid, cid, cfg, args):
     if not (c["content"] or "").strip():
         return _agent_err("本章为空")
     s = llm.process("摘要", c["content"], bible=_agent_bible(c["work_id"], uid),
-                    base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"])
+                    base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
+                    skill_instructions=cfg.get("skill_instructions"))
     return {"changed": False, "summary_text": s}
 
 
@@ -933,12 +1239,14 @@ def _tool_check_consistency(uid, cid, cfg, args):
         return _agent_err("本章为空")
     s = llm.process("校验", c["content"], notes=c.get("notes") or "",
                     bible=_agent_bible(c["work_id"], uid),
-                    base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"])
+                    base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
+                    skill_instructions=cfg.get("skill_instructions"))
     return {"changed": False, "issues": s}
 
 
 _AGENT_TOOLS = {
     "read_chapter": _tool_read_chapter, "list_chapters": _tool_list_chapters,
+    "activate_skill": _tool_activate_skill, "read_skill_resource": _tool_read_skill_resource,
     "list_revisions": _tool_list_revisions, "replace_text": _tool_replace_text,
     "append_text": _tool_append_text, "edit_passage": _tool_edit_passage,
     "continue_writing": _tool_continue_writing, "set_title": _tool_set_title,
@@ -948,7 +1256,8 @@ _AGENT_TOOLS = {
 }
 
 
-def _run_agent(uid, cid, history_text, selection=None, model_turn=None):
+def _run_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
+               runtime_system=None, persist=True):
     """执行一轮 agent。
 
     history_text 是持久化到 SQLite 的安全文本；model_turn 可在本轮替换成音频等
@@ -960,7 +1269,7 @@ def _run_agent(uid, cid, history_text, selection=None, model_turn=None):
     model = st.get("llm_model") or config.LLM_MODEL
     if not api_key:
         raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
-    cfg = {"base_url": base_url, "api_key": api_key, "model": model}
+    cfg = {"base_url": base_url, "api_key": api_key, "model": model, "active_skill_ids": set()}
 
     # 加载持久化对话（服务端权威）。音频只进入本轮模型消息，不保存原始内容。
     conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
@@ -970,6 +1279,17 @@ def _run_agent(uid, cid, history_text, selection=None, model_turn=None):
 
     # 发给模型的数组：系统提示 + 早期摘要(若有) + 当前对话
     messages = [_agent_system(uid, cid)]
+    if runtime_system:
+        messages.append(runtime_system)
+    skill_catalog = _agent_skill_catalog_system(uid, cid)
+    if skill_catalog:
+        messages.append(skill_catalog)
+    skill_msg = _agent_skills_system(uid, cid, skill_ids)
+    if skill_msg:
+        messages.append(skill_msg)
+        # 工具内会再次调用文本模型生成正文，必须带上同一组 Skill 规则。
+        cfg["skill_instructions"] = skill_msg["content"]
+        cfg["active_skill_ids"] = set(skill_id for skill_id in skill_ids if isinstance(skill_id, int) and not isinstance(skill_id, bool))
     selection_msg = _agent_selection_system(uid, cid, selection)
     if selection_msg:
         messages.append(selection_msg)
@@ -1005,10 +1325,24 @@ def _run_agent(uid, cid, history_text, selection=None, model_turn=None):
                 result = fn(uid, cid, cfg, args) if fn else {"error": f"未知工具 {name}"}
             except Exception as e:
                 result = {"error": f"工具执行出错：{e}"}
+            # activate_skill 的完整规则只留在当前模型上下文，不写进历史或工具记录。
+            skill_system = result.pop("_skill_system", None) if isinstance(result, dict) else None
+            activated_skill_id = result.pop("_skill_id", None) if isinstance(result, dict) else None
+            resource_system = result.pop("_skill_resource_system", None) if isinstance(result, dict) else None
+            result.pop("_resource_truncated", None) if isinstance(result, dict) else None
             tm = {"role": "tool", "tool_call_id": tc.id,
                   "content": json.dumps(result, ensure_ascii=False)}
             messages.append(tm)
             msgs.append(tm)
+            if skill_system:
+                messages.append({"role": "system", "content": skill_system})
+                cfg["skill_instructions"] = ((cfg.get("skill_instructions") or "") + "\n\n" + skill_system).strip()
+                cfg["active_skill_ids"].add(activated_skill_id)
+            if resource_system:
+                messages.append({"role": "system", "content": resource_system})
+                combined = ((cfg.get("skill_instructions") or "") + "\n\n" + resource_system).strip()
+                if len(combined) <= 18000:
+                    cfg["skill_instructions"] = combined
     else:
         reply = "操作较多，已暂停。已执行的动作见对话记录，可逐条撤销。"
 
@@ -1027,8 +1361,57 @@ def _run_agent(uid, cid, history_text, selection=None, model_turn=None):
                 # 摘要失败则保留原样，不阻断本轮
                 pass
 
-    db.save_conversation(uid, cid, msgs, summary)
-    return {"reply": reply, "messages": msgs, "compacted": compacted}
+    if persist:
+        db.save_conversation(uid, cid, msgs, summary)
+        return {"reply": reply, "messages": msgs, "compacted": compacted}
+    return {
+        "reply": reply, "messages": msgs, "compacted": compacted,
+        "_pending_conversation": {"messages": msgs, "summary": summary},
+    }
+
+
+def _runtime_request_payload(uid, cid, history_text, selection):
+    """写入本机 launcher 的请求文件；音频 Base64 永远不落盘。"""
+    return {
+        "user_id": uid,
+        "chapter_id": cid,
+        "input": history_text,
+        "selection": selection if isinstance(selection, dict) else None,
+    }
+
+
+def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None):
+    """执行 Agent，并在启用本机运行时时先缓冲回答、等 after/recovery 确认。"""
+    turn = None
+    try:
+        turn = skill_runtime.start_turn(_runtime_request_payload(uid, cid, history_text, selection))
+        result = _run_agent(
+            uid, cid, history_text, selection, skill_ids, model_turn=model_turn,
+            runtime_system=turn.system_message if turn else None,
+            persist=turn is None,
+        )
+    except skill_runtime.SkillRuntimeError as e:
+        raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
+    except Exception as e:
+        if turn:
+            turn.fail_before_answer(_provider_error(e))
+        raise
+
+    if not turn:
+        return result
+
+    pending = result.pop("_pending_conversation")
+    try:
+        runtime_state = turn.complete({
+            "reply": result["reply"], "messages": result["messages"],
+            "compacted": result["compacted"], "chapter_id": cid, "pending_conversation": pending,
+        })
+    except skill_runtime.SkillRuntimeError as e:
+        raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
+    db.save_conversation(uid, cid, pending["messages"], pending["summary"])
+    skill_runtime.mark_conversation_saved(turn.turn_id, uid)
+    result["skill_runtime"] = runtime_state
+    return result
 
 
 @app.post("/api/agent")
@@ -1039,7 +1422,7 @@ async def agent(request: Request):
     text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "没有对话内容")
-    return _run_agent(uid, body.get("chapter_id"), text, body.get("selection"))
+    return _run_agent_turn(uid, body.get("chapter_id"), text, body.get("selection"), body.get("skill_ids"))
 
 
 @app.post("/api/agent/audio")
@@ -1078,14 +1461,40 @@ async def agent_audio(request: Request):
         ],
     }
     try:
-        return _run_agent(uid, body.get("chapter_id"), "[voice] 语音指令",
-                          body.get("selection"), model_turn=model_turn)
+        return _run_agent_turn(uid, body.get("chapter_id"), "[voice] 语音指令",
+                               body.get("selection"), body.get("skill_ids"), model_turn=model_turn)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(502, "语音已直接发送给模型，但当前模型或网关不支持音频输入/工具调用。"
                             "可关闭「直接发送语音给 AI」后改用转写模式。"
                             f" 详情：{_provider_error(e)}")
+
+
+@app.post("/api/agent/runtime/recover/{turn_id}")
+async def recover_agent_runtime(turn_id: str, request: Request):
+    """重放一个未确认的本机 launcher 回合，不重新调用模型。"""
+    uid = _auth(request)
+    try:
+        answer, runtime_state = skill_runtime.recover_turn(turn_id, uid)
+    except skill_runtime.SkillRuntimeError as e:
+        raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
+    if not isinstance(answer, dict):
+        raise HTTPException(409, "该回合没有可恢复的模型回答")
+    pending = answer.get("pending_conversation")
+    if not isinstance(pending, dict) or not isinstance(pending.get("messages"), list):
+        raise HTTPException(409, "该回合没有可保存的对话状态")
+    chapter_id = answer.get("chapter_id")
+    if chapter_id is not None and (not isinstance(chapter_id, int) or isinstance(chapter_id, bool)):
+        raise HTTPException(409, "该回合的章节标识无效")
+    if not runtime_state.get("conversation_saved"):
+        db.save_conversation(uid, chapter_id, pending["messages"], pending.get("summary") or "")
+        skill_runtime.mark_conversation_saved(turn_id, uid)
+        runtime_state["conversation_saved"] = True
+    return {
+        "reply": answer.get("reply") or "", "messages": pending["messages"],
+        "compacted": bool(answer.get("compacted")), "skill_runtime": runtime_state,
+    }
 
 
 @app.get("/api/agent/conversation")
