@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+node_modules/
 
 # 运行时数据 / 密钥
 writehtml.db

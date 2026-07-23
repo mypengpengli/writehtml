@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
-import config, db, llm, skill_runtime
+import config, db, llm, pi_agent, skill_runtime
 
 app = FastAPI(title="写作")
 db.init_db()
@@ -1256,7 +1256,290 @@ _AGENT_TOOLS = {
 }
 
 
-def _run_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
+def _pi_text(content):
+    """Extract visible text from a Pi content array or a legacy string."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        part.get("text", "") for part in content
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+    )
+
+
+def _pi_timestamp():
+    import time
+    return int(time.time() * 1000)
+
+
+def _pi_tool_name_map(messages):
+    names = {}
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            call_id = call.get("id")
+            if isinstance(call_id, str) and isinstance(function.get("name"), str):
+                names[call_id] = function["name"]
+    return names
+
+
+def _is_pi_transcript(messages):
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "toolResult":
+            return True
+        if message.get("role") in {"user", "assistant"} and isinstance(message.get("content"), list):
+            return True
+    return False
+
+
+def _legacy_messages_to_pi(messages, model):
+    """Migrate old OpenAI-shaped persisted messages lazily on the next Pi turn."""
+    if _is_pi_transcript(messages):
+        return list(messages)
+    call_names = _pi_tool_name_map(messages)
+    result = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        timestamp = _pi_timestamp()
+        if role == "user":
+            text = _pi_text(message.get("content"))
+            result.append({"role": "user", "content": [{"type": "text", "text": text}], "timestamp": timestamp})
+        elif role == "assistant":
+            content = []
+            text = _pi_text(message.get("content"))
+            if text:
+                content.append({"type": "text", "text": text})
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                call_id = call.get("id")
+                name = function.get("name")
+                raw_args = function.get("arguments") or "{}"
+                try:
+                    arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    arguments = {}
+                if isinstance(call_id, str) and isinstance(name, str) and isinstance(arguments, dict):
+                    content.append({"type": "toolCall", "id": call_id, "name": name, "arguments": arguments})
+            result.append({
+                "role": "assistant", "content": content, "api": "openai-completions", "provider": "openai",
+                "model": model, "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                                           "totalTokens": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+                "stopReason": "stop", "timestamp": timestamp,
+            })
+        elif role == "tool":
+            raw = message.get("content") or "{}"
+            try:
+                details = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                details = {"summary": str(raw)}
+            call_id = message.get("tool_call_id") or "legacy-tool-result"
+            result.append({
+                "role": "toolResult", "toolCallId": call_id, "toolName": call_names.get(call_id, "writing_tool"),
+                "content": [{"type": "text", "text": json.dumps(details, ensure_ascii=False)}],
+                "details": details, "isError": bool(isinstance(details, dict) and details.get("error")), "timestamp": timestamp,
+            })
+    return result
+
+
+def _pi_messages_for_frontend(messages):
+    """Translate Pi transcript messages into the stable structure used by static/app.js."""
+    if not _is_pi_transcript(messages):
+        return list(messages)
+    result = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "user":
+            result.append({"role": "user", "content": _pi_text(message.get("content"))})
+        elif role == "assistant":
+            item = {"role": "assistant", "content": _pi_text(message.get("content"))}
+            calls = []
+            for part in message.get("content") or []:
+                if not isinstance(part, dict) or part.get("type") != "toolCall":
+                    continue
+                calls.append({"id": part.get("id"), "type": "function", "function": {
+                    "name": part.get("name"), "arguments": json.dumps(part.get("arguments") or {}, ensure_ascii=False),
+                }})
+            if calls:
+                item["tool_calls"] = calls
+            result.append(item)
+        elif role == "toolResult":
+            details = message.get("details")
+            if not isinstance(details, (dict, list)):
+                raw = _pi_text(message.get("content"))
+                try:
+                    details = json.loads(raw)
+                except Exception:
+                    details = {"summary": raw}
+            result.append({
+                "role": "tool", "tool_call_id": message.get("toolCallId"), "name": message.get("toolName"),
+                "content": json.dumps(details, ensure_ascii=False),
+            })
+    return result
+
+
+def _pi_message_size(message):
+    if not isinstance(message, dict):
+        return 0
+    return len(_pi_text(message.get("content"))) + len(json.dumps(message.get("details") or {}, ensure_ascii=False))
+
+
+def _pi_recent_history(messages):
+    limit = max(0, config.PI_AGENT_MAX_HISTORY_MESSAGES)
+    if not limit or len(messages) <= limit:
+        return list(messages)
+    start = _compact_split(messages, limit)
+    # Do not sever an assistant/tool-result pair just to meet a soft context cap.
+    return list(messages[start:]) if start else list(messages)
+
+
+def _pi_system_prompt(uid, cid, selection, skill_ids, runtime_system, summary, cfg):
+    system_messages = [_agent_system(uid, cid)]
+    if runtime_system:
+        system_messages.append(runtime_system)
+    skill_catalog = _agent_skill_catalog_system(uid, cid)
+    if skill_catalog:
+        system_messages.append(skill_catalog)
+    skill_msg = _agent_skills_system(uid, cid, skill_ids)
+    if skill_msg:
+        system_messages.append(skill_msg)
+        cfg["skill_instructions"] = skill_msg["content"]
+        cfg["active_skill_ids"] = {
+            skill_id for skill_id in skill_ids if isinstance(skill_id, int) and not isinstance(skill_id, bool)
+        }
+    selection_msg = _agent_selection_system(uid, cid, selection)
+    if selection_msg:
+        system_messages.append(selection_msg)
+    if summary:
+        system_messages.append({"role": "system", "content": "[此前对话摘要]\n" + summary})
+    return "\n\n".join(message["content"] for message in system_messages if message.get("content"))
+
+
+def _pi_tools():
+    return [{
+        "name": item["function"]["name"],
+        "label": item["function"]["name"],
+        "description": item["function"]["description"],
+        "parameters": item["function"]["parameters"],
+    } for item in AGENT_TOOLS]
+
+
+def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
+                  runtime_system=None, persist=True):
+    """Run the writing agent through the official Pi Agent Core process."""
+    audio = None
+    if model_turn is not None:
+        content = model_turn.get("content") if isinstance(model_turn, dict) else None
+        if not isinstance(content, list):
+            raise HTTPException(400, "语音请求格式无效")
+        instruction = ""
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                instruction += part["text"]
+            if part.get("type") == "input_audio":
+                raw_audio = part.get("input_audio") or {}
+                data, format_ = raw_audio.get("data"), raw_audio.get("format")
+                if isinstance(data, str) and isinstance(format_, str):
+                    audio = {"data": data, "format": format_, "instruction": instruction}
+        if not audio:
+            raise HTTPException(400, "语音请求缺少可用音频")
+    st = db.get_settings(uid) or {}
+    base_url = st.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = st.get("llm_api_key") or config.LLM_API_KEY
+    model = st.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        raise HTTPException(500, "未配置 API Key，请在设置里填写 base_url / key / 模型")
+    cfg = {"base_url": base_url, "api_key": api_key, "model": model, "active_skill_ids": set()}
+    conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
+    summary = conv["summary"] or ""
+    history = _legacy_messages_to_pi(conv["messages"], model)
+    system_prompt = _pi_system_prompt(uid, cid, selection, skill_ids, runtime_system, summary, cfg)
+
+    def execute_tool(name, args):
+        fn = _AGENT_TOOLS.get(name)
+        try:
+            result = fn(uid, cid, cfg, args) if fn else {"error": f"未知工具 {name}"}
+        except Exception as exc:
+            result = {"error": f"工具执行出错：{exc}"}
+        if not isinstance(result, dict):
+            return {"summary": str(result)}
+        result = dict(result)
+        additions = []
+        skill_system = result.pop("_skill_system", None)
+        activated_skill_id = result.pop("_skill_id", None)
+        resource_system = result.pop("_skill_resource_system", None)
+        result.pop("_resource_truncated", None)
+        if skill_system:
+            additions.append(skill_system)
+            cfg["skill_instructions"] = ((cfg.get("skill_instructions") or "") + "\n\n" + skill_system).strip()
+            if isinstance(activated_skill_id, int):
+                cfg["active_skill_ids"].add(activated_skill_id)
+        if resource_system:
+            additions.append(resource_system)
+            combined = ((cfg.get("skill_instructions") or "") + "\n\n" + resource_system).strip()
+            if len(combined) <= 18000:
+                cfg["skill_instructions"] = combined
+        if additions:
+            result["_pi_system"] = "\n\n".join(additions)
+        return result
+
+    request = {
+        "systemPrompt": system_prompt,
+        "messages": _pi_recent_history(history),
+        "prompt": history_text,
+        "tools": _pi_tools(),
+        "baseUrl": base_url,
+        "apiKey": api_key,
+        "model": model,
+        "audio": audio,
+        "sessionId": f"{config.AGENT_SKILL_AGENT_ID}:user-{uid}:chapter-{cid if cid is not None else 'global'}",
+    }
+    raw_messages = pi_agent.run_turn(request, execute_tool)
+    reply = ""
+    for message in reversed(raw_messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            reply = _pi_text(message.get("content")).strip()
+            if reply:
+                break
+    if not reply:
+        reply = "已完成本次操作。"
+
+    compacted = False
+    keep_from = _compact_split(raw_messages, config.AGENT_PRESERVE_RECENT)
+    if keep_from > 0 and sum(_pi_message_size(message) for message in raw_messages) > config.AGENT_COMPACT_CHARS:
+        try:
+            summary = llm.summarize(_pi_messages_for_frontend(raw_messages[:keep_from]), prev=summary,
+                                    base_url=base_url, api_key=api_key, model=model)
+            raw_messages = raw_messages[keep_from:]
+            compacted = True
+        except Exception:
+            pass
+
+    display_messages = _pi_messages_for_frontend(raw_messages)
+    if persist:
+        db.save_conversation(uid, cid, raw_messages, summary)
+        return {"reply": reply, "messages": display_messages, "compacted": compacted}
+    return {
+        "reply": reply, "messages": display_messages, "compacted": compacted,
+        "_pending_conversation": {"messages": raw_messages, "summary": summary},
+    }
+
+
+def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                runtime_system=None, persist=True):
     """执行一轮 agent。
 
@@ -1385,13 +1668,18 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     turn = None
     try:
         turn = skill_runtime.start_turn(_runtime_request_payload(uid, cid, history_text, selection))
-        result = _run_agent(
+        engine = _run_pi_agent if config.PI_AGENT_ENABLED else _run_legacy_agent
+        result = engine(
             uid, cid, history_text, selection, skill_ids, model_turn=model_turn,
             runtime_system=turn.system_message if turn else None,
             persist=turn is None,
         )
     except skill_runtime.SkillRuntimeError as e:
         raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
+    except pi_agent.PiAgentError as e:
+        if turn:
+            turn.fail_before_answer(_provider_error(e))
+        raise HTTPException(502, f"Pi Agent Core 执行失败：{_provider_error(e)}")
     except Exception as e:
         if turn:
             turn.fail_before_answer(_provider_error(e))
@@ -1492,7 +1780,7 @@ async def recover_agent_runtime(turn_id: str, request: Request):
         skill_runtime.mark_conversation_saved(turn_id, uid)
         runtime_state["conversation_saved"] = True
     return {
-        "reply": answer.get("reply") or "", "messages": pending["messages"],
+        "reply": answer.get("reply") or "", "messages": _pi_messages_for_frontend(pending["messages"]),
         "compacted": bool(answer.get("compacted")), "skill_runtime": runtime_state,
     }
 
@@ -1503,7 +1791,7 @@ async def get_agent_conversation(request: Request):
     uid = _auth(request)
     cid = _qparam_int(request, "chapter_id")
     conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
-    return conv
+    return {"messages": _pi_messages_for_frontend(conv["messages"]), "summary": conv["summary"]}
 
 
 @app.delete("/api/agent/conversation")

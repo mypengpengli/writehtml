@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 _TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".smoke_tmp", uuid.uuid4().hex[:10])
 os.makedirs(_TMP, exist_ok=True)
 os.environ["DB_PATH"] = os.path.join(_TMP, "test.db")
+os.environ["PI_AGENT_ENABLED"] = "false"  # The broad legacy smoke suite stubs llm.agent_chat.
 os.environ["SIGNUP_CODE"] = "testcode"   # 开放凭码注册
 os.environ["LLM_API_KEY"] = ""           # 测试不调真 LLM；校验/摘要/聊天应走"未配置"500
 os.environ["WRITEHTML_ADMIN_PASSWORD"] = "admintest"  # 引导创建的 admin 用确定性密码
@@ -593,5 +594,5 @@ ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 # 首页
 ok(c.get("/").status_code == 200, "首页可访问")
 
-print("\n全部通过 ✅")
+print("\nAll smoke checks passed.")
 shutil.rmtree(_TMP, ignore_errors=True)

@@ -1,0 +1,188 @@
+"""Pi Agent Core integration smoke test using a local OpenAI-compatible SSE server."""
+import base64
+import json
+import os
+import shutil
+import sys
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".smoke_tmp", "pi-" + uuid.uuid4().hex[:10])
+os.makedirs(TMP, exist_ok=True)
+os.environ["DB_PATH"] = os.path.join(TMP, "test.db")
+os.environ["PI_AGENT_ENABLED"] = "true"
+os.environ["PI_AGENT_TIMEOUT_SECONDS"] = "30"
+os.environ["SIGNUP_CODE"] = ""
+os.environ["ALLOW_SIGNUP"] = "true"
+
+from fastapi.testclient import TestClient
+import db
+import main
+
+
+def ok(condition, message):
+    print(("  OK  " if condition else " FAIL ") + message)
+    if not condition:
+        raise SystemExit(1)
+
+
+def sse_chunk(delta, finish_reason=None, response_id="pi-test"):
+    return {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "pi-test-model",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+class FakeOpenAI(BaseHTTPRequestHandler):
+    requests = []
+    skill_id = None
+
+    def do_POST(self):
+        size = int(self.headers.get("content-length", "0"))
+        payload = json.loads(self.rfile.read(size))
+        type(self).requests.append(payload)
+        has_audio = any(
+            message.get("role") == "user" and isinstance(message.get("content"), list)
+            and any(part.get("type") == "input_audio" for part in message["content"] if isinstance(part, dict))
+            for message in payload.get("messages", []) if isinstance(message, dict)
+        )
+        if has_audio:
+            chunks = [sse_chunk({"role": "assistant", "content": "Pi received raw audio."}), sse_chunk({}, "stop")]
+        elif len(type(self).requests) == 1:
+            chunks = [
+                sse_chunk({"role": "assistant", "tool_calls": [{
+                    "index": 0,
+                    "id": "call_activate",
+                    "type": "function",
+                    "function": {"name": "activate_skill", "arguments": json.dumps({"skill_id": type(self).skill_id})},
+                }]}),
+                sse_chunk({}, "tool_calls"),
+            ]
+        else:
+            chunks = [sse_chunk({"role": "assistant", "content": "Pi completed the Skill turn."}), sse_chunk({}, "stop")]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for chunk in chunks:
+            self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode("utf-8"))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def log_message(self, *args):
+        pass
+
+
+db.init_db()
+server = HTTPServer(("127.0.0.1", 0), FakeOpenAI)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+try:
+    user = db.create_user("piuser", "pw1234")
+    uid = user["id"]
+    token = "pi-test-token"
+    main._sessions[token] = uid
+    work = db.create_work(uid, "Pi work")
+    chapter = db.create_chapter(work["id"], uid, "Chapter")
+    db.update_chapter(chapter["id"], uid, None, "Original chapter text", None)
+    skill = db.create_agent_skill(
+        uid, None, "pi-skill", "test dynamic skill", "PI_SKILL_RULE: preserve narrative viewpoint",
+        source_kind="skill_md",
+    )
+    FakeOpenAI.skill_id = skill["id"]
+    db.save_settings(uid, f"http://127.0.0.1:{server.server_port}/v1", "test-key", "pi-test-model")
+    client = TestClient(main.app)
+    response = client.post(
+        "/api/agent", json={"text": "Use pi-skill", "chapter_id": chapter["id"]},
+        headers={"Authorization": "Bearer " + token},
+    )
+    ok(response.status_code == 200, "Pi Agent API turn succeeds")
+    payload = response.json()
+    ok(payload["reply"] == "Pi completed the Skill turn.", "Pi final answer returned")
+    ok(any(message.get("role") == "tool" for message in payload["messages"]), "Pi tool result is converted for the UI")
+    ok(len(FakeOpenAI.requests) == 2, "Pi makes a second model call after a tool result")
+    second_prompt = json.dumps(FakeOpenAI.requests[1], ensure_ascii=False)
+    ok("PI_SKILL_RULE" in second_prompt, "activate_skill injects SKILL.md into the next Pi turn")
+    stored = db.get_conversation(uid, chapter["id"])
+    ok(any(message.get("role") == "toolResult" for message in stored["messages"]), "database stores Pi-native toolResult")
+    ok("PI_SKILL_RULE" not in json.dumps(stored["messages"], ensure_ascii=False), "Skill text is not persisted in chat history")
+    fetched = client.get(
+        f"/api/agent/conversation?chapter_id={chapter['id']}",
+        headers={"Authorization": "Bearer " + token},
+    ).json()
+    ok(any(message.get("role") == "tool" for message in fetched["messages"]), "history endpoint remains UI compatible")
+    voice = client.post(
+        "/api/agent/audio", json={
+            "audio": base64.b64encode(b"fake-pi-audio").decode(), "format": "wav", "chapter_id": chapter["id"],
+        }, headers={"Authorization": "Bearer " + token},
+    )
+    ok(voice.status_code == 200 and voice.json()["reply"] == "Pi received raw audio.", "Pi direct audio turn succeeds")
+    raw_audio_prompt = FakeOpenAI.requests[-1]
+    ok("input_audio" in json.dumps(raw_audio_prompt), "raw audio reaches the OpenAI-compatible model request")
+    stored_after_voice = db.get_conversation(uid, chapter["id"])
+    serialized = json.dumps(stored_after_voice["messages"], ensure_ascii=False)
+    ok("ZmFrZS1waS1hdWRpbw==" not in serialized, "raw audio Base64 is never persisted")
+    plain_chapter = db.create_chapter(work["id"], uid, "Plain Pi chapter")
+    plain = client.post(
+        "/api/agent", json={"text": "Plain Pi reply", "chapter_id": plain_chapter["id"]},
+        headers={"Authorization": "Bearer " + token},
+    )
+    ok(plain.status_code == 200, "Pi text-only turn succeeds")
+    plain_stored = db.get_conversation(uid, plain_chapter["id"])
+    ok(not any(message.get("role") == "toolResult" for message in plain_stored["messages"]), "plain Pi transcript has no tool result")
+    plain_history = client.get(
+        f"/api/agent/conversation?chapter_id={plain_chapter['id']}",
+        headers={"Authorization": "Bearer " + token},
+    ).json()
+    ok(all(isinstance(message.get("content"), str) for message in plain_history["messages"]),
+       "text-only Pi history is converted for the existing UI")
+    runtime_root = os.path.join(TMP, "pi-local-skill")
+    meta_dir = os.path.join(runtime_root, "meta-memory")
+    os.makedirs(meta_dir, exist_ok=True)
+    with open(os.path.join(meta_dir, "SKILL.md"), "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("PI_LOCAL_SKILL_MARKER\n")
+    launcher = os.path.join(TMP, "pi_launcher.py")
+    with open(launcher, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write(
+            "import json, sys\n"
+            "phase = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+            "print(json.dumps({'status': 'ok', 'context': 'PI_LAUNCHER_CONTEXT'} if phase == 'before' else {'status': 'ok'}))\n"
+        )
+    old_runtime = {
+        "dir": main.config.AGENT_SKILL_DIR, "launcher": main.config.AGENT_SKILL_LAUNCHER,
+        "cwd": main.config.AGENT_SKILL_CWD, "runtime_dir": main.config.AGENT_SKILL_RUNTIME_DIR,
+        "touch": main.config.AGENT_SKILL_TOUCH_SECONDS,
+    }
+    main.config.AGENT_SKILL_DIR = runtime_root
+    main.config.AGENT_SKILL_LAUNCHER = [sys.executable, launcher]
+    main.config.AGENT_SKILL_CWD = os.path.dirname(os.path.abspath(__file__))
+    main.config.AGENT_SKILL_RUNTIME_DIR = os.path.join(TMP, "pi-skill-turns")
+    main.config.AGENT_SKILL_TOUCH_SECONDS = 60
+    try:
+        runtime_chapter = db.create_chapter(work["id"], uid, "Pi runtime chapter")
+        runtime_response = client.post(
+            "/api/agent", json={"text": "Use local runtime", "chapter_id": runtime_chapter["id"]},
+            headers={"Authorization": "Bearer " + token},
+        )
+        ok(runtime_response.status_code == 200 and runtime_response.json().get("skill_runtime", {}).get("state") == "ok",
+           "Pi turn is confirmed by the local launcher")
+        runtime_prompt = json.dumps(FakeOpenAI.requests[-1], ensure_ascii=False)
+        ok("PI_LOCAL_SKILL_MARKER" in runtime_prompt and "PI_LAUNCHER_CONTEXT" in runtime_prompt,
+           "Pi receives local SKILL.md and launcher before context")
+        runtime_stored = db.get_conversation(uid, runtime_chapter["id"])
+        ok("PI_LOCAL_SKILL_MARKER" not in json.dumps(runtime_stored["messages"], ensure_ascii=False),
+           "local Skill text is not persisted by Pi")
+    finally:
+        main.config.AGENT_SKILL_DIR = old_runtime["dir"]
+        main.config.AGENT_SKILL_LAUNCHER = old_runtime["launcher"]
+        main.config.AGENT_SKILL_CWD = old_runtime["cwd"]
+        main.config.AGENT_SKILL_RUNTIME_DIR = old_runtime["runtime_dir"]
+        main.config.AGENT_SKILL_TOUCH_SECONDS = old_runtime["touch"]
+finally:
+    server.shutdown()
+    server.server_close()
+    shutil.rmtree(TMP, ignore_errors=True)
+
+print("Pi Agent Core smoke test passed.")

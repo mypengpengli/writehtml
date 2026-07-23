@@ -1,0 +1,14 @@
+{
+  "name": "writehtml-pi-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.81.1",
+    "@earendil-works/pi-ai": "0.81.1",
+    "openai": "6.26.0"
+  }
+}

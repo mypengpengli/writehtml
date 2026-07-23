@@ -190,6 +190,7 @@ class LocalSkillTurn:
                 completed = subprocess.run(
                     self._command(phase), cwd=self.cwd, shell=False, capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
+                    env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
                     timeout=max(1, float(config.AGENT_SKILL_COMMAND_TIMEOUT)),
                 )
                 result = _parse_launcher_json(completed.stdout, completed.stderr, completed.returncode)

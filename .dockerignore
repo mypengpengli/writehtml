@@ -1,4 +1,6 @@
 .venv
+node_modules
+pi_runtime/node_modules
 __pycache__
 *.pyc
 writehtml.db

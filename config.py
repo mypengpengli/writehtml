@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # OpenAI 兼容的大模型配置——你自己填 base_url / key / model
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
@@ -32,6 +34,15 @@ AGENT_SKILL_RUNTIME_DIR = os.getenv(
 AGENT_SKILL_AGENT_ID = os.getenv("AGENT_SKILL_AGENT_ID", "writehtml-writing-agent-v1")
 AGENT_SKILL_COMMAND_TIMEOUT = float(os.getenv("AGENT_SKILL_COMMAND_TIMEOUT", "30"))
 AGENT_SKILL_TOUCH_SECONDS = float(os.getenv("AGENT_SKILL_TOUCH_SECONDS", "20"))
+
+# Pi Agent Core is the production writing-agent runtime. Set PI_AGENT_ENABLED=false
+# only for a controlled rollback while diagnosing a deployment.
+PI_AGENT_ENABLED = os.getenv("PI_AGENT_ENABLED", "true").lower() not in {"0", "false", "no"}
+PI_AGENT_NODE = os.getenv("PI_AGENT_NODE", "node")
+_pi_bridge = os.getenv("PI_AGENT_BRIDGE", os.path.join("pi_runtime", "bridge.mjs"))
+PI_AGENT_BRIDGE = _pi_bridge if os.path.isabs(_pi_bridge) else os.path.join(ROOT_DIR, _pi_bridge)
+PI_AGENT_TIMEOUT_SECONDS = float(os.getenv("PI_AGENT_TIMEOUT_SECONDS", "240"))
+PI_AGENT_MAX_HISTORY_MESSAGES = int(os.getenv("PI_AGENT_MAX_HISTORY_MESSAGES", "80"))
 
 # 服务端口（选了个基本不用的 9123，可自行改）
 PORT = int(os.getenv("PORT", "9123"))
