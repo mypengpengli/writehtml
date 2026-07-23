@@ -27,7 +27,13 @@ services:
       # - AGENT_SKILL_CWD=/app
       # - AGENT_SKILL_RUNTIME_DIR=/data/skill-turns
       # - AGENT_SKILL_AGENT_ID=writehtml-writing-agent-v1
+      # 可选：Pi 原生全局配置 / Skills。开启后 Pi 的 bash、文件工具、扩展和包按官方机制运行。
+      # - PI_CODING_AGENT_DIR=/opt/pi-agent
+      # - PI_AGENT_SKILL_DIR=/opt/pi-skills
+      # - PI_AGENT_WORKSPACE_DIR=/app
     volumes:
       - ./data:/data
       # - /opt/meta-skills:/opt/meta-skills:ro
       # - /opt/meta-runtime:/opt/meta-runtime:ro
+      # - /opt/pi-agent:/opt/pi-agent
+      # - /opt/pi-skills:/opt/pi-skills

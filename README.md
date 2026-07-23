@@ -12,6 +12,7 @@
 - **AI Skills**：在「⋯」→「AI Skills」中创建可复用的写作规则，或导入标准 `SKILL.md` / ZIP Skill 包（支持按需读取 `references/` 文本）。可设为所有作品通用或当前作品专用；Agent 会先看到元数据，任务匹配时再加载完整 Skill。规则会同时传给文字、选区和直发语音请求，也会传给 Agent 后续的续写/改写工具，但不会存入聊天历史。
 - **找回**：从历史版本把旧草稿找回成正文。
 - **AI 助手（agent）**：🤖 常驻右侧侧栏，用自然语言让 AI 直接动手——改某段文字、续写、回退到历史版本、改标题/备注、加章、摘要、设定校验。每个写操作前自动存版本快照，对话里每步带「撤销」按钮，错了秒回。支持**语音指令**（🎤 默认直发模型，关闭直发后才转写）与**自动朗读**（🔊 把 AI 的回复与操作念给你听）。
+- **Pi 原生智能体**：AI 助手以官方 Pi Coding Agent 运行，原生 `read / bash / edit / write / grep / find / ls`、本机 `SKILL.md`、扩展和已安装包均可用；现有章节、版本和选区工具作为额外 Pi 工具保留。
 - **AI 工具**：✦AI 做一致性校验（只列问题不改字）、生成本章摘要（填进备注当后续上下文）。
 - **作品设定（bible）**：人物表 / 世界观 / 大纲，本作品下所有 AI 都会读到。
 - **撤销 / 查找替换 / 拆分章节 / 存版 / 导出（txt、docx）/ 专注模式 / 阅读视图（夜间适配、朗读）**。
@@ -46,9 +47,27 @@ cd /opt/1panel/docker/compose/writehtml && bash deploy.sh
 
 数据（`writehtml.db`）在 `./data/` 卷里，容器重建不丢稿；删这个目录才会丢。
 
+### Pi 原生 Skills、扩展和包（可选）
+
+AI 助手使用官方 Pi Coding Agent 的原生资源加载机制。它会读取 Pi 标准全局目录（默认 `~/.pi/agent`，可用 `PI_CODING_AGENT_DIR` 指定）、项目目录下的 `.pi/`，并可通过 `PI_AGENT_SKILL_DIR` 追加一个 Skill 目录。原生 Pi 的 `SKILL.md`、扩展和已安装包可使用 Pi 自带的文件与 `bash` 工具。
+
+Docker 中需要持久化或挂载这些内容时，可在 `docker-compose.yml` 中配置：
+
+```yaml
+environment:
+  - PI_CODING_AGENT_DIR=/opt/pi-agent
+  - PI_AGENT_SKILL_DIR=/opt/pi-skills
+  - PI_AGENT_WORKSPACE_DIR=/app
+volumes:
+  - /opt/pi-agent:/opt/pi-agent
+  - /opt/pi-skills:/opt/pi-skills
+```
+
+注意：这是不受限的服务器进程能力。能够向 AI 助手发指令的人，可能通过模型调用读取、修改或执行该工作目录中的内容。只应在受信任的私有部署中启用，工作目录也应是明确授权给 Pi 的项目目录。
+
 ### 本机 meta-memory launcher（可选）
 
-这是**服务端**能力，不是让网页用户执行服务器命令。只有同时配置了本机 Skill 目录和安装器生成的 launcher 后才启用；未配置时，原有 Agent 行为不变。
+这是给 meta-memory 安装器使用的**服务端生命周期**。只有同时配置本机 Skill 目录和安装器生成的 launcher 后才启用；它与上面的 Pi 原生工具能力独立。
 
 目录必须包含：
 
@@ -124,6 +143,6 @@ caddy reverse-proxy --from your.domain --to localhost:9123
 ## 说明
 
 - **语音直发与转写**：默认直发语音时，当前 AI 模型必须支持音频输入；不支持会明确提示，关闭直发即可改用转写。转写服务要求 `/audio/transcriptions`，可以与文字模型使用不同的 Base URL、Key 和模型；因此文字 AI 可用但转写服务不可用时，两者互不影响。
-- **AI Skills 的执行边界**：网页导入的 `SKILL.md` / ZIP 只作为文本规则和文本资料，包内脚本永不执行。只有服务管理员通过环境变量配置的本机 `meta-memory` launcher 才能执行 CLI；Agent 可执行的作品动作仍受内置工具和账号权限限制。
+- **AI Skills 的来源**：网页导入的 `SKILL.md` / ZIP 仍只作为数据库中的文本规则和资料；Pi 原生 Skills、扩展和包则从服务器文件系统按 Pi 标准加载，并可使用 Pi 原生工具。两者是不同来源，不要把不可信网页上传包当作服务器本机 Pi 包安装。
 - API key 只存在服务器数据库里（按用户隔离，前端只调自家后端，不暴露 key）。
 - 数据库为 `./data/writehtml.db`，定期备份即可。

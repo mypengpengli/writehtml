@@ -865,7 +865,7 @@ AGENT_TOOLS = [
             "required": ["skill_id"]}}},
     {"type": "function", "function": {
         "name": "read_skill_resource",
-        "description": "读取已激活 Skill 内的引用文本资源（如 references/STYLE.md）。只能读取 Skill 包内文本资料，不能执行脚本。",
+        "description": "读取已导入数据库的 Skill 引用文本资源（如 references/STYLE.md）。该工具只处理文本；Pi 的原生 read/bash 工具可直接使用本机 Skill 的文件和脚本。",
         "parameters": {"type": "object", "properties": {
             "skill_id": {"type": "integer", "description": "已激活的 Skill id"},
             "path": {"type": "string", "description": "Skill 包内相对路径，例如 references/STYLE.md"}},
@@ -906,6 +906,8 @@ def _agent_system(uid, cid):
         "原则：1) 要改某段文字前，先 read_chapter 读准确原文，再用 replace_text 或 edit_passage，"
         "old_text 必须与正文逐字一致；2) 每个写操作都会自动存版本，用户可一键撤销，所以放心改；"
         "3) 不要替作者下不可逆的决定；4) 回答简洁，做完事说一句即可。"
+        "除这些写作工具外，你还拥有 Pi 原生的 read、bash、edit、write、grep、find、ls，"
+        "以及当前项目加载的本机 Skills、扩展和包；用户要求时正常使用，不能声称自己无法执行 CLI 或加载本机 Skill。"
     ]
     if cid:
         c = db.get_chapter_meta(cid, uid)
@@ -1021,8 +1023,8 @@ def _agent_skill_catalog_system(uid, cid):
         "content": "当前用户安装了以下可按需调用的 Skills（仅元数据，完整规则尚未加载）：\n"
                    + "\n".join(items)
                    + "\n\n当用户明确提到某个 Skill，或请求与其 description 高度匹配时，先调用 activate_skill 加载完整规则；"
-                     "不匹配时不要调用。Skill 内的 references 文本资料可在激活后用 read_skill_resource 按需读取；"
-                     "脚本不能执行。",
+                     "不匹配时不要调用。网页导入到数据库的 Skill 包只保存文本资料，可在激活后用 "
+                     "read_skill_resource 按需读取；Pi 本机 Skill 和扩展可使用 Pi 的原生 read/bash 工具。",
     }
 
 
@@ -1438,7 +1440,7 @@ def _pi_tools():
 
 def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                   runtime_system=None, persist=True):
-    """Run the writing agent through the official Pi Agent Core process."""
+    """Run the writing agent through the official Pi Coding Agent process."""
     audio = None
     if model_turn is not None:
         content = model_turn.get("content") if isinstance(model_turn, dict) else None
@@ -1507,6 +1509,8 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
         "model": model,
         "audio": audio,
         "sessionId": f"{config.AGENT_SKILL_AGENT_ID}:user-{uid}:chapter-{cid if cid is not None else 'global'}",
+        "cwd": config.PI_AGENT_WORKSPACE_DIR,
+        "skillDirs": [config.PI_AGENT_SKILL_DIR] if config.PI_AGENT_SKILL_DIR else [],
     }
     raw_messages = pi_agent.run_turn(request, execute_tool)
     reply = ""
@@ -1679,7 +1683,7 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     except pi_agent.PiAgentError as e:
         if turn:
             turn.fail_before_answer(_provider_error(e))
-        raise HTTPException(502, f"Pi Agent Core 执行失败：{_provider_error(e)}")
+        raise HTTPException(502, f"Pi Coding Agent 执行失败：{_provider_error(e)}")
     except Exception as e:
         if turn:
             turn.fail_before_answer(_provider_error(e))

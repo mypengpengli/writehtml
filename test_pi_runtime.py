@@ -1,4 +1,4 @@
-"""Pi Agent Core integration smoke test using a local OpenAI-compatible SSE server."""
+"""Pi Coding Agent integration smoke test using a local OpenAI-compatible SSE server."""
 import base64
 import json
 import os
@@ -45,6 +45,11 @@ class FakeOpenAI(BaseHTTPRequestHandler):
         size = int(self.headers.get("content-length", "0"))
         payload = json.loads(self.rfile.read(size))
         type(self).requests.append(payload)
+        prompt_text = json.dumps(payload.get("messages", []), ensure_ascii=False)
+        has_native_bash_result = any(
+            message.get("role") == "tool" and "PI_NATIVE_BASH_OK" in str(message.get("content", ""))
+            for message in payload.get("messages", []) if isinstance(message, dict)
+        )
         has_audio = any(
             message.get("role") == "user" and isinstance(message.get("content"), list)
             and any(part.get("type") == "input_audio" for part in message["content"] if isinstance(part, dict))
@@ -52,6 +57,18 @@ class FakeOpenAI(BaseHTTPRequestHandler):
         )
         if has_audio:
             chunks = [sse_chunk({"role": "assistant", "content": "Pi received raw audio."}), sse_chunk({}, "stop")]
+        elif "Run native Pi shell probe" in prompt_text and not has_native_bash_result:
+            chunks = [
+                sse_chunk({"role": "assistant", "tool_calls": [{
+                    "index": 0,
+                    "id": "call_native_bash",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": json.dumps({"command": "echo PI_NATIVE_BASH_OK"})},
+                }]}),
+                sse_chunk({}, "tool_calls"),
+            ]
+        elif "Run native Pi shell probe" in prompt_text:
+            chunks = [sse_chunk({"role": "assistant", "content": "Pi executed native bash."}), sse_chunk({}, "stop")]
         elif len(type(self).requests) == 1:
             chunks = [
                 sse_chunk({"role": "assistant", "tool_calls": [{
@@ -138,6 +155,40 @@ try:
     ).json()
     ok(all(isinstance(message.get("content"), str) for message in plain_history["messages"]),
        "text-only Pi history is converted for the existing UI")
+    native_chapter = db.create_chapter(work["id"], uid, "Native Pi chapter")
+    native = client.post(
+        "/api/agent", json={"text": "Run native Pi shell probe", "chapter_id": native_chapter["id"]},
+        headers={"Authorization": "Bearer " + token},
+    )
+    ok(native.status_code == 200 and native.json()["reply"] == "Pi executed native bash.",
+       "Pi native bash tool executes through the writing agent")
+    native_prompt = json.dumps(FakeOpenAI.requests[-1], ensure_ascii=False)
+    ok("PI_NATIVE_BASH_OK" in native_prompt, "native bash stdout returns to the model")
+    native_skill_root = os.path.join(TMP, "native-pi-skills")
+    native_skill_dir = os.path.join(native_skill_root, "native-pi-skill")
+    os.makedirs(native_skill_dir, exist_ok=True)
+    with open(os.path.join(native_skill_dir, "SKILL.md"), "w", encoding="utf-8", newline="\n") as stream:
+        stream.write(
+            "---\n"
+            "name: native-pi-skill\n"
+            "description: Native Pi Skill discovery probe\n"
+            "---\n"
+            "NATIVE_PI_SKILL_BODY\n"
+        )
+    old_pi_skill_dir = main.config.PI_AGENT_SKILL_DIR
+    main.config.PI_AGENT_SKILL_DIR = native_skill_root
+    try:
+        native_skill_chapter = db.create_chapter(work["id"], uid, "Native Pi skill chapter")
+        native_skill_response = client.post(
+            "/api/agent", json={"text": "Use native Pi Skill", "chapter_id": native_skill_chapter["id"]},
+            headers={"Authorization": "Bearer " + token},
+        )
+        ok(native_skill_response.status_code == 200, "Pi native Skill turn succeeds")
+        native_skill_prompt = json.dumps(FakeOpenAI.requests[-1], ensure_ascii=False)
+        ok("native-pi-skill" in native_skill_prompt and "Native Pi Skill discovery probe" in native_skill_prompt,
+           "PI_AGENT_SKILL_DIR is discovered by native Pi")
+    finally:
+        main.config.PI_AGENT_SKILL_DIR = old_pi_skill_dir
     runtime_root = os.path.join(TMP, "pi-local-skill")
     meta_dir = os.path.join(runtime_root, "meta-memory")
     os.makedirs(meta_dir, exist_ok=True)
@@ -185,4 +236,4 @@ finally:
     server.server_close()
     shutil.rmtree(TMP, ignore_errors=True)
 
-print("Pi Agent Core smoke test passed.")
+print("Pi Coding Agent smoke test passed.")

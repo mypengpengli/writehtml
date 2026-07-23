@@ -1,40 +1,53 @@
-# Pi Agent Core Runtime
+# Pi Coding Agent Runtime
 
-The writing agent runs on the official `@earendil-works/pi-agent-core` package,
-version `0.81.1`. Python remains the authority for authentication, works,
-chapters, revisions, and the allowlisted writing tools.
+The writing agent runs on the official `@earendil-works/pi-coding-agent`
+package, version `0.81.1`. Python remains the authority for application
+authentication, works, chapters, revisions, and the writing-specific database
+tools.
 
-## Execution Boundary
+## Native Pi Capabilities
 
-- Pi owns the model loop, transcript state, sequential tool scheduling, and
-  per-conversation session identity.
-- `pi_runtime/bridge.mjs` is a JSONL stdio transport. It never exposes a shell
-  or an arbitrary command tool to the model.
-- `pi_agent.py` launches one bridge process per request, routes only declared
-  writing tools back to Python, and kills the process at timeout.
-- Pi-native messages are persisted in `agent_conversations`; the HTTP API
-  translates them to the existing `user`, `assistant`, and `tool` UI format.
+- `pi_runtime/bridge.mjs` creates an official Pi Coding Agent session for each
+  web turn.
+- All native Pi tools are enabled: `read`, `bash`, `edit`, `write`, `grep`,
+  `find`, and `ls`.
+- Pi's normal project/global Skill discovery, `SKILL.md` invocation, extension
+  loading, package loading, and project context files are enabled. Project
+  resources are trusted intentionally for this agent runtime.
+- The native tool working directory is `PI_AGENT_WORKSPACE_DIR` (the app
+  project directory by default). Pi's normal global agent directory is still
+  controlled by `PI_CODING_AGENT_DIR` or `~/.pi/agent`.
+- `PI_AGENT_SKILL_DIR`, when configured, is added to Pi's normal Skill search
+  paths; it does not replace Pi's other Skill locations.
 
-## Skills
+## Writing Bridge
 
-The agent first receives only the Skill catalog. `activate_skill` returns the
-full `SKILL.md` only for the current Pi turn; `read_skill_resource` does the
-same for imported text resources. These private system additions are removed
-before the Pi transcript is persisted.
+The existing writing tools are extra Pi custom tools. They keep the editor and
+SQLite contracts intact while Pi remains free to use its native capabilities.
+`activate_skill` and `read_skill_resource` only access Skills imported into the
+application database; their private rule text is added for the current turn
+and is not persisted in chat history.
+
+## Local Launcher Lifecycle
+
+The optional meta-memory launcher is separate from Pi's native Skills. It runs
+only when both `AGENT_SKILL_DIR` and `AGENT_SKILL_LAUNCHER` are configured, and
+then preserves its `before -> model -> after/recovery` protocol. Setting only a
+Pi Skill directory leaves native Pi Skill loading active without attempting the
+launcher lifecycle.
 
 ## Voice Input
 
-Pi Agent Core's public model contract accepts text and images. For the existing
-direct-voice feature, the bridge provides a narrow OpenAI-compatible
-`input_audio` stream adapter while Pi still owns the Agent loop and tool calls.
-The audio payload is stripped before the Pi transcript is returned or saved.
-Models and gateways still need to support OpenAI-compatible audio input; users
-can switch off direct delivery to use the transcription path instead.
+Pi's public model contract represents text and images. For the existing
+direct-voice feature, the bridge provides an OpenAI-compatible `input_audio`
+adapter while retaining the same Pi Coding Agent session, native tools, and
+loaded resources. The raw audio payload is removed before the transcript is
+returned or stored.
 
 ## Verification
 
 ```bash
 npm ci --ignore-scripts --prefix pi_runtime
-python test_pi_runtime.py
-python test_smoke.py
+.venv\Scripts\python.exe test_pi_runtime.py
+.venv\Scripts\python.exe test_smoke.py
 ```

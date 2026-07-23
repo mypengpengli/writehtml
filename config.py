@@ -18,9 +18,9 @@ ASR_MODEL = os.getenv("ASR_MODEL", "whisper-1")
 # SQLite 路径（Docker 里挂到数据卷）
 DB_PATH = os.getenv("DB_PATH", "writehtml.db")
 
-# 本机 Skill / launcher 运行时（可选，默认关闭）。
-# 仅服务管理员配置；用户上传的 SKILL.md 不会获得执行服务器命令的权限。
-# AGENT_SKILL_DIR 下必须存在 meta-memory/SKILL.md；每一个 Agent 回合都会重新读取它。
+# 本机 Skill / launcher 运行时（可选）。
+# 仅服务管理员配置；网页上传的 SKILL.md 不会获得执行服务器命令的权限。
+# AGENT_SKILL_DIR 下的 meta-memory/SKILL.md 会在启用 launcher 生命周期时每回合重新读取。
 AGENT_SKILL_DIR = os.getenv("AGENT_SKILL_DIR", "")
 # 安装器生成的 launcher 路径或命令，例如 /opt/meta-memory/bin/launcher。
 AGENT_SKILL_LAUNCHER = os.getenv("AGENT_SKILL_LAUNCHER", "")
@@ -35,7 +35,7 @@ AGENT_SKILL_AGENT_ID = os.getenv("AGENT_SKILL_AGENT_ID", "writehtml-writing-agen
 AGENT_SKILL_COMMAND_TIMEOUT = float(os.getenv("AGENT_SKILL_COMMAND_TIMEOUT", "30"))
 AGENT_SKILL_TOUCH_SECONDS = float(os.getenv("AGENT_SKILL_TOUCH_SECONDS", "20"))
 
-# Pi Agent Core is the production writing-agent runtime. Set PI_AGENT_ENABLED=false
+# Pi Coding Agent is the production writing-agent runtime. Set PI_AGENT_ENABLED=false
 # only for a controlled rollback while diagnosing a deployment.
 PI_AGENT_ENABLED = os.getenv("PI_AGENT_ENABLED", "true").lower() not in {"0", "false", "no"}
 PI_AGENT_NODE = os.getenv("PI_AGENT_NODE", "node")
@@ -43,7 +43,12 @@ _pi_bridge = os.getenv("PI_AGENT_BRIDGE", os.path.join("pi_runtime", "bridge.mjs
 PI_AGENT_BRIDGE = _pi_bridge if os.path.isabs(_pi_bridge) else os.path.join(ROOT_DIR, _pi_bridge)
 PI_AGENT_TIMEOUT_SECONDS = float(os.getenv("PI_AGENT_TIMEOUT_SECONDS", "240"))
 PI_AGENT_MAX_HISTORY_MESSAGES = int(os.getenv("PI_AGENT_MAX_HISTORY_MESSAGES", "80"))
-
+# Pi Coding Agent 的本机 Skill 目录。留空时沿用 AGENT_SKILL_DIR；它会按 Pi 的
+# Agent Skills 规范扫描目录中的 SKILL.md，并由 Pi 的 read/bash 工具按需使用。
+PI_AGENT_SKILL_DIR = os.getenv("PI_AGENT_SKILL_DIR", AGENT_SKILL_DIR)
+# Pi 的 read/grep/find/ls/bash 工具的默认工作目录。相对路径相对于项目根目录解析。
+_pi_workspace = os.getenv("PI_AGENT_WORKSPACE_DIR", AGENT_SKILL_CWD or ROOT_DIR)
+PI_AGENT_WORKSPACE_DIR = _pi_workspace if os.path.isabs(_pi_workspace) else os.path.join(ROOT_DIR, _pi_workspace)
 # 服务端口（选了个基本不用的 9123，可自行改）
 PORT = int(os.getenv("PORT", "9123"))
 

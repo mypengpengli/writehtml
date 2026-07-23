@@ -1,19 +1,29 @@
 #!/usr/bin/env node
 
-// Thin stdio transport around Pi Agent Core. The Python application owns
-// authentication and tool implementations; this process only schedules tools.
+// Stdio adapter around the official Pi Coding Agent SDK.  The Python service
+// supplies writing-specific database tools; Pi keeps its normal tools,
+// resource discovery, extension loading, package loading, and session loop.
+import { existsSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import readline from "node:readline";
 import OpenAI from "openai";
-import { Agent } from "@earendil-works/pi-agent-core";
 import { AssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
-import { streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  defineTool,
+  getAgentDir,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 let started = false;
 let startRequest;
 let resolveStart;
-const startPromise = new Promise((resolve) => {
-  resolveStart = resolve;
+const startPromise = new Promise((resolveStartRequest) => {
+  resolveStart = resolveStartRequest;
 });
 const toolWaiters = new Map();
 
@@ -27,8 +37,8 @@ function messageText(error) {
 }
 
 function awaitToolResult(toolCallId) {
-  return new Promise((resolve, reject) => {
-    toolWaiters.set(toolCallId, { resolve, reject });
+  return new Promise((resolveResult, rejectResult) => {
+    toolWaiters.set(toolCallId, { resolve: resolveResult, reject: rejectResult });
   });
 }
 
@@ -76,22 +86,19 @@ function publicToolResult(result) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return result ?? {};
   const copy = { ...result };
   delete copy._pi_system;
+  delete copy._writehtmlBridge;
   return copy;
 }
 
-function createModel(request) {
-  return {
-    id: request.model,
-    name: request.model,
-    api: "openai-completions",
-    provider: "openai",
-    baseUrl: request.baseUrl,
-    reasoning: false,
-    input: ["text", "image"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: request.contextWindow || 128000,
-    maxTokens: request.maxTokens || 8192,
-  };
+function workspacePath(request) {
+  const candidate = typeof request.cwd === "string" && request.cwd.trim()
+    ? resolve(request.cwd)
+    : process.cwd();
+  try {
+    return existsSync(candidate) && statSync(candidate).isDirectory() ? candidate : process.cwd();
+  } catch {
+    return process.cwd();
+  }
 }
 
 function contentText(content) {
@@ -167,114 +174,231 @@ function parseArguments(value) {
   }
 }
 
-// Pi Agent Core owns the loop and tool scheduling. This adapter only supplies
-// the OpenAI input_audio wire format that Pi's public text/image model type
-// deliberately does not represent yet.
-function directAudioStream(model, context, options) {
-  const stream = new AssistantMessageEventStream();
-  void (async () => {
-    const output = {
-      role: "assistant",
-      content: [],
-      api: model.api,
-      provider: model.provider,
-      model: model.id,
-      usage: {
-        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      stopReason: "stop",
-      timestamp: Date.now(),
-    };
-    try {
-      const client = new OpenAI({ apiKey: options?.apiKey, baseURL: model.baseUrl, dangerouslyAllowBrowser: true });
-      const tools = (context.tools || []).map((tool) => ({
-        type: "function",
-        function: { name: tool.name, description: tool.description, parameters: tool.parameters },
-      }));
-      const completion = await client.chat.completions.create({
+// Pi's public model type currently represents text and images, while the app
+// also supports OpenAI-compatible input_audio.  This keeps the Pi session and
+// all native tools intact for direct-audio turns.
+function directAudioStream(apiKey, fallbackBaseUrl) {
+  return (model, context, options) => {
+    const stream = new AssistantMessageEventStream();
+    void (async () => {
+      const output = {
+        role: "assistant",
+        content: [],
+        api: model.api,
+        provider: model.provider,
         model: model.id,
-        messages: toOpenAIMessageParams(context),
-        stream: true,
-        ...(tools.length ? { tools, tool_choice: "auto" } : {}),
-      }, { signal: options?.signal, maxRetries: 0 });
-      stream.push({ type: "start", partial: output });
-      let textBlock;
-      const callsByIndex = new Map();
-      let sawFinishReason = false;
-      for await (const chunk of completion) {
-        output.responseId ||= chunk.id;
-        const usage = chunk.usage;
-        if (usage) {
-          output.usage.input = usage.prompt_tokens || 0;
-          output.usage.output = usage.completion_tokens || 0;
-          output.usage.totalTokens = usage.total_tokens || output.usage.input + output.usage.output;
-        }
-        const choice = chunk.choices?.[0];
-        if (!choice) continue;
-        if (choice.finish_reason) {
-          output.stopReason = stopReason(choice.finish_reason);
-          sawFinishReason = true;
-        }
-        const delta = choice.delta || {};
-        if (typeof delta.content === "string" && delta.content) {
-          if (!textBlock) {
-            textBlock = { type: "text", text: "" };
-            output.content.push(textBlock);
-            stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+        usage: {
+          input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      };
+      try {
+        const client = new OpenAI({
+          apiKey,
+          baseURL: model.baseUrl || fallbackBaseUrl,
+          dangerouslyAllowBrowser: true,
+        });
+        const tools = (context.tools || []).map((tool) => ({
+          type: "function",
+          function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+        }));
+        const completion = await client.chat.completions.create({
+          model: model.id,
+          messages: toOpenAIMessageParams(context),
+          stream: true,
+          ...(tools.length ? { tools, tool_choice: "auto" } : {}),
+        }, { signal: options?.signal, maxRetries: 0 });
+        stream.push({ type: "start", partial: output });
+        let textBlock;
+        const callsByIndex = new Map();
+        let sawFinishReason = false;
+        for await (const chunk of completion) {
+          output.responseId ||= chunk.id;
+          const usage = chunk.usage;
+          if (usage) {
+            output.usage.input = usage.prompt_tokens || 0;
+            output.usage.output = usage.completion_tokens || 0;
+            output.usage.totalTokens = usage.total_tokens || output.usage.input + output.usage.output;
           }
-          textBlock.text += delta.content;
-          stream.push({ type: "text_delta", contentIndex: output.content.indexOf(textBlock), delta: delta.content, partial: output });
-        }
-        for (const toolCall of delta.tool_calls || []) {
-          const index = typeof toolCall.index === "number" ? toolCall.index : 0;
-          let block = callsByIndex.get(index);
-          if (!block) {
-            block = { type: "toolCall", id: toolCall.id || "", name: toolCall.function?.name || "", arguments: {}, _partialArgs: "" };
-            callsByIndex.set(index, block);
-            output.content.push(block);
-            stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+          const choice = chunk.choices?.[0];
+          if (!choice) continue;
+          if (choice.finish_reason) {
+            output.stopReason = stopReason(choice.finish_reason);
+            sawFinishReason = true;
           }
-          if (toolCall.id) block.id = toolCall.id;
-          if (toolCall.function?.name) block.name = toolCall.function.name;
-          const argumentDelta = toolCall.function?.arguments || "";
-          block._partialArgs += argumentDelta;
+          const delta = choice.delta || {};
+          if (typeof delta.content === "string" && delta.content) {
+            if (!textBlock) {
+              textBlock = { type: "text", text: "" };
+              output.content.push(textBlock);
+              stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+            }
+            textBlock.text += delta.content;
+            stream.push({ type: "text_delta", contentIndex: output.content.indexOf(textBlock), delta: delta.content, partial: output });
+          }
+          for (const toolCall of delta.tool_calls || []) {
+            const index = typeof toolCall.index === "number" ? toolCall.index : 0;
+            let block = callsByIndex.get(index);
+            if (!block) {
+              block = { type: "toolCall", id: toolCall.id || "", name: toolCall.function?.name || "", arguments: {}, _partialArgs: "" };
+              callsByIndex.set(index, block);
+              output.content.push(block);
+              stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+            }
+            if (toolCall.id) block.id = toolCall.id;
+            if (toolCall.function?.name) block.name = toolCall.function.name;
+            const argumentDelta = toolCall.function?.arguments || "";
+            block._partialArgs += argumentDelta;
+            block.arguments = parseArguments(block._partialArgs);
+            stream.push({ type: "toolcall_delta", contentIndex: output.content.indexOf(block), delta: argumentDelta, partial: output });
+          }
+        }
+        if (!sawFinishReason) throw new Error("Audio model stream ended without finish_reason");
+        if (textBlock) stream.push({ type: "text_end", contentIndex: output.content.indexOf(textBlock), content: textBlock.text, partial: output });
+        for (const block of callsByIndex.values()) {
           block.arguments = parseArguments(block._partialArgs);
-          stream.push({ type: "toolcall_delta", contentIndex: output.content.indexOf(block), delta: argumentDelta, partial: output });
+          delete block._partialArgs;
+          stream.push({ type: "toolcall_end", contentIndex: output.content.indexOf(block), toolCall: block, partial: output });
         }
+        stream.push({ type: "done", reason: output.stopReason, message: output });
+        stream.end();
+      } catch (error) {
+        output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+        output.errorMessage = messageText(error);
+        stream.push({ type: "error", reason: output.stopReason, error: output });
+        stream.end();
       }
-      if (!sawFinishReason) throw new Error("Audio model stream ended without finish_reason");
-      if (textBlock) stream.push({ type: "text_end", contentIndex: output.content.indexOf(textBlock), content: textBlock.text, partial: output });
-      for (const block of callsByIndex.values()) {
-        block.arguments = parseArguments(block._partialArgs);
-        delete block._partialArgs;
-        stream.push({ type: "toolcall_end", contentIndex: output.content.indexOf(block), toolCall: block, partial: output });
-      }
-      stream.push({ type: "done", reason: output.stopReason, message: output });
-      stream.end();
-    } catch (error) {
-      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-      output.errorMessage = messageText(error);
-      stream.push({ type: "error", reason: output.stopReason, error: output });
-      stream.end();
-    }
-  })();
-  return stream;
+    })();
+    return stream;
+  };
 }
 
-function createTool(spec) {
-  return {
+function createWritingTool(spec) {
+  const parameters = spec && typeof spec.parameters === "object" && !Array.isArray(spec.parameters)
+    ? spec.parameters
+    : { type: "object", properties: {} };
+  return defineTool({
     name: spec.name,
     label: spec.label || spec.name,
     description: spec.description || spec.name,
-    parameters: Type.Unsafe(spec.parameters || { type: "object", properties: {} }),
+    promptSnippet: `${spec.name}: ${spec.description || spec.name}`,
+    parameters: Type.Unsafe(parameters),
     executionMode: "sequential",
     async execute(toolCallId, params) {
       emit({ type: "tool_call", toolCallId, name: spec.name, args: params || {} });
       const result = await awaitToolResult(toolCallId);
-      return { content: textContent(publicToolResult(result)), details: result ?? {} };
+      const details = result && typeof result === "object" && !Array.isArray(result)
+        ? { ...result, _writehtmlBridge: true }
+        : { value: result, _writehtmlBridge: true };
+      return { content: textContent(publicToolResult(result)), details };
     },
+  });
+}
+
+function installWritingToolLifecycle(session) {
+  const pendingSystemPrompts = [];
+  const previousAfterToolCall = session.agent.afterToolCall;
+  const previousPrepareNextTurn = session.agent.prepareNextTurnWithContext;
+
+  session.agent.afterToolCall = async (context, signal) => {
+    const details = context.result?.details;
+    if (!details || typeof details !== "object" || !details._writehtmlBridge) {
+      return previousAfterToolCall ? previousAfterToolCall(context, signal) : undefined;
+    }
+    if (typeof details._pi_system === "string" && details._pi_system) {
+      pendingSystemPrompts.push(details._pi_system);
+    }
+    const publicDetails = publicToolResult(details);
+    return {
+      content: textContent(publicDetails),
+      details: publicDetails,
+      isError: Boolean(publicDetails && typeof publicDetails === "object" && publicDetails.error),
+    };
   };
+
+  session.agent.prepareNextTurnWithContext = async (turn, signal) => {
+    const prepared = previousPrepareNextTurn ? await previousPrepareNextTurn(turn, signal) : undefined;
+    if (!pendingSystemPrompts.length) return prepared;
+    const additions = pendingSystemPrompts.splice(0).join("\n\n");
+    const context = prepared?.context || turn.context;
+    return {
+      ...(prepared || {}),
+      context: {
+        ...context,
+        systemPrompt: context.systemPrompt
+          ? `${context.systemPrompt}\n\n${additions}`
+          : additions,
+      },
+    };
+  };
+}
+
+async function createPiSession(request) {
+  const cwd = workspacePath(request);
+  const agentDir = typeof request.agentDir === "string" && request.agentDir.trim()
+    ? resolve(request.agentDir)
+    : getAgentDir();
+  const skillDirs = Array.isArray(request.skillDirs)
+    ? request.skillDirs.filter((path) => typeof path === "string" && path.trim())
+    : [];
+  const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
+  const resourceLoader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    additionalSkillPaths: skillDirs,
+    appendSystemPrompt: request.systemPrompt ? [String(request.systemPrompt)] : [],
+  });
+  await resourceLoader.reload();
+
+  const providerId = "writehtml-openai-compatible";
+  const modelRuntime = await ModelRuntime.create();
+  modelRuntime.registerProvider(providerId, {
+    name: "WriteHTML OpenAI compatible",
+    baseUrl: request.baseUrl,
+    api: "openai-completions",
+    apiKey: request.apiKey,
+    authHeader: true,
+    models: [{
+      id: request.model,
+      name: request.model,
+      api: "openai-completions",
+      baseUrl: request.baseUrl,
+      reasoning: false,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: request.contextWindow || 128000,
+      maxTokens: request.maxTokens || 8192,
+    }],
+  });
+  await modelRuntime.setRuntimeApiKey(providerId, request.apiKey);
+  const model = modelRuntime.getModel(providerId, request.model);
+  if (!model) throw new Error(`Pi could not resolve model ${request.model}`);
+
+  const tools = Array.isArray(request.tools)
+    ? request.tools.filter((spec) => spec && typeof spec.name === "string" && spec.name)
+    : [];
+  const { session } = await createAgentSession({
+    cwd,
+    agentDir,
+    modelRuntime,
+    model,
+    settingsManager,
+    sessionManager: SessionManager.inMemory(cwd),
+    resourceLoader,
+    customTools: tools.map(createWritingTool),
+  });
+
+  // The Pi SDK defaults to four coding tools.  This web agent deliberately
+  // enables every discovered Pi tool, including grep/find/ls and tools exposed
+  // by installed Pi extensions/packages.
+  session.setActiveToolsByName(session.getAllTools().map((tool) => tool.name));
+  session.agent.state.messages = Array.isArray(request.messages) ? request.messages : [];
+  session.agent.sessionId = String(request.sessionId || session.agent.sessionId || "writehtml-pi");
+  installWritingToolLifecycle(session);
+  return session;
 }
 
 async function run() {
@@ -284,64 +408,35 @@ async function run() {
     throw new Error("Pi bridge requires baseUrl, apiKey, and model");
   }
 
-  const pendingSystemPrompts = [];
-  const agent = new Agent({
-    initialState: {
-      systemPrompt: String(request.systemPrompt || ""),
-      model: createModel(request),
-      tools: Array.isArray(request.tools) ? request.tools.map(createTool) : [],
-      messages: Array.isArray(request.messages) ? request.messages : [],
-    },
-    streamFn: request.audio ? directAudioStream : streamSimple,
-    getApiKey: () => request.apiKey,
-    sessionId: request.sessionId,
-    toolExecution: "sequential",
-    afterToolCall: async ({ result }) => {
-      const details = result.details;
-      if (details && typeof details === "object" && !Array.isArray(details) && typeof details._pi_system === "string") {
-        pendingSystemPrompts.push(details._pi_system);
-      }
-      const publicDetails = publicToolResult(details);
-      return {
-        content: textContent(publicDetails),
-        details: publicDetails,
-        isError: Boolean(publicDetails && typeof publicDetails === "object" && publicDetails.error),
-      };
-    },
-    prepareNextTurnWithContext: async ({ context }) => {
-      if (!pendingSystemPrompts.length) return undefined;
-      const additions = pendingSystemPrompts.splice(0).join("\n\n");
-      return {
-        context: {
-          ...context,
-          systemPrompt: context.systemPrompt
-            ? `${context.systemPrompt}\n\n${additions}`
-            : additions,
-        },
-      };
-    },
-  });
-
-  const prompt = request.audio
-    ? {
+  let session;
+  try {
+    session = await createPiSession(request);
+    if (request.audio) {
+      session.agent.streamFunction = directAudioStream(request.apiKey, request.baseUrl);
+      await session.agent.prompt({
         role: "user",
         content: [{ type: "text", text: String(request.prompt || "[voice] Voice instruction") }],
         timestamp: Date.now(),
         _writehtmlAudio: request.audio,
-      }
-    : String(request.prompt || "");
-  await agent.prompt(prompt);
-  const messages = agent.state.messages.map((message) => {
-    if (!message || typeof message !== "object" || !message._writehtmlAudio) return message;
-    const clean = { ...message };
-    delete clean._writehtmlAudio;
-    return clean;
-  });
-  const finalAssistant = [...messages].reverse().find((message) => message.role === "assistant");
-  if (finalAssistant?.stopReason === "error" || finalAssistant?.stopReason === "aborted") {
-    throw new Error(finalAssistant.errorMessage || "Pi model request failed");
+      });
+    } else {
+      await session.prompt(String(request.prompt || ""));
+    }
+
+    const messages = session.agent.state.messages.map((message) => {
+      if (!message || typeof message !== "object" || !message._writehtmlAudio) return message;
+      const clean = { ...message };
+      delete clean._writehtmlAudio;
+      return clean;
+    });
+    const finalAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+    if (finalAssistant?.stopReason === "error" || finalAssistant?.stopReason === "aborted") {
+      throw new Error(finalAssistant.errorMessage || "Pi model request failed");
+    }
+    emit({ type: "done", messages });
+  } finally {
+    session?.dispose();
   }
-  emit({ type: "done", messages });
 }
 
 run().catch((error) => {

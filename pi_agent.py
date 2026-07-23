@@ -1,4 +1,4 @@
-"""Host-side transport for the official Pi Agent Core runtime."""
+"""Host-side transport for the official Pi Coding Agent runtime."""
 import json
 import os
 import queue
@@ -29,7 +29,7 @@ def _write_command(process, command):
 
 
 def run_turn(request, execute_tool, timeout=None):
-    """Run one isolated Pi Agent Core process and broker its tool calls."""
+    """Run one isolated official Pi Coding Agent process and broker app tools."""
     timeout = float(timeout or config.PI_AGENT_TIMEOUT_SECONDS)
     command = [config.PI_AGENT_NODE, config.PI_AGENT_BRIDGE]
     runtime_dir = os.path.dirname(config.PI_AGENT_BRIDGE)
@@ -47,7 +47,7 @@ def run_turn(request, execute_tool, timeout=None):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except OSError as exc:
-        raise PiAgentError(f"Unable to start Pi Agent Core ({command[0]}): {exc}") from exc
+        raise PiAgentError(f"Unable to start Pi Coding Agent ({command[0]}): {exc}") from exc
 
     events = queue.Queue()
     for kind, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
@@ -59,7 +59,7 @@ def run_turn(request, execute_tool, timeout=None):
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise PiAgentError(f"Pi Agent Core timed out after {int(timeout)} seconds")
+                raise PiAgentError(f"Pi Coding Agent timed out after {int(timeout)} seconds")
             try:
                 kind, line = events.get(timeout=min(remaining, 0.5))
             except queue.Empty:

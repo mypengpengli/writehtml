@@ -29,7 +29,9 @@ class SkillRuntimeError(RuntimeError):
 
 
 def is_enabled():
-    return bool(config.AGENT_SKILL_DIR or config.AGENT_SKILL_LAUNCHER)
+    # A Pi Skill directory by itself is valid and is loaded by Pi's native
+    # resource loader. The separate before/after launcher lifecycle needs both.
+    return bool(config.AGENT_SKILL_DIR and config.AGENT_SKILL_LAUNCHER)
 
 
 def _json_write(path, payload):
