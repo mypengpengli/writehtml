@@ -24,6 +24,10 @@ db.init_db()
 async def add_browser_permission_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("Permissions-Policy", "microphone=(self)")
+    # HTML 引用了带版本号的前端资源；入口和未指纹化资源仍要求浏览器每次校验，
+    # 避免发布瞬间出现新 HTML 配旧 CSS/JS 的混合版本。
+    if request.url.path in {"/", "/index.html", "/style.css", "/app.js"}:
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
