@@ -5,11 +5,18 @@ import time
 import json
 import secrets
 import hashlib
+import re
+from datetime import datetime
 from contextlib import contextmanager
 
 import config
 
 DB_PATH = config.DB_PATH
+
+
+def _content_fingerprint(content):
+    """Stable source identifier for analysis outputs created from chapter prose."""
+    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
 
 
 # 人物的基础设定仍存放在 entities；下面这些字段只描述“截至某一章”的动态状态。
@@ -35,6 +42,17 @@ PLOT_STATE_LABELS = {
     "next_goal": "下一章目标", "notes": "补充",
 }
 WORKFLOW_STATUSES = ("planning", "drafting", "review", "final")
+STORY_MEMORY_TYPES = (
+    "event", "fact", "knowledge", "relationship_change", "item_change",
+    "location_change", "ability_change", "world_rule", "promise", "secret",
+)
+STORY_MEMORY_STATUSES = ("proposed", "confirmed", "rejected", "stale")
+STORY_MEMORY_TYPE_LABELS = {
+    "event": "重要事件", "fact": "明确事实", "knowledge": "知情变化",
+    "relationship_change": "关系变化", "item_change": "物品变化",
+    "location_change": "地点变化", "ability_change": "能力变化",
+    "world_rule": "世界规则", "promise": "承诺/任务", "secret": "重要秘密",
+}
 
 
 def normalize_character_state(state, base=None):
@@ -117,10 +135,142 @@ def _add_col(conn, table, col, decl):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
+def _migration_story_memory_and_provenance(conn):
+    """V2 foundation: source-aware chapter analysis and confirmed story memories."""
+    _add_col(conn, "chapters", "content_hash", "TEXT DEFAULT ''")
+    _add_col(conn, "chapters", "content_revision", "INTEGER DEFAULT 1")
+    _add_col(conn, "chapters", "analysis_status", "TEXT DEFAULT 'fresh'")
+    _add_col(conn, "chapters", "analysis_reason", "TEXT DEFAULT ''")
+    _add_col(conn, "chapters", "analysis_checked_at", "REAL")
+    _add_col(conn, "entity_state_versions", "source_content_hash", "TEXT DEFAULT ''")
+    _add_col(conn, "entity_state_versions", "stale", "INTEGER DEFAULT 0")
+    _add_col(conn, "entity_state_proposals", "source_content_hash", "TEXT DEFAULT ''")
+    _add_col(conn, "plot_state_versions", "source_content_hash", "TEXT DEFAULT ''")
+    _add_col(conn, "plot_state_versions", "stale", "INTEGER DEFAULT 0")
+    _add_col(conn, "plot_state_proposals", "source_content_hash", "TEXT DEFAULT ''")
+    _add_col(conn, "chapter_consistency_alerts", "source_content_hash", "TEXT DEFAULT ''")
+    _add_col(conn, "chapter_consistency_alerts", "stale", "INTEGER DEFAULT 0")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS story_memory_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_id INTEGER NOT NULL,
+            chapter_id INTEGER NOT NULL,
+            memory_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            evidence TEXT DEFAULT '',
+            importance INTEGER NOT NULL DEFAULT 3,
+            status TEXT NOT NULL DEFAULT 'proposed',
+            source_content_hash TEXT DEFAULT '',
+            source_content_revision INTEGER DEFAULT 0,
+            stale INTEGER NOT NULL DEFAULT 0,
+            confirmed_at REAL,
+            resolved_at REAL,
+            created_at REAL,
+            updated_at REAL,
+            FOREIGN KEY(work_id) REFERENCES works(id),
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+        );
+        CREATE TABLE IF NOT EXISTS story_memory_entity_refs (
+            memory_id INTEGER NOT NULL,
+            entity_id INTEGER NOT NULL,
+            PRIMARY KEY(memory_id, entity_id),
+            FOREIGN KEY(memory_id) REFERENCES story_memory_items(id),
+            FOREIGN KEY(entity_id) REFERENCES entities(id)
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS story_memory_fts USING fts5(
+            title,
+            content,
+            evidence,
+            keywords,
+            tokenize='trigram'
+        );
+        CREATE INDEX IF NOT EXISTS idx_story_memory_work_chapter_status
+            ON story_memory_items(work_id, chapter_id, status, stale, importance DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_story_memory_refs_entity
+            ON story_memory_entity_refs(entity_id, memory_id);
+        """
+    )
+    rows = conn.execute(
+        "SELECT id, content, content_hash, content_revision, analysis_status FROM chapters"
+    ).fetchall()
+    for row in rows:
+        content = row["content"] or ""
+        fingerprint = row["content_hash"] or _content_fingerprint(content)
+        revision = row["content_revision"] or 1
+        status = row["analysis_status"] or ("needs_review" if content.strip() else "fresh")
+        conn.execute(
+            "UPDATE chapters SET content_hash=?, content_revision=?, analysis_status=? WHERE id=?",
+            (fingerprint, revision, status, row["id"]),
+        )
+
+
+_MIGRATIONS = (
+    (1, "baseline_schema", lambda conn: None),
+    (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
+)
+
+
+def _backup_before_migration(conn):
+    """Use SQLite's backup API so a pending schema migration never touches the only copy."""
+    base_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    backup_dir = os.path.join(base_dir, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = os.path.join(backup_dir, f"writehtml-before-migration-{stamp}.db")
+    suffix = 1
+    while os.path.exists(target):
+        target = os.path.join(backup_dir, f"writehtml-before-migration-{stamp}-{suffix}.db")
+        suffix += 1
+    backup = sqlite3.connect(target)
+    try:
+        conn.backup(backup)
+    finally:
+        backup.close()
+    return target
+
+
+def _pending_migrations(conn):
+    try:
+        applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
+    except sqlite3.OperationalError:
+        applied = set()
+    return [migration for migration in _MIGRATIONS if migration[0] not in applied]
+
+
+def _run_migrations(conn, had_database, backup_done=False):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at REAL NOT NULL)"
+    )
+    pending = _pending_migrations(conn)
+    if pending and had_database and not backup_done:
+        _backup_before_migration(conn)
+    for version, name, apply in pending:
+        apply(conn)
+        conn.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)",
+            (version, name, time.time()),
+        )
+
+
 def init_db():
     parent = os.path.dirname(DB_PATH)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    had_database = os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0
+    # A legacy database can need old additive columns before the formal V2 migration
+    # runs. Back it up first, before any CREATE/ALTER statement touches that file.
+    backup_done = False
+    if had_database:
+        preflight = sqlite3.connect(DB_PATH)
+        try:
+            if _pending_migrations(preflight):
+                _backup_before_migration(preflight)
+                backup_done = True
+        finally:
+            preflight.close()
     with get_conn() as conn:
         conn.executescript(
             """
@@ -347,6 +497,7 @@ def init_db():
         _add_col(conn, "chapters", "branch_of_chapter_id", "INTEGER")
         _add_col(conn, "chapters", "branch_from_revision_id", "INTEGER")
         _add_col(conn, "chapter_revisions", "label", "TEXT DEFAULT ''")
+        _run_migrations(conn, had_database, backup_done=backup_done)
         _bootstrap_admin(conn)
 
 
@@ -543,6 +694,7 @@ def admin_delete_user(user_id):
             conn.execute("DELETE FROM plot_state_versions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM plot_state_proposals WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=?", (cid,))
+            _delete_story_memories_for_chapter(conn, cid)
         # 章节以上的作品级数据 + 该用户的无章节对话 + 设置 + 账号本身
         conn.execute("DELETE FROM chapters WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entity_state_versions WHERE entity_id IN "
@@ -681,6 +833,7 @@ def delete_work(wid, user_id):
             conn.execute("DELETE FROM plot_state_versions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM plot_state_proposals WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=?", (cid,))
+            _delete_story_memories_for_chapter(conn, cid)
         conn.execute("DELETE FROM chapters WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entity_state_versions WHERE entity_id IN (SELECT id FROM entities WHERE work_id=?)", (wid,))
         conn.execute("DELETE FROM entity_state_proposals WHERE entity_id IN (SELECT id FROM entities WHERE work_id=?)", (wid,))
@@ -738,6 +891,9 @@ def _state_version_payload(row):
         return None
     item = dict(row)
     item["state"] = _decode_character_state(item.pop("state_json", "{}"))
+    item["source_current"] = not bool(item.get("source_content_hash")) or bool(item.get("source_hash_matches", 1))
+    item["is_stale"] = bool(item.get("stale")) or not item["source_current"]
+    item.pop("source_hash_matches", None)
     return item
 
 
@@ -746,6 +902,9 @@ def _state_proposal_payload(row):
         return None
     item = dict(row)
     item["state"] = _decode_character_state(item.pop("state_json", "{}"))
+    item["source_current"] = not bool(item.get("source_content_hash")) or bool(item.get("source_hash_matches", 1))
+    item["is_stale"] = not item["source_current"]
+    item.pop("source_hash_matches", None)
     return item
 
 
@@ -774,6 +933,520 @@ def _chapter_for_work(conn, cid, wid):
     return dict(row) if row else None
 
 
+# ---------- 故事记忆（正文派生、作者确认、可追溯）----------
+
+def _chapter_memory_source(conn, cid, wid):
+    row = conn.execute(
+        "SELECT id, work_id, title, ord, content_hash, content_revision, analysis_status, "
+        "analysis_reason, analysis_checked_at FROM chapters "
+        "WHERE id=? AND work_id=? AND deleted_at IS NULL",
+        (cid, wid),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _memory_payload(conn, row):
+    if not row:
+        return None
+    item = dict(row)
+    refs = conn.execute(
+        "SELECT e.id, e.name FROM story_memory_entity_refs r "
+        "JOIN entities e ON e.id=r.entity_id WHERE r.memory_id=? ORDER BY e.name, e.id",
+        (item["id"],),
+    ).fetchall()
+    item["entity_ids"] = [ref["id"] for ref in refs]
+    item["entity_names"] = [ref["name"] for ref in refs]
+    item["source_current"] = not bool(item.get("source_content_hash")) or bool(item.get("source_hash_matches", 1))
+    item["is_stale"] = bool(item.get("stale")) or not item["source_current"]
+    item.pop("source_hash_matches", None)
+    return item
+
+
+def _normalize_story_memory(item):
+    item = item if isinstance(item, dict) else {}
+    memory_type = (item.get("memory_type") or "fact").strip().lower()
+    if memory_type not in STORY_MEMORY_TYPES:
+        return {"invalid_type": True}
+    title = (item.get("title") or "").strip()[:240]
+    content = (item.get("content") or "").strip()[:4000]
+    if not title or not content:
+        return {"invalid": True}
+    try:
+        importance = int(item.get("importance", 3))
+    except (TypeError, ValueError):
+        importance = 3
+    entity_ids = item.get("entity_ids")
+    if entity_ids is None and item.get("entity_id") is not None:
+        entity_ids = [item.get("entity_id")]
+    if not isinstance(entity_ids, list):
+        entity_ids = []
+    normalized_ids = []
+    for value in entity_ids[:12]:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0 and value not in normalized_ids:
+            normalized_ids.append(value)
+    entity_names = item.get("entity_names")
+    if entity_names is None and item.get("entity_name"):
+        entity_names = [item.get("entity_name")]
+    if not isinstance(entity_names, list):
+        entity_names = []
+    normalized_names = []
+    for value in entity_names[:12]:
+        name = str(value or "").strip()[:160]
+        if name and name not in normalized_names:
+            normalized_names.append(name)
+    return {
+        "memory_type": memory_type,
+        "title": title,
+        "content": content,
+        "evidence": (item.get("evidence") or "").strip()[:1600],
+        "importance": max(1, min(5, importance)),
+        "entity_ids": normalized_ids,
+        "entity_names": normalized_names,
+    }
+
+
+def _resolve_memory_entities(conn, wid, entity_ids, entity_names):
+    resolved = []
+    for eid in entity_ids:
+        row = conn.execute("SELECT id FROM entities WHERE id=? AND work_id=?", (eid, wid)).fetchone()
+        if row and row["id"] not in resolved:
+            resolved.append(row["id"])
+    for name in entity_names:
+        row = conn.execute(
+            "SELECT id FROM entities WHERE work_id=? AND name=? ORDER BY id LIMIT 1", (wid, name)
+        ).fetchone()
+        if row and row["id"] not in resolved:
+            resolved.append(row["id"])
+    return resolved
+
+
+def _sync_story_memory_fts(conn, memory_id):
+    row = conn.execute(
+        "SELECT m.title, m.content, m.evidence, GROUP_CONCAT(e.name, ' ') AS entity_names "
+        "FROM story_memory_items m "
+        "LEFT JOIN story_memory_entity_refs r ON r.memory_id=m.id "
+        "LEFT JOIN entities e ON e.id=r.entity_id WHERE m.id=? GROUP BY m.id",
+        (memory_id,),
+    ).fetchone()
+    conn.execute("DELETE FROM story_memory_fts WHERE rowid=?", (memory_id,))
+    if row:
+        conn.execute(
+            "INSERT INTO story_memory_fts(rowid,title,content,evidence,keywords) VALUES(?,?,?,?,?)",
+            (memory_id, row["title"], row["content"], row["evidence"], row["entity_names"] or ""),
+        )
+
+
+def _set_story_memory_entities(conn, memory_id, entity_ids):
+    conn.execute("DELETE FROM story_memory_entity_refs WHERE memory_id=?", (memory_id,))
+    for eid in entity_ids:
+        conn.execute(
+            "INSERT OR IGNORE INTO story_memory_entity_refs(memory_id,entity_id) VALUES(?,?)",
+            (memory_id, eid),
+        )
+    _sync_story_memory_fts(conn, memory_id)
+
+
+def _delete_story_memories_for_chapter(conn, cid):
+    memory_ids = [row["id"] for row in conn.execute(
+        "SELECT id FROM story_memory_items WHERE chapter_id=?", (cid,)
+    )]
+    if not memory_ids:
+        return
+    marks = ",".join("?" for _ in memory_ids)
+    conn.execute("DELETE FROM story_memory_fts WHERE rowid IN (" + marks + ")", memory_ids)
+    conn.execute("DELETE FROM story_memory_entity_refs WHERE memory_id IN (" + marks + ")", memory_ids)
+    conn.execute("DELETE FROM story_memory_items WHERE id IN (" + marks + ")", memory_ids)
+
+
+def _delete_story_memories_for_work(conn, wid):
+    memory_ids = [row["id"] for row in conn.execute(
+        "SELECT id FROM story_memory_items WHERE work_id=?", (wid,)
+    )]
+    if not memory_ids:
+        return
+    marks = ",".join("?" for _ in memory_ids)
+    conn.execute("DELETE FROM story_memory_fts WHERE rowid IN (" + marks + ")", memory_ids)
+    conn.execute("DELETE FROM story_memory_entity_refs WHERE memory_id IN (" + marks + ")", memory_ids)
+    conn.execute("DELETE FROM story_memory_items WHERE id IN (" + marks + ")", memory_ids)
+
+
+_STORY_MEMORY_SELECT = (
+    "SELECT m.id, m.work_id, m.chapter_id, m.memory_type, m.title, m.content, m.evidence, "
+    "m.importance, m.status, m.source_content_hash, m.source_content_revision, m.stale, "
+    "m.confirmed_at, m.resolved_at, m.created_at, m.updated_at, c.title AS chapter_title, "
+    "c.ord AS chapter_ord, CASE WHEN m.source_content_hash='' OR m.source_content_hash=c.content_hash "
+    "THEN 1 ELSE 0 END AS source_hash_matches "
+    "FROM story_memory_items m JOIN chapters c ON c.id=m.chapter_id "
+)
+
+
+def _story_memory_where(wid, at_chapter_id=None, statuses=None, memory_types=None, include_stale=True):
+    clauses = ["m.work_id=?", "c.deleted_at IS NULL"]
+    params = [wid]
+    if at_chapter_id is not None:
+        clauses.append("c.ord <= (SELECT ord FROM chapters WHERE id=? AND work_id=? AND deleted_at IS NULL)")
+        params.extend([at_chapter_id, wid])
+    if statuses:
+        values = [value for value in statuses if value in STORY_MEMORY_STATUSES]
+        if values:
+            clauses.append("m.status IN (" + ",".join("?" for _ in values) + ")")
+            params.extend(values)
+    if memory_types:
+        values = [value for value in memory_types if value in STORY_MEMORY_TYPES]
+        if values:
+            clauses.append("m.memory_type IN (" + ",".join("?" for _ in values) + ")")
+            params.extend(values)
+    if not include_stale:
+        clauses.extend(["m.stale=0", "(m.source_content_hash='' OR m.source_content_hash=c.content_hash)"])
+    return " WHERE " + " AND ".join(clauses), params
+
+
+def list_story_memories(wid, user_id, at_chapter_id=None, statuses=None, memory_types=None,
+                        include_stale=True, limit=200):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if at_chapter_id is not None and not _chapter_for_work(conn, at_chapter_id, wid):
+            return {"invalid_chapter": True}
+        where, params = _story_memory_where(wid, at_chapter_id, statuses, memory_types, include_stale)
+        rows = conn.execute(
+            _STORY_MEMORY_SELECT + where + " ORDER BY c.ord DESC, m.importance DESC, m.id DESC LIMIT ?",
+            (*params, max(1, min(int(limit or 200), 500))),
+        ).fetchall()
+        return [_memory_payload(conn, row) for row in rows]
+
+
+def get_story_memory_overview(wid, user_id, at_chapter_id=None):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        target = _chapter_memory_source(conn, at_chapter_id, wid) if at_chapter_id is not None else None
+        if at_chapter_id is not None and not target:
+            return {"invalid_chapter": True}
+        where, params = _story_memory_where(wid, at_chapter_id, include_stale=True)
+        rows = conn.execute(
+            _STORY_MEMORY_SELECT + where + " ORDER BY c.ord DESC, m.importance DESC, m.id DESC LIMIT 300",
+            params,
+        ).fetchall()
+        memories = [_memory_payload(conn, row) for row in rows]
+        chapter_memories = [item for item in memories if target and item["chapter_id"] == target["id"]]
+        return {
+            "target_chapter": target,
+            "proposals": [item for item in chapter_memories if item["status"] == "proposed" and not item["is_stale"]],
+            "confirmed": [item for item in memories if item["status"] == "confirmed" and not item["is_stale"]],
+            "stale": [item for item in memories if item["is_stale"] or item["status"] == "stale"],
+            "chapter_memories": chapter_memories,
+            "counts": {
+                "proposed": sum(1 for item in chapter_memories if item["status"] == "proposed" and not item["is_stale"]),
+                "confirmed": sum(1 for item in memories if item["status"] == "confirmed" and not item["is_stale"]),
+                "stale": sum(1 for item in memories if item["is_stale"] or item["status"] == "stale"),
+            },
+        }
+
+
+def upsert_story_memory_proposal(wid, user_id, chapter_id, item):
+    now = time.time()
+    normalized = _normalize_story_memory(item)
+    if normalized.get("invalid") or normalized.get("invalid_type"):
+        return normalized
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        chapter_source = _chapter_memory_source(conn, chapter_id, wid)
+        if not chapter_source:
+            return {"invalid_chapter": True}
+        entity_ids = _resolve_memory_entities(
+            conn, wid, normalized["entity_ids"], normalized["entity_names"]
+        )
+        existing = conn.execute(
+            "SELECT id FROM story_memory_items WHERE work_id=? AND chapter_id=? AND memory_type=? "
+            "AND title=? AND status='proposed' ORDER BY id DESC LIMIT 1",
+            (wid, chapter_id, normalized["memory_type"], normalized["title"]),
+        ).fetchone()
+        values = (
+            normalized["content"], normalized["evidence"], normalized["importance"],
+            chapter_source["content_hash"] or _content_fingerprint(""), chapter_source["content_revision"] or 1, now,
+        )
+        if existing:
+            conn.execute(
+                "UPDATE story_memory_items SET content=?, evidence=?, importance=?, source_content_hash=?, "
+                "source_content_revision=?, stale=0, status='proposed', updated_at=?, resolved_at=NULL WHERE id=?",
+                (*values, existing["id"]),
+            )
+            memory_id = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO story_memory_items(work_id,chapter_id,memory_type,title,content,evidence,importance,"
+                "status,source_content_hash,source_content_revision,stale,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,'proposed',?,?,0,?,?)",
+                (wid, chapter_id, normalized["memory_type"], normalized["title"], *values[:-1], now, now),
+            )
+            memory_id = cur.lastrowid
+        _set_story_memory_entities(conn, memory_id, entity_ids)
+        row = conn.execute(_STORY_MEMORY_SELECT + " WHERE m.id=?", (memory_id,)).fetchone()
+        return _memory_payload(conn, row)
+
+
+def accept_story_memory(memory_id, user_id, changes=None):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            _STORY_MEMORY_SELECT + " JOIN works w ON w.id=m.work_id WHERE m.id=? AND w.user_id=?",
+            (memory_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        item = _memory_payload(conn, row)
+        if item["status"] != "proposed":
+            return {"resolved": True}
+        if item["is_stale"]:
+            conn.execute(
+                "UPDATE story_memory_items SET status='stale', stale=1, updated_at=?, resolved_at=? WHERE id=?",
+                (now, now, memory_id),
+            )
+            return {"stale": True}
+        normalized = _normalize_story_memory({**item, **(changes or {})}) if changes else None
+        if normalized and (normalized.get("invalid") or normalized.get("invalid_type")):
+            return normalized
+        if normalized:
+            entity_ids = _resolve_memory_entities(
+                conn, item["work_id"], normalized["entity_ids"], normalized["entity_names"]
+            )
+            conn.execute(
+                "UPDATE story_memory_items SET memory_type=?, title=?, content=?, evidence=?, importance=?, "
+                "status='confirmed', stale=0, confirmed_at=?, resolved_at=?, updated_at=? WHERE id=?",
+                (normalized["memory_type"], normalized["title"], normalized["content"], normalized["evidence"],
+                 normalized["importance"], now, now, now, memory_id),
+            )
+            _set_story_memory_entities(conn, memory_id, entity_ids)
+        else:
+            conn.execute(
+                "UPDATE story_memory_items SET status='confirmed', stale=0, confirmed_at=?, resolved_at=?, updated_at=? WHERE id=?",
+                (now, now, now, memory_id),
+            )
+            _sync_story_memory_fts(conn, memory_id)
+        result = conn.execute(_STORY_MEMORY_SELECT + " WHERE m.id=?", (memory_id,)).fetchone()
+        return _memory_payload(conn, result)
+
+
+def reject_story_memory(memory_id, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT m.id, m.status FROM story_memory_items m JOIN works w ON w.id=m.work_id "
+            "WHERE m.id=? AND w.user_id=?", (memory_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] != "proposed":
+            return {"resolved": True}
+        conn.execute(
+            "UPDATE story_memory_items SET status='rejected', resolved_at=?, updated_at=? WHERE id=?",
+            (now, now, memory_id),
+        )
+        return {"ok": True}
+
+
+def update_story_memory(memory_id, user_id, changes):
+    normalized = _normalize_story_memory(changes)
+    if normalized.get("invalid") or normalized.get("invalid_type"):
+        return normalized
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT m.id, m.work_id, m.status FROM story_memory_items m JOIN works w ON w.id=m.work_id "
+            "WHERE m.id=? AND w.user_id=?", (memory_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] != "confirmed":
+            return {"not_confirmed": True}
+        entity_ids = _resolve_memory_entities(
+            conn, row["work_id"], normalized["entity_ids"], normalized["entity_names"]
+        )
+        conn.execute(
+            "UPDATE story_memory_items SET memory_type=?, title=?, content=?, evidence=?, importance=?, updated_at=? WHERE id=?",
+            (normalized["memory_type"], normalized["title"], normalized["content"], normalized["evidence"],
+             normalized["importance"], now, memory_id),
+        )
+        _set_story_memory_entities(conn, memory_id, entity_ids)
+        result = conn.execute(_STORY_MEMORY_SELECT + " WHERE m.id=?", (memory_id,)).fetchone()
+        return _memory_payload(conn, result)
+
+
+def _invalidate_chapter_derived_state(conn, cid, reason="正文已修改"):
+    now = time.time()
+    conn.execute(
+        "UPDATE story_memory_items SET stale=1, status=CASE WHEN status='proposed' THEN 'stale' ELSE status END, "
+        "updated_at=?, resolved_at=CASE WHEN status='proposed' THEN ? ELSE resolved_at END WHERE chapter_id=?",
+        (now, now, cid),
+    )
+    conn.execute(
+        "UPDATE entity_state_proposals SET status='stale', updated_at=?, resolved_at=? "
+        "WHERE chapter_id=? AND status='pending'", (now, now, cid),
+    )
+    conn.execute(
+        "UPDATE plot_state_proposals SET status='stale', updated_at=?, resolved_at=? "
+        "WHERE chapter_id=? AND status='pending'", (now, now, cid),
+    )
+    conn.execute(
+        "UPDATE entity_state_versions SET stale=1 WHERE chapter_id=? AND source_content_hash<>''", (cid,))
+    conn.execute(
+        "UPDATE plot_state_versions SET stale=1 WHERE chapter_id=? AND source_content_hash<>''", (cid,))
+    conn.execute(
+        "UPDATE chapter_consistency_alerts SET stale=1, status=CASE WHEN status='open' THEN 'stale' ELSE status END, "
+        "updated_at=? WHERE chapter_id=?", (now, cid),
+    )
+    conn.execute(
+        "UPDATE chapters SET analysis_status='needs_review', analysis_reason=?, analysis_checked_at=NULL WHERE id=?",
+        ((reason or "正文已修改")[:240], cid),
+    )
+
+
+def mark_chapter_story_memory_stale(cid, user_id, reason="作者标记正文发生重大修改"):
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        chapter = conn.execute("SELECT work_id, ord FROM chapters WHERE id=?", (cid,)).fetchone()
+        _invalidate_chapter_derived_state(conn, cid, reason)
+        affected = conn.execute(
+            "SELECT COUNT(*) FROM chapters WHERE work_id=? AND deleted_at IS NULL AND ord>?",
+            (chapter["work_id"], chapter["ord"]),
+        ).fetchone()[0]
+        return {"ok": True, "later_chapters": affected}
+
+
+def mark_chapter_analysis_reviewed(cid, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        conn.execute(
+            "UPDATE chapters SET analysis_status='fresh', analysis_reason='', analysis_checked_at=? WHERE id=?",
+            (now, cid),
+        )
+        return {"ok": True, "checked_at": now}
+
+
+def _memory_fts_terms(query):
+    runs = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9_]{2,}", query or "")
+    terms = []
+    for run in runs:
+        if run not in terms:
+            terms.append(run[:80])
+        if len(run) > 6 and re.fullmatch(r"[\u4e00-\u9fff]+", run):
+            for index in range(len(run) - 2):
+                gram = run[index:index + 3]
+                if gram not in terms:
+                    terms.append(gram)
+    return terms[:12]
+
+
+def _memory_literal_terms(query):
+    """Terms FTS5's trigram tokenizer cannot reliably find (notably two CJK chars)."""
+    terms = []
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9_]{2,}", query or ""):
+        if re.fullmatch(r"[\u4e00-\u9fff]+", run):
+            candidates = [run[index:index + 2] for index in range(max(1, len(run) - 1))]
+        else:
+            candidates = [run]
+        for term in candidates:
+            if term not in terms:
+                terms.append(term[:80])
+    return terms[:16]
+
+
+def search_story_memories(wid, user_id, query="", entity_ids=None, memory_types=None,
+                          before_chapter_id=None, limit=15):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if before_chapter_id is not None and not _chapter_for_work(conn, before_chapter_id, wid):
+            return {"invalid_chapter": True}
+        clauses = ["m.work_id=?", "m.status='confirmed'", "m.stale=0", "c.deleted_at IS NULL",
+                   "(m.source_content_hash='' OR m.source_content_hash=c.content_hash)"]
+        params = [wid]
+        if before_chapter_id is not None:
+            clauses.append("c.ord <= (SELECT ord FROM chapters WHERE id=? AND work_id=? AND deleted_at IS NULL)")
+            params.extend([before_chapter_id, wid])
+        if memory_types:
+            values = [value for value in memory_types if value in STORY_MEMORY_TYPES]
+            if values:
+                clauses.append("m.memory_type IN (" + ",".join("?" for _ in values) + ")")
+                params.extend(values)
+        normalized_ids = [value for value in (entity_ids or []) if isinstance(value, int) and value > 0]
+        if normalized_ids:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM story_memory_entity_refs r WHERE r.memory_id=m.id "
+                "AND r.entity_id IN (" + ",".join("?" for _ in normalized_ids) + "))"
+            )
+            params.extend(normalized_ids)
+        terms = _memory_fts_terms(query)
+        literal_terms = _memory_literal_terms(query)
+        from_sql = "story_memory_items m JOIN chapters c ON c.id=m.chapter_id"
+        text_matches = []
+        if terms:
+            fts_query = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
+            # MATCH cannot be nested directly inside an OR in SQLite. Keep it in a
+            # subquery so FTS and the two-character CJK fallback can be combined.
+            text_matches.append("m.id IN (SELECT rowid FROM story_memory_fts WHERE story_memory_fts MATCH ?)")
+            params.append(fts_query)
+        if literal_terms:
+            text_matches.append("(" + " OR ".join(
+                "instr(m.title || ' ' || m.content || ' ' || m.evidence, ?) > 0"
+                for _ in literal_terms
+            ) + ")")
+            params.extend(literal_terms)
+        if text_matches:
+            clauses.append("(" + " OR ".join(text_matches) + ")")
+        rows = conn.execute(
+            _STORY_MEMORY_SELECT.replace("FROM story_memory_items m JOIN chapters c ON c.id=m.chapter_id", "FROM " + from_sql)
+            + " WHERE " + " AND ".join(clauses)
+            + " ORDER BY m.importance DESC, c.ord DESC, m.id DESC LIMIT ?",
+            (*params, max(1, min(int(limit or 15), 40))),
+        ).fetchall()
+        return [_memory_payload(conn, row) for row in rows]
+
+
+def list_recent_story_memories(wid, user_id, before_chapter_id=None, limit=12):
+    return search_story_memories(wid, user_id, "", before_chapter_id=before_chapter_id, limit=limit)
+
+
+def get_story_memory_source(memory_id, user_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            _STORY_MEMORY_SELECT + " JOIN works w ON w.id=m.work_id WHERE m.id=? AND w.user_id=?",
+            (memory_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        item = _memory_payload(conn, row)
+        chapter = conn.execute(
+            "SELECT id, title, ord, content, content_hash, content_revision FROM chapters WHERE id=?",
+            (item["chapter_id"],),
+        ).fetchone()
+        return {"memory": item, "chapter": dict(chapter) if chapter else None}
+
+
+def list_recent_chapter_summaries(wid, user_id, before_chapter_id=None, limit=5):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        clauses = ["work_id=?", "deleted_at IS NULL", "TRIM(COALESCE(workflow_summary, ''))<>''"]
+        params = [wid]
+        if before_chapter_id is not None:
+            if not _chapter_for_work(conn, before_chapter_id, wid):
+                return {"invalid_chapter": True}
+            clauses.append("ord <= (SELECT ord FROM chapters WHERE id=? AND work_id=? AND deleted_at IS NULL)")
+            params.extend([before_chapter_id, wid])
+        rows = conn.execute(
+            "SELECT id, title, ord, workflow_summary, content_hash, content_revision FROM chapters WHERE "
+            + " AND ".join(clauses) + " ORDER BY ord DESC LIMIT ?",
+            (*params, max(1, min(int(limit or 5), 20))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 # ---------- 剧情状态（作品级、按章节生效）----------
 
 def _plot_state_version_payload(row):
@@ -781,6 +1454,9 @@ def _plot_state_version_payload(row):
         return None
     item = dict(row)
     item["state"] = _decode_plot_state(item.pop("state_json", "{}"))
+    item["source_current"] = not bool(item.get("source_content_hash")) or bool(item.get("source_hash_matches", 1))
+    item["is_stale"] = bool(item.get("stale")) or not item["source_current"]
+    item.pop("source_hash_matches", None)
     return item
 
 
@@ -789,6 +1465,9 @@ def _plot_state_proposal_payload(row):
         return None
     item = dict(row)
     item["state"] = _decode_plot_state(item.pop("state_json", "{}"))
+    item["source_current"] = not bool(item.get("source_content_hash")) or bool(item.get("source_hash_matches", 1))
+    item["is_stale"] = not item["source_current"]
+    item.pop("source_hash_matches", None)
     return item
 
 
@@ -798,12 +1477,15 @@ def _plot_state_version_at(conn, wid, target_chapter_id, before=False):
     op = "<" if before else "<="
     row = conn.execute(
         "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-        "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+        "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+        "c.title AS chapter_title, c.ord AS chapter_ord, "
+        "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
         "FROM plot_state_versions v "
         "JOIN chapters c ON c.id=v.chapter_id "
         "JOIN chapters target ON target.id=? "
         f"WHERE v.work_id=? AND target.work_id=? AND c.deleted_at IS NULL AND target.deleted_at IS NULL "
-        f"AND c.work_id=target.work_id AND c.ord {op} target.ord "
+        f"AND c.work_id=target.work_id AND c.ord {op} target.ord AND v.stale=0 "
+        "AND (v.source_content_hash='' OR v.source_content_hash=c.content_hash) "
         "ORDER BY c.ord DESC, v.id DESC LIMIT 1",
         (target_chapter_id, wid, wid),
     ).fetchone()
@@ -821,7 +1503,9 @@ def get_plot_state_overview(wid, user_id, at_chapter_id=None):
         version = _plot_state_version_at(conn, wid, at_chapter_id)
         history_rows = conn.execute(
             "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+            "c.title AS chapter_title, c.ord AS chapter_ord, "
+            "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
             "FROM plot_state_versions v JOIN chapters c ON c.id=v.chapter_id "
             "WHERE v.work_id=? AND c.deleted_at IS NULL ORDER BY c.ord DESC, v.id DESC",
             (wid,),
@@ -829,10 +1513,12 @@ def get_plot_state_overview(wid, user_id, at_chapter_id=None):
         proposal_rows = []
         if at_chapter_id is not None:
             proposal_rows = conn.execute(
-                "SELECT id, work_id, chapter_id, state_json, change_summary, evidence, status, "
-                "created_at, updated_at, resolved_at FROM plot_state_proposals "
-                "WHERE work_id=? AND chapter_id=? "
-                "ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC",
+                "SELECT p.id, p.work_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status, "
+                "p.source_content_hash, p.created_at, p.updated_at, p.resolved_at, "
+                "CASE WHEN p.source_content_hash='' OR p.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
+                "FROM plot_state_proposals p JOIN chapters c ON c.id=p.chapter_id "
+                "WHERE p.work_id=? AND p.chapter_id=? "
+                "ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END, p.id DESC",
                 (wid, at_chapter_id),
             ).fetchall()
         work = conn.execute("SELECT id, title FROM works WHERE id=?", (wid,)).fetchone()
@@ -851,20 +1537,23 @@ def create_plot_state_version(wid, user_id, chapter_id, state, change_summary=""
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
             return None
-        if not _chapter_for_work(conn, chapter_id, wid):
+        chapter_source = _chapter_memory_source(conn, chapter_id, wid)
+        if not chapter_source:
             return {"invalid_chapter": True}
         normalized = normalize_plot_state(state)
         if not plot_state_has_content(normalized):
             return {"empty_state": True}
         cur = conn.execute(
-            "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,"
+            "source_content_hash,stale,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (wid, chapter_id, json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1400],
-             (evidence or "").strip()[:4000], source, proposal_id, now),
+             (evidence or "").strip()[:4000], source, proposal_id, "", 0, now),
         )
         row = conn.execute(
             "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+            "c.title AS chapter_title, c.ord AS chapter_ord, "
+            "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
             "FROM plot_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
             (cur.lastrowid,),
         ).fetchone()
@@ -877,7 +1566,8 @@ def autosave_plot_state_version(wid, user_id, chapter_id, state, change_summary=
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
             return None
-        if not _chapter_for_work(conn, chapter_id, wid):
+        chapter_source = _chapter_memory_source(conn, chapter_id, wid)
+        if not chapter_source:
             return {"invalid_chapter": True}
         normalized = normalize_plot_state(state)
         if not plot_state_has_content(normalized):
@@ -902,14 +1592,16 @@ def autosave_plot_state_version(wid, user_id, chapter_id, state, change_summary=
             vid = existing["id"]
         else:
             cur = conn.execute(
-                "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
-                "VALUES(?,?,?,?,?,'autosave',NULL,?)",
+                "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,"
+                "source_content_hash,stale,created_at) VALUES(?,?,?,?,?,'autosave',NULL,'',0,?)",
                 (wid, chapter_id, json.dumps(normalized, ensure_ascii=False), summary, proof, now),
             )
             vid = cur.lastrowid
         row = conn.execute(
             "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+            "c.title AS chapter_title, c.ord AS chapter_ord, "
+            "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
             "FROM plot_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
             (vid,),
         ).fetchone()
@@ -922,33 +1614,37 @@ def upsert_plot_state_proposal(wid, user_id, chapter_id, state, change_summary="
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
             return None
-        if not _chapter_for_work(conn, chapter_id, wid):
+        chapter_source = _chapter_memory_source(conn, chapter_id, wid)
+        if not chapter_source:
             return {"invalid_chapter": True}
         normalized = normalize_plot_state(state)
         if not plot_state_has_content(normalized):
             return {"empty_state": True}
         payload = (json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1400],
-                   (evidence or "").strip()[:4000], now)
+                   (evidence or "").strip()[:4000], chapter_source["content_hash"] or _content_fingerprint(""), now)
         existing = conn.execute(
             "SELECT id FROM plot_state_proposals WHERE work_id=? AND chapter_id=? AND status='pending' "
             "ORDER BY id DESC LIMIT 1", (wid, chapter_id),
         ).fetchone()
         if existing:
             conn.execute(
-                "UPDATE plot_state_proposals SET state_json=?, change_summary=?, evidence=?, updated_at=? WHERE id=?",
+                "UPDATE plot_state_proposals SET state_json=?, change_summary=?, evidence=?, source_content_hash=?, "
+                "status='pending', updated_at=?, resolved_at=NULL WHERE id=?",
                 (*payload, existing["id"]),
             )
             pid = existing["id"]
         else:
             cur = conn.execute(
-                "INSERT INTO plot_state_proposals(work_id,chapter_id,state_json,change_summary,evidence,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'pending',?,?)",
-                (wid, chapter_id, payload[0], payload[1], payload[2], now, now),
+                "INSERT INTO plot_state_proposals(work_id,chapter_id,state_json,change_summary,evidence,status,source_content_hash,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'pending',?,?,?)",
+                (wid, chapter_id, payload[0], payload[1], payload[2], payload[3], now, now),
             )
             pid = cur.lastrowid
         row = conn.execute(
-            "SELECT id, work_id, chapter_id, state_json, change_summary, evidence, status, "
-            "created_at, updated_at, resolved_at FROM plot_state_proposals WHERE id=?", (pid,)
+            "SELECT p.id, p.work_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status, "
+            "p.source_content_hash, p.created_at, p.updated_at, p.resolved_at, "
+            "CASE WHEN p.source_content_hash='' OR p.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
+            "FROM plot_state_proposals p JOIN chapters c ON c.id=p.chapter_id WHERE p.id=?", (pid,)
         ).fetchone()
         return _plot_state_proposal_payload(row)
 
@@ -957,14 +1653,22 @@ def accept_plot_state_proposal(pid, user_id, state=None, change_summary=None, ev
     now = time.time()
     with get_conn() as conn:
         proposal = conn.execute(
-            "SELECT p.id, p.work_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status "
-            "FROM plot_state_proposals p JOIN works w ON w.id=p.work_id WHERE p.id=? AND w.user_id=?",
+            "SELECT p.id, p.work_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status, "
+            "p.source_content_hash, c.content_hash FROM plot_state_proposals p "
+            "JOIN works w ON w.id=p.work_id JOIN chapters c ON c.id=p.chapter_id "
+            "WHERE p.id=? AND w.user_id=?",
             (pid, user_id),
         ).fetchone()
         if not proposal:
             return None
         if proposal["status"] != "pending":
             return {"resolved": True}
+        if proposal["source_content_hash"] and proposal["source_content_hash"] != proposal["content_hash"]:
+            conn.execute(
+                "UPDATE plot_state_proposals SET status='stale', updated_at=?, resolved_at=? WHERE id=?",
+                (now, now, pid),
+            )
+            return {"stale": True}
         previous = _decode_plot_state(proposal["state_json"])
         normalized = normalize_plot_state(state, previous)
         if not plot_state_has_content(normalized):
@@ -973,10 +1677,13 @@ def accept_plot_state_proposal(pid, user_id, state=None, change_summary=None, ev
         proof = proposal["evidence"] if evidence is None else (evidence or "").strip()[:4000]
         edited = state is not None or change_summary is not None or evidence is not None
         cur = conn.execute(
-            "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,"
+            "source_content_hash,stale,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (proposal["work_id"], proposal["chapter_id"], json.dumps(normalized, ensure_ascii=False),
-             summary, proof, "ai_edited" if edited else "ai_confirmed", pid, now),
+             summary, proof, "ai_edited" if edited else "ai_confirmed", pid,
+             # Acceptance is an author decision. Keep proposal_id for provenance, but do not
+             # make the confirmed story state disappear after the chapter is edited.
+             "", 0, now),
         )
         conn.execute(
             "UPDATE plot_state_proposals SET status='accepted', updated_at=?, resolved_at=? WHERE id=?",
@@ -984,7 +1691,9 @@ def accept_plot_state_proposal(pid, user_id, state=None, change_summary=None, ev
         )
         version = conn.execute(
             "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+            "c.title AS chapter_title, c.ord AS chapter_ord, "
+            "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
             "FROM plot_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
             (cur.lastrowid,),
         ).fetchone()
@@ -1028,12 +1737,15 @@ def _state_version_at(conn, eid, target_chapter_id, before=False):
     op = "<" if before else "<="
     row = conn.execute(
         "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-        "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+        "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+        "c.title AS chapter_title, c.ord AS chapter_ord, "
+        "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
         "FROM entity_state_versions v "
         "JOIN chapters c ON c.id=v.chapter_id "
         "JOIN chapters target ON target.id=? "
         f"WHERE v.entity_id=? AND c.deleted_at IS NULL AND target.deleted_at IS NULL "
-        f"AND c.work_id=target.work_id AND c.ord {op} target.ord "
+        f"AND c.work_id=target.work_id AND c.ord {op} target.ord AND v.stale=0 "
+        "AND (v.source_content_hash='' OR v.source_content_hash=c.content_hash) "
         "ORDER BY c.ord DESC, v.id DESC LIMIT 1",
         (target_chapter_id, eid),
     ).fetchone()
@@ -1110,10 +1822,16 @@ def delete_entity(eid, user_id):
     with get_conn() as conn:
         if not _entity_owned(conn, eid, user_id):
             return False
+        memory_ids = [row["memory_id"] for row in conn.execute(
+            "SELECT memory_id FROM story_memory_entity_refs WHERE entity_id=?", (eid,)
+        )]
         conn.execute("DELETE FROM entity_state_versions WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entity_state_proposals WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entity_relations WHERE from_entity_id=? OR to_entity_id=?", (eid, eid))
+        conn.execute("DELETE FROM story_memory_entity_refs WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entities WHERE id=?", (eid,))
+        for memory_id in memory_ids:
+            _sync_story_memory_fts(conn, memory_id)
         return True
 
 
@@ -1149,8 +1867,9 @@ def get_entity_state_overview(eid, user_id, at_chapter_id=None):
         version = _state_version_at(conn, eid, at_chapter_id)
         history_rows = conn.execute(
             "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord, "
-            "c.deleted_at AS chapter_deleted_at "
+            "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+            "c.title AS chapter_title, c.ord AS chapter_ord, c.deleted_at AS chapter_deleted_at, "
+            "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
             "FROM entity_state_versions v JOIN chapters c ON c.id=v.chapter_id "
             "WHERE v.entity_id=? ORDER BY c.ord DESC, v.id DESC",
             (eid,),
@@ -1159,8 +1878,10 @@ def get_entity_state_overview(eid, user_id, at_chapter_id=None):
         if at_chapter_id is not None:
             proposal_rows = conn.execute(
                 "SELECT p.id, p.entity_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, "
-                "p.status, p.created_at, p.updated_at, p.resolved_at "
-                "FROM entity_state_proposals p WHERE p.entity_id=? AND p.chapter_id=? "
+                "p.status, p.source_content_hash, p.created_at, p.updated_at, p.resolved_at, "
+                "CASE WHEN p.source_content_hash='' OR p.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
+                "FROM entity_state_proposals p JOIN chapters c ON c.id=p.chapter_id "
+                "WHERE p.entity_id=? AND p.chapter_id=? "
                 "ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END, p.id DESC",
                 (eid, at_chapter_id),
             ).fetchall()
@@ -1183,20 +1904,23 @@ def create_character_state_version(eid, user_id, chapter_id, state, change_summa
             return None
         if entity["kind"] != "人物":
             return {"not_character": True}
-        if not _chapter_for_work(conn, chapter_id, entity["work_id"]):
+        chapter_source = _chapter_memory_source(conn, chapter_id, entity["work_id"])
+        if not chapter_source:
             return {"invalid_chapter": True}
         normalized = normalize_character_state(state)
         if not character_state_has_content(normalized):
             return {"empty_state": True}
         cur = conn.execute(
-            "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,"
+            "source_content_hash,stale,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (eid, chapter_id, json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1000],
-             (evidence or "").strip()[:3000], source, proposal_id, now),
+             (evidence or "").strip()[:3000], source, proposal_id, "", 0, now),
         )
         row = conn.execute(
             "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+            "c.title AS chapter_title, c.ord AS chapter_ord, "
+            "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
             "FROM entity_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
             (cur.lastrowid,),
         ).fetchone()
@@ -1212,33 +1936,37 @@ def upsert_character_state_proposal(eid, user_id, chapter_id, state, change_summ
             return None
         if entity["kind"] != "人物":
             return {"not_character": True}
-        if not _chapter_for_work(conn, chapter_id, entity["work_id"]):
+        chapter_source = _chapter_memory_source(conn, chapter_id, entity["work_id"])
+        if not chapter_source:
             return {"invalid_chapter": True}
         normalized = normalize_character_state(state)
         if not character_state_has_content(normalized):
             return {"empty_state": True}
         payload = (json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1000],
-                   (evidence or "").strip()[:3000], now)
+                   (evidence or "").strip()[:3000], chapter_source["content_hash"] or _content_fingerprint(""), now)
         existing = conn.execute(
             "SELECT id FROM entity_state_proposals WHERE entity_id=? AND chapter_id=? AND status='pending' "
             "ORDER BY id DESC LIMIT 1", (eid, chapter_id),
         ).fetchone()
         if existing:
             conn.execute(
-                "UPDATE entity_state_proposals SET state_json=?, change_summary=?, evidence=?, updated_at=? WHERE id=?",
+                "UPDATE entity_state_proposals SET state_json=?, change_summary=?, evidence=?, source_content_hash=?, "
+                "status='pending', updated_at=?, resolved_at=NULL WHERE id=?",
                 (*payload, existing["id"]),
             )
             pid = existing["id"]
         else:
             cur = conn.execute(
-                "INSERT INTO entity_state_proposals(entity_id,chapter_id,state_json,change_summary,evidence,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'pending',?,?)",
-                (eid, chapter_id, payload[0], payload[1], payload[2], now, now),
+                "INSERT INTO entity_state_proposals(entity_id,chapter_id,state_json,change_summary,evidence,status,source_content_hash,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'pending',?,?,?)",
+                (eid, chapter_id, payload[0], payload[1], payload[2], payload[3], now, now),
             )
             pid = cur.lastrowid
         row = conn.execute(
-            "SELECT id, entity_id, chapter_id, state_json, change_summary, evidence, status, "
-            "created_at, updated_at, resolved_at FROM entity_state_proposals WHERE id=?", (pid,)
+            "SELECT p.id, p.entity_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status, "
+            "p.source_content_hash, p.created_at, p.updated_at, p.resolved_at, "
+            "CASE WHEN p.source_content_hash='' OR p.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
+            "FROM entity_state_proposals p JOIN chapters c ON c.id=p.chapter_id WHERE p.id=?", (pid,)
         ).fetchone()
         return _state_proposal_payload(row)
 
@@ -1253,8 +1981,9 @@ def list_character_state_proposals(chapter_id, user_id):
             return None
         rows = conn.execute(
             "SELECT p.id, p.entity_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, "
-            "p.status, p.created_at, p.updated_at, p.resolved_at, e.name AS entity_name "
-            "FROM entity_state_proposals p JOIN entities e ON e.id=p.entity_id "
+            "p.status, p.source_content_hash, p.created_at, p.updated_at, p.resolved_at, e.name AS entity_name, "
+            "CASE WHEN p.source_content_hash='' OR p.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
+            "FROM entity_state_proposals p JOIN entities e ON e.id=p.entity_id JOIN chapters c ON c.id=p.chapter_id "
             "WHERE p.chapter_id=? ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END, p.id DESC",
             (chapter_id,),
         ).fetchall()
@@ -1265,14 +1994,20 @@ def accept_character_state_proposal(pid, user_id, state=None, change_summary=Non
     now = time.time()
     with get_conn() as conn:
         proposal = conn.execute(
-            "SELECT p.id, p.entity_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status "
-            "FROM entity_state_proposals p JOIN entities e ON e.id=p.entity_id "
-            "JOIN works w ON w.id=e.work_id WHERE p.id=? AND w.user_id=?", (pid, user_id),
+            "SELECT p.id, p.entity_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status, "
+            "p.source_content_hash, c.content_hash FROM entity_state_proposals p JOIN entities e ON e.id=p.entity_id "
+            "JOIN works w ON w.id=e.work_id JOIN chapters c ON c.id=p.chapter_id WHERE p.id=? AND w.user_id=?", (pid, user_id),
         ).fetchone()
         if not proposal:
             return None
         if proposal["status"] != "pending":
             return {"resolved": True}
+        if proposal["source_content_hash"] and proposal["source_content_hash"] != proposal["content_hash"]:
+            conn.execute(
+                "UPDATE entity_state_proposals SET status='stale', updated_at=?, resolved_at=? WHERE id=?",
+                (now, now, pid),
+            )
+            return {"stale": True}
         previous = _decode_character_state(proposal["state_json"])
         normalized = normalize_character_state(state, previous)
         if not character_state_has_content(normalized):
@@ -1281,10 +2016,13 @@ def accept_character_state_proposal(pid, user_id, state=None, change_summary=Non
         proof = proposal["evidence"] if evidence is None else (evidence or "").strip()[:3000]
         edited = state is not None or change_summary is not None or evidence is not None
         cur = conn.execute(
-            "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,"
+            "source_content_hash,stale,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (proposal["entity_id"], proposal["chapter_id"], json.dumps(normalized, ensure_ascii=False),
-             summary, proof, "ai_edited" if edited else "ai_confirmed", pid, now),
+             summary, proof, "ai_edited" if edited else "ai_confirmed", pid,
+             # Once the author accepts it, this becomes an authored state snapshot rather
+             # than a disposable extraction tied to one exact source revision.
+             "", 0, now),
         )
         conn.execute(
             "UPDATE entity_state_proposals SET status='accepted', updated_at=?, resolved_at=? WHERE id=?",
@@ -1292,7 +2030,9 @@ def accept_character_state_proposal(pid, user_id, state=None, change_summary=Non
         )
         version = conn.execute(
             "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
-            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
+            "c.title AS chapter_title, c.ord AS chapter_ord, "
+            "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
             "FROM entity_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
             (cur.lastrowid,),
         ).fetchone()
@@ -1585,7 +2325,10 @@ def list_chapters(wid, user_id):
         return [dict(r) for r in conn.execute(
             "SELECT id, work_id, title, ord, created_at, length(content) AS chars, "
             "workflow_status, workflow_goal, workflow_summary, workflow_checked_at, "
-            "branch_of_chapter_id, branch_from_revision_id "
+            "branch_of_chapter_id, branch_from_revision_id, content_revision, analysis_status, "
+            "analysis_reason, analysis_checked_at, "
+            "(SELECT COUNT(*) FROM story_memory_items m WHERE m.chapter_id=chapters.id "
+            "AND m.status='confirmed' AND m.stale=0) AS confirmed_memory_count "
             "FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY ord", (wid,)
         )]
 
@@ -1599,9 +2342,9 @@ def create_chapter(wid, user_id, title):
             "SELECT COALESCE(MAX(ord),0)+1 FROM chapters WHERE work_id=?", (wid,)
         ).fetchone()[0]
         cur = conn.execute(
-            "INSERT INTO chapters(work_id,title,ord,content,notes,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (wid, title, ord_, "", "", now, now),
+            "INSERT INTO chapters(work_id,title,ord,content,notes,content_hash,content_revision,analysis_status,"
+            "analysis_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (wid, title, ord_, "", "", _content_fingerprint(""), 1, "fresh", "", now, now),
         )
         return {"id": cur.lastrowid, "work_id": wid, "title": title, "ord": ord_}
 
@@ -1642,7 +2385,8 @@ def get_chapter_meta(cid, user_id):
             return None
         r = conn.execute(
             "SELECT id, work_id, title, ord, content, notes, workflow_status, workflow_goal, "
-            "workflow_summary, workflow_checked_at, branch_of_chapter_id, branch_from_revision_id "
+            "workflow_summary, workflow_checked_at, branch_of_chapter_id, branch_from_revision_id, "
+            "content_hash, content_revision, analysis_status, analysis_reason, analysis_checked_at "
             "FROM chapters WHERE id=? AND deleted_at IS NULL",
             (cid,),
         ).fetchone()
@@ -1655,7 +2399,8 @@ def get_chapter_workflow(cid, user_id):
             return None
         row = conn.execute(
             "SELECT id, work_id, title, ord, workflow_status, workflow_goal, workflow_summary, "
-            "workflow_checked_at, updated_at FROM chapters WHERE id=? AND deleted_at IS NULL",
+            "workflow_checked_at, updated_at, content_revision, analysis_status, analysis_reason, analysis_checked_at "
+            "FROM chapters WHERE id=? AND deleted_at IS NULL",
             (cid,),
         ).fetchone()
         return dict(row) if row else None
@@ -1689,7 +2434,13 @@ _ALERT_SEVERITIES = {"critical", "warning", "notice"}
 
 
 def _alert_payload(row):
-    return dict(row) if row else None
+    if not row:
+        return None
+    item = dict(row)
+    item["source_current"] = not bool(item.get("source_content_hash")) or bool(item.get("source_hash_matches", 1))
+    item["is_stale"] = bool(item.get("stale")) or not item["source_current"]
+    item.pop("source_hash_matches", None)
+    return item
 
 
 def list_chapter_consistency_alerts(cid, user_id):
@@ -1697,10 +2448,12 @@ def list_chapter_consistency_alerts(cid, user_id):
         if not _chapter_owned(conn, cid, user_id):
             return None
         rows = conn.execute(
-            "SELECT id, chapter_id, category, severity, title, detail, evidence, suggestion, status, "
-            "created_at, updated_at, resolved_at FROM chapter_consistency_alerts "
-            "WHERE chapter_id=? ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, "
-            "CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, id DESC",
+            "SELECT a.id, a.chapter_id, a.category, a.severity, a.title, a.detail, a.evidence, a.suggestion, a.status, "
+            "a.source_content_hash, a.stale, a.created_at, a.updated_at, a.resolved_at, "
+            "CASE WHEN a.source_content_hash='' OR a.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
+            "FROM chapter_consistency_alerts a JOIN chapters c ON c.id=a.chapter_id "
+            "WHERE a.chapter_id=? ORDER BY CASE a.status WHEN 'open' THEN 0 ELSE 1 END, "
+            "CASE a.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, a.id DESC",
             (cid,),
         ).fetchall()
         return [_alert_payload(row) for row in rows]
@@ -1731,13 +2484,15 @@ def replace_chapter_consistency_alerts(cid, user_id, alerts):
     with get_conn() as conn:
         if not _chapter_owned(conn, cid, user_id):
             return None
+        chapter = conn.execute("SELECT content_hash FROM chapters WHERE id=?", (cid,)).fetchone()
+        source_hash = (chapter["content_hash"] if chapter else "") or _content_fingerprint("")
         conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=? AND status='open'", (cid,))
         for item in normalized:
             conn.execute(
-                "INSERT INTO chapter_consistency_alerts(chapter_id,category,severity,title,detail,evidence,suggestion,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,'open',?,?)",
+                "INSERT INTO chapter_consistency_alerts(chapter_id,category,severity,title,detail,evidence,suggestion,status,"
+                "source_content_hash,stale,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'open',?,0,?,?)",
                 (cid, item["category"], item["severity"], item["title"], item["detail"],
-                 item["evidence"], item["suggestion"], now, now),
+                 item["evidence"], item["suggestion"], source_hash, now, now),
             )
     return list_chapter_consistency_alerts(cid, user_id)
 
@@ -1761,15 +2516,41 @@ def dismiss_chapter_consistency_alert(alert_id, user_id):
         return {"ok": True}
 
 
+def _persist_chapter_content(conn, cid, content, now=None, reason="正文已修改，需重新分析", invalidate=False):
+    """唯一的正文写入点：同步源版本，并让派生资料不再误当作当前事实。"""
+    now = now or time.time()
+    row = conn.execute(
+        "SELECT content, content_hash, content_revision FROM chapters WHERE id=?", (cid,)
+    ).fetchone()
+    if not row:
+        return None
+    content = content if isinstance(content, str) else ""
+    old_content = row["content"] or ""
+    old_hash = row["content_hash"] or _content_fingerprint(old_content)
+    new_hash = _content_fingerprint(content)
+    if content == old_content and new_hash == old_hash:
+        return {"changed": False, "content_hash": old_hash, "content_revision": row["content_revision"] or 1}
+    revision = max(1, int(row["content_revision"] or 1)) + 1
+    conn.execute(
+        "UPDATE chapters SET content=?, content_hash=?, content_revision=?, analysis_status='needs_review', "
+        "analysis_reason=?, analysis_checked_at=NULL, updated_at=? WHERE id=?",
+        (content, new_hash, revision, (reason or "正文已修改，需重新分析")[:240], now, cid),
+    )
+    if invalidate:
+        _invalidate_chapter_derived_state(conn, cid, reason)
+    return {"changed": True, "content_hash": new_hash, "content_revision": revision}
+
+
 def update_chapter(cid, user_id, title, content, notes):
     now = time.time()
     with get_conn() as conn:
         if not _chapter_owned(conn, cid, user_id):
             return False
+        if content is not None:
+            _persist_chapter_content(conn, cid, content, now, "正文已修改，需重新分析")
         conn.execute(
-            "UPDATE chapters SET title=COALESCE(?,title), content=COALESCE(?,content), "
-            "notes=COALESCE(?,notes), updated_at=? WHERE id=?",
-            (title, content, notes, now, cid),
+            "UPDATE chapters SET title=COALESCE(?,title), notes=COALESCE(?,notes), updated_at=? WHERE id=?",
+            (title, notes, now, cid),
         )
         conn.execute(
             "UPDATE works SET updated_at=? WHERE id="
@@ -1796,7 +2577,7 @@ def replace_text_in_chapter(cid, user_id, old, new):
         if old not in content:
             return None
         content = content.replace(old, new, 1)
-        conn.execute("UPDATE chapters SET content=?, updated_at=? WHERE id=?", (content, now, cid))
+        _persist_chapter_content(conn, cid, content, now, "AI 替换正文，需要重新分析", invalidate=True)
         conn.execute(
             "UPDATE works SET updated_at=? WHERE id="
             "(SELECT work_id FROM chapters WHERE id=?)",
@@ -1839,10 +2620,7 @@ def apply_chapter_edit_proposal(cid, user_id, base_content, operation, result_te
                 content = current[:index] + result_text + current[index + len(old_text):]
             raw = old_text
         snapshot = _add_revision_snapshot(conn, cid)
-        conn.execute(
-            "UPDATE chapters SET content=?, updated_at=? WHERE id=?",
-            (content, now, cid),
-        )
+        _persist_chapter_content(conn, cid, content, now, "AI 修改正文，需要重新分析", invalidate=True)
         conn.execute(
             "INSERT INTO segments(chapter_id, raw, result, mode, created_at) VALUES(?,?,?,?,?)",
             (cid, raw, result_text, f"preview:{mode or 'edit'}", now),
@@ -1881,6 +2659,7 @@ def purge_chapter(cid, user_id):
         conn.execute("DELETE FROM plot_state_versions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM plot_state_proposals WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=?", (cid,))
+        _delete_story_memories_for_chapter(conn, cid)
         conn.execute("DELETE FROM chapters WHERE id=?", (cid,))
         return True
 
@@ -1923,17 +2702,16 @@ def split_chapter(cid, user_id, at, title):
         content = chap["content"] or ""
         at = max(0, min(at, len(content)))
         left, right = content[:at], content[at:]
-        conn.execute(
-            "UPDATE chapters SET content=?, updated_at=? WHERE id=?", (left, now, cid)
-        )
+        _persist_chapter_content(conn, cid, left, now, "拆分章节，需要重新分析", invalidate=True)
         conn.execute(
             "UPDATE chapters SET ord=ord+1 WHERE work_id=? AND ord>?",
             (chap["work_id"], chap["ord"]),
         )
         cur = conn.execute(
-            "INSERT INTO chapters(work_id,title,ord,content,notes,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (chap["work_id"], title, chap["ord"] + 1, right, "", now, now),
+            "INSERT INTO chapters(work_id,title,ord,content,notes,content_hash,content_revision,analysis_status,"
+            "analysis_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (chap["work_id"], title, chap["ord"] + 1, right, "", _content_fingerprint(right), 1,
+             "needs_review" if right.strip() else "fresh", "章节由拆分创建，需要重新分析" if right.strip() else "", now, now),
         )
         return {"new_chapter_id": cur.lastrowid}
 
@@ -1953,10 +2731,7 @@ def add_segment(cid, user_id, raw, result, mode):
         if content and not content.endswith("\n"):
             content += "\n"
         content += result
-        conn.execute(
-            "UPDATE chapters SET content=?, updated_at=? WHERE id=?",
-            (content, now, cid),
-        )
+        _persist_chapter_content(conn, cid, content, now, "正文新增内容，需要重新分析")
         cur = conn.execute(
             "INSERT INTO segments(chapter_id, raw, result, mode, created_at) VALUES(?,?,?,?,?)",
             (cid, raw, result, mode, now),
@@ -1985,10 +2760,7 @@ def undo_last_segment(cid, user_id):
             content = content[: -len(row["result"])].rstrip("\n")
         if row:
             conn.execute("DELETE FROM segments WHERE id=?", (row["id"],))
-        conn.execute(
-            "UPDATE chapters SET content=?, updated_at=? WHERE id=?",
-            (content, time.time(), cid),
-        )
+        _persist_chapter_content(conn, cid, content, time.time(), "撤销段落，需要重新分析")
     return get_chapter(cid, user_id)
 
 
@@ -2063,10 +2835,8 @@ def restore_revision(cid, user_id, rid):
         ).fetchone()
         if not rev:
             return None
-        conn.execute(
-            "UPDATE chapters SET title=?, content=?, updated_at=? WHERE id=?",
-            (rev["title"], rev["content"], now, cid),
-        )
+        _persist_chapter_content(conn, cid, rev["content"] or "", now, "从历史版本恢复，需要重新分析", invalidate=True)
+        conn.execute("UPDATE chapters SET title=?, updated_at=? WHERE id=?", (rev["title"], now, cid))
     return get_chapter(cid, user_id)
 
 
@@ -2100,12 +2870,15 @@ def create_chapter_branch(cid, user_id, rid, title=""):
         ord_ = conn.execute(
             "SELECT COALESCE(MAX(ord),0)+1 FROM chapters WHERE work_id=?", (source["work_id"],)
         ).fetchone()[0]
+        branch_content = rev["content"] or ""
         cur = conn.execute(
             "INSERT INTO chapters(work_id,title,ord,content,notes,workflow_status,workflow_goal,"
-            "branch_of_chapter_id,branch_from_revision_id,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,'drafting',?,?,?,?,?)",
-            (source["work_id"], title, ord_, rev["content"] or "", source["notes"] or "",
-             source["workflow_goal"] or "", cid, rid, now, now),
+            "branch_of_chapter_id,branch_from_revision_id,content_hash,content_revision,analysis_status,analysis_reason,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,'drafting',?,?,?,?,?,?,?,?,?)",
+            (source["work_id"], title, ord_, branch_content, source["notes"] or "",
+             source["workflow_goal"] or "", cid, rid, _content_fingerprint(branch_content), 1,
+             "needs_review" if branch_content.strip() else "fresh",
+             "分支稿需要独立分析" if branch_content.strip() else "", now, now),
         )
         conn.execute("UPDATE works SET updated_at=? WHERE id=?", (now, source["work_id"]))
         return {"id": cur.lastrowid, "work_id": source["work_id"], "title": title, "ord": ord_,
@@ -2231,20 +3004,25 @@ def restore_work_revision(wid, user_id, rid):
             old_id = item.get("id")
             existing = conn.execute("SELECT id FROM chapters WHERE id=? AND work_id=?", (old_id, wid)).fetchone() if isinstance(old_id, int) else None
             if existing:
+                _persist_chapter_content(
+                    conn, old_id, content, now, "从整本历史版本恢复，需要重新分析", invalidate=True
+                )
                 conn.execute(
-                    "UPDATE chapters SET title=?, ord=?, content=?, notes=?, workflow_status=?, workflow_goal=?, "
+                    "UPDATE chapters SET title=?, ord=?, notes=?, workflow_status=?, workflow_goal=?, "
                     "workflow_summary=?, workflow_checked_at=?, deleted_at=NULL, updated_at=? WHERE id=?",
-                    (title, ord_, content, notes, workflow_status, workflow_goal[:2000], workflow_summary[:4000],
+                    (title, ord_, notes, workflow_status, workflow_goal[:2000], workflow_summary[:4000],
                      item.get("workflow_checked_at"), now, old_id),
                 )
                 restored += 1
             else:
                 conn.execute(
                     "INSERT INTO chapters(work_id,title,ord,content,notes,workflow_status,workflow_goal,workflow_summary,"
-                    "workflow_checked_at,branch_of_chapter_id,branch_from_revision_id,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "workflow_checked_at,branch_of_chapter_id,branch_from_revision_id,content_hash,content_revision,analysis_status,"
+                    "analysis_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (wid, title, ord_, content, notes, workflow_status, workflow_goal[:2000], workflow_summary[:4000],
-                     item.get("workflow_checked_at"), item.get("branch_of_chapter_id"), item.get("branch_from_revision_id"), now, now),
+                     item.get("workflow_checked_at"), item.get("branch_of_chapter_id"), item.get("branch_from_revision_id"),
+                     _content_fingerprint(content), 1, "needs_review" if content.strip() else "fresh",
+                     "从整本历史版本恢复，需要重新分析" if content.strip() else "", now, now),
                 )
                 created += 1
         work_notes = snapshot.get("work", {}).get("notes") if isinstance(snapshot.get("work"), dict) else None

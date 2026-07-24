@@ -39,6 +39,10 @@ let plotStateProposalId = null;
 let plotStateData = null;
 let plotStateSaveTimer = null;
 let chapterWorkflow = null;
+let storyMemoryChapterId = null;
+let storyMemoryData = null;
+let storyMemorySearchResults = null;
+let editingStoryMemoryId = null;
 let entityRelations = [];
 let editingRelationId = null;
 let consistencyAlerts = [];
@@ -269,6 +273,7 @@ function renderTree() {
         <span class="c-title">${esc(c.title) || "(无标题)"}</span>
         ${c.branch_of_chapter_id ? `<span class="chap-branch" title="从历史版本创建的分支稿">${svg("branch")}</span>` : ""}
         <span class="chap-stage stage-${esc(c.workflow_status || "drafting")}" title="章节阶段">${esc(workflowLabel(c.workflow_status))}</span>
+        ${c.analysis_status === "needs_review" ? '<span class="chap-analysis" title="正文已变化，派生资料需要重新分析">需复核</span>' : ""}
         <span class="c-wc">${(c.chars || 0)}字</span>
         <button class="c-del" onclick="event.stopPropagation();delChapter(${c.id})" title="删除">${svg("x")}</button>
       </div>`).join("") : "";
@@ -311,6 +316,10 @@ async function loadChapters() {
 async function selectChapter(cid) {
   if (dirty) await saveNow();
   currentChapterId = cid;
+  plotStateChapterId = cid;
+  storyMemoryChapterId = cid;
+  storyMemorySearchResults = null;
+  editingStoryMemoryId = null;
   clearAgentSelection();
   agentUndone.clear();
   await loadConversation();  // 切章：从服务端拉取该章持久化对话（刷新/切回都不丢）
@@ -427,13 +436,20 @@ async function saveNow() {
   clearTimeout(saveTimer);
   updateSaveStat("保存中…");
   try {
-    await api(`/api/chapters/${currentChapterId}`, {
+    const saved = await api(`/api/chapters/${currentChapterId}`, {
       method: "PUT",
       body: { title: $("chapTitle").value, content: $("content").value, notes: $("notes").value },
     });
     dirty = false; updateSaveStat("已保存");
     const cur = chapters.find(x => x.id === currentChapterId);
-    if (cur) cur.chars = charCount($("content").value);
+    if (cur) {
+      cur.chars = charCount($("content").value);
+      if (saved.analysis) {
+        cur.content_revision = saved.analysis.content_revision;
+        cur.analysis_status = saved.analysis.status;
+        cur.analysis_reason = saved.analysis.reason;
+      }
+    }
     renderTree();
   } catch (e) { updateSaveStat("保存失败"); }
 }
@@ -594,10 +610,12 @@ function clearAgentSelection() {
 async function notifyStoryUpdates(result) {
   const count = Array.isArray(result?.character_state_proposals) ? result.character_state_proposals.length : 0;
   const plot = result?.plot_state_proposal ? 1 : 0;
-  if (count || plot) {
+  const memories = Array.isArray(result?.memory_proposals) ? result.memory_proposals.length : 0;
+  if (count || plot || memories) {
     const labels = [];
     if (count) labels.push(`${count} 条人物状态`);
     if (plot) labels.push("剧情推进");
+    if (memories) labels.push(`${memories} 条故事记忆`);
     showToast(`已生成待确认：${labels.join("、")}`, "ok");
     await refreshCharacterCards();
     if ($("app").classList.contains("story-open")) await refreshStoryDrawer();
@@ -1948,7 +1966,7 @@ function toggleStoryDrawer() {
 }
 function closeStoryDrawer() { $("app").classList.remove("story-open"); }
 async function selectStoryTab(tab) {
-  storyTab = ["plot", "workflow", "relations", "alerts", "context"].includes(tab) ? tab : "plot";
+  storyTab = ["plot", "workflow", "memory", "relations", "alerts", "context"].includes(tab) ? tab : "plot";
   document.querySelectorAll(".story-tab").forEach(button => {
     button.classList.toggle("active", button.dataset.storyTab === storyTab);
   });
@@ -1962,6 +1980,7 @@ async function refreshStoryDrawer() {
   try {
     if (storyTab === "plot") await loadPlotState();
     else if (storyTab === "workflow") await loadWorkflow();
+    else if (storyTab === "memory") await loadStoryMemories();
     else if (storyTab === "relations") await loadRelationships();
     else if (storyTab === "alerts") await loadConsistencyAlerts();
     else if (storyTab === "context") await loadAgentContext();
@@ -2261,6 +2280,220 @@ async function runChapterReview() {
   finally { busy(button, false, "AI 复核"); }
 }
 
+const storyMemoryTypeLabels = {
+  event: "重要事件", fact: "明确事实", knowledge: "知情变化", relationship_change: "关系变化",
+  item_change: "物品变化", location_change: "地点变化", ability_change: "能力变化",
+  world_rule: "世界规则", promise: "承诺/任务", secret: "重要秘密",
+};
+
+function storyMemoryChapterOptions() {
+  return chapters.map(chapter =>
+    `<option value="${chapter.id}" ${chapter.id === storyMemoryChapterId ? "selected" : ""}>${esc(storyChapterLabel(chapter))}</option>`
+  ).join("");
+}
+function storyMemoryTypeOptions(selected) {
+  return Object.entries(storyMemoryTypeLabels).map(([value, label]) =>
+    `<option value="${value}" ${value === selected ? "selected" : ""}>${esc(label)}</option>`
+  ).join("");
+}
+function storyMemoryPoint(item) {
+  return `第${item.chapter_ord || "?"}章《${item.chapter_title || "无标题"}》`;
+}
+function storyMemoryState(item) {
+  if (item.is_stale || item.status === "stale") return "来源已过期";
+  if (item.status === "proposed") return "待确认";
+  if (item.status === "rejected") return "已拒绝";
+  return "已确认";
+}
+function storyMemoryEditor(item, proposal) {
+  const id = item.id;
+  return `<div class="memory-inline-editor">
+    <div class="memory-edit-row"><label>类型<select id="storyMemoryType-${id}">${storyMemoryTypeOptions(item.memory_type)}</select></label><label>重要度<select id="storyMemoryImportance-${id}">${[1,2,3,4,5].map(v => `<option value="${v}" ${v === item.importance ? "selected" : ""}>${v}</option>`).join("")}</select></label></div>
+    <label>标题<input id="storyMemoryTitle-${id}" value="${esc(item.title)}"></label>
+    <label>记忆内容<textarea id="storyMemoryContent-${id}">${esc(item.content)}</textarea></label>
+    <label>来源证据<textarea id="storyMemoryEvidence-${id}">${esc(item.evidence || "")}</textarea></label>
+    <div class="memory-edit-actions">
+      <button onclick="${proposal ? `acceptStoryMemory(${id},true)` : `saveStoryMemory(${id})`}">${proposal ? "编辑后采纳" : "保存修改"}</button>
+      <button class="ic" data-ic="x" onclick="cancelStoryMemoryEdit()" title="取消编辑"></button>
+    </div>
+  </div>`;
+}
+function readStoryMemoryEditor(item) {
+  const id = item.id;
+  return {
+    memory_type: $(`storyMemoryType-${id}`).value,
+    title: $(`storyMemoryTitle-${id}`).value.trim(),
+    content: $(`storyMemoryContent-${id}`).value.trim(),
+    evidence: $(`storyMemoryEvidence-${id}`).value.trim(),
+    importance: +$(`storyMemoryImportance-${id}`).value || 3,
+    entity_ids: item.entity_ids || [],
+  };
+}
+function renderStoryMemoryItem(item, kind) {
+  const editable = editingStoryMemoryId === item.id;
+  const proposal = kind === "proposal";
+  const actions = proposal ? `
+      <div class="story-proposal-actions">
+        <button onclick="acceptStoryMemory(${item.id})">采纳</button>
+        <button class="ic" data-ic="pen" onclick="editStoryMemory(${item.id})" title="编辑后采纳"></button>
+        <button class="ic" data-ic="x" onclick="rejectStoryMemory(${item.id})" title="拒绝"></button>
+      </div>` : (!item.is_stale && item.status === "confirmed" ? `
+      <div class="story-proposal-actions"><button class="ic" data-ic="pen" onclick="editStoryMemory(${item.id})" title="编辑这条记忆"></button></div>` : "");
+  return `<article class="story-memory-item ${item.is_stale ? "stale" : ""}">
+    <details ${proposal || editable ? "open" : ""}>
+      <summary><b>${esc(storyMemoryTypeLabels[item.memory_type] || "故事记忆")}</b><span>${esc(item.title || "未命名")}</span><small class="memory-status">${esc(storyMemoryState(item))}</small></summary>
+      <p class="memory-content">${esc(item.content || "")}</p>
+      <small class="memory-evidence">${esc(storyMemoryPoint(item))}${item.entity_names?.length ? ` · ${esc(item.entity_names.join("、"))}` : ""}${item.evidence ? `\n证据：${esc(item.evidence)}` : ""}</small>
+      ${editable ? storyMemoryEditor(item, proposal) : actions}
+    </details>
+  </article>`;
+}
+function renderStoryMemories(data) {
+  storyMemoryData = data || {};
+  const target = data?.target_chapter || null;
+  if (!storyMemoryChapterId && target) storyMemoryChapterId = target.id;
+  $("storyMemoryChapter").innerHTML = storyMemoryChapterOptions();
+  const counts = data?.counts || {};
+  const status = target?.analysis_status === "needs_review" ? "需要重新分析" : "当前来源已复核";
+  $("storyMemoryMeta").textContent = target ? `${storyChapterLabel(target)} · ${status}` : "请先选择章节";
+  const warnings = [];
+  if (target?.analysis_status === "needs_review") warnings.push(`本章正文已变化：${target.analysis_reason || "派生资料需要重新分析"}。`);
+  if (counts.stale) warnings.push(`已有 ${counts.stale} 条故事记忆的来源已过期，系统不会把它们用于 AI 召回。`);
+  $("storyMemoryWarning").textContent = warnings.join("\n");
+  $("storyMemoryWarning").classList.toggle("hidden", !warnings.length);
+  const proposals = data?.proposals || [];
+  const acceptAllButton = $("storyMemoryAcceptAllBtn");
+  acceptAllButton.classList.toggle("hidden", !proposals.length);
+  acceptAllButton.disabled = !proposals.length;
+  $("storyMemoryProposalCount").textContent = proposals.length ? `${proposals.length} 条` : "";
+  $("storyMemoryProposals").innerHTML = proposals.length ? proposals.map(item => renderStoryMemoryItem(item, "proposal")).join("") : '<div class="empty">本章还没有待确认故事记忆</div>';
+  const confirmed = storyMemorySearchResults || data?.confirmed || [];
+  $("storyMemoryConfirmedTitle").textContent = storyMemorySearchResults ? "检索结果" : "已确认记忆";
+  $("storyMemoryConfirmedCount").textContent = confirmed.length ? `${confirmed.length} 条` : "";
+  $("storyMemoryConfirmed").innerHTML = confirmed.length ? confirmed.map(item => renderStoryMemoryItem(item, "confirmed")).join("") : '<div class="empty">没有匹配的已确认故事记忆</div>';
+  const stale = data?.stale || [];
+  $("storyMemoryStaleCount").textContent = stale.length ? `${stale.length} 条` : "";
+  $("storyMemoryStale").innerHTML = stale.length ? stale.map(item => renderStoryMemoryItem(item, "stale")).join("") : '<div class="empty">暂无来源过期的故事记忆</div>';
+  applyIcons();
+}
+async function loadStoryMemories() {
+  if (!currentWorkId) return;
+  if (!chapters.length) {
+    renderStoryMemories({ target_chapter: null, proposals: [], confirmed: [], stale: [], counts: {} });
+    return;
+  }
+  if (!chapters.some(item => item.id === storyMemoryChapterId)) storyMemoryChapterId = currentChapterId || chapters[chapters.length - 1].id;
+  const data = await api(`/api/works/${currentWorkId}/story-memory-overview?chapter_id=${storyMemoryChapterId}`, { method: "GET" });
+  renderStoryMemories(data);
+}
+async function changeStoryMemoryChapter() {
+  storyMemoryChapterId = +$("storyMemoryChapter").value || null;
+  storyMemorySearchResults = null;
+  editingStoryMemoryId = null;
+  $("storyMemorySearch").value = "";
+  await loadStoryMemories();
+}
+function editStoryMemory(memoryId) {
+  editingStoryMemoryId = memoryId;
+  renderStoryMemories(storyMemoryData);
+}
+function cancelStoryMemoryEdit() {
+  editingStoryMemoryId = null;
+  renderStoryMemories(storyMemoryData);
+}
+function findStoryMemory(memoryId) {
+  const groups = [storyMemoryData?.proposals, storyMemorySearchResults, storyMemoryData?.confirmed, storyMemoryData?.stale];
+  return groups.flatMap(items => items || []).find(item => item.id === memoryId) || null;
+}
+async function acceptStoryMemory(memoryId, edited = false) {
+  const item = findStoryMemory(memoryId);
+  if (!item) return;
+  try {
+    const changes = edited ? readStoryMemoryEditor(item) : null;
+    await api(`/api/story-memories/${memoryId}/accept`, { body: changes ? { changes } : {} });
+    editingStoryMemoryId = null;
+    storyMemorySearchResults = null;
+    await loadStoryMemories();
+    showToast("已确认故事记忆", "ok");
+  } catch (e) { showToast(e.message, "err"); }
+}
+async function acceptAllStoryMemories() {
+  const proposals = (storyMemoryData?.proposals || []).filter(item => item.status === "proposed" && !item.is_stale);
+  if (!proposals.length) return;
+  const button = $("storyMemoryAcceptAllBtn");
+  busy(button, true, "");
+  try {
+    const failures = [];
+    for (const item of proposals) {
+      try { await api(`/api/story-memories/${item.id}/accept`, { body: {} }); }
+      catch (e) { failures.push(item.title || `#${item.id}`); }
+    }
+    editingStoryMemoryId = null;
+    storyMemorySearchResults = null;
+    await loadStoryMemories();
+    showToast(failures.length ? `已采纳 ${proposals.length - failures.length} 条；${failures.length} 条需重新处理` : `已采纳 ${proposals.length} 条故事记忆`, failures.length ? "" : "ok");
+  } finally {
+    busy(button, false, "");
+    applyIcons();
+  }
+}
+async function rejectStoryMemory(memoryId) {
+  try {
+    await api(`/api/story-memories/${memoryId}/reject`, { body: {} });
+    editingStoryMemoryId = null;
+    await loadStoryMemories();
+    showToast("已拒绝故事记忆提议");
+  } catch (e) { showToast(e.message, "err"); }
+}
+async function saveStoryMemory(memoryId) {
+  const item = findStoryMemory(memoryId);
+  if (!item) return;
+  try {
+    await api(`/api/story-memories/${memoryId}`, { method: "PUT", body: readStoryMemoryEditor(item) });
+    editingStoryMemoryId = null;
+    storyMemorySearchResults = null;
+    await loadStoryMemories();
+    showToast("故事记忆已更新", "ok");
+  } catch (e) { showToast(e.message, "err"); }
+}
+async function analyzeStoryMemories() {
+  if (!storyMemoryChapterId) return;
+  if (storyMemoryChapterId === currentChapterId && dirty) await saveNow();
+  const button = $("storyMemoryAnalyzeBtn");
+  busy(button, true, "分析中");
+  try {
+    const result = await api(`/api/chapters/${storyMemoryChapterId}/story-memories/analyze`, { body: {} });
+    storyMemorySearchResults = null;
+    await loadStoryMemories();
+    showToast(result.proposals?.length ? `已生成 ${result.proposals.length} 条待确认故事记忆` : "未发现需要长期记录的事实", result.proposals?.length ? "ok" : "");
+  } catch (e) { showToast(e.message, "err"); }
+  finally { busy(button, false); applyIcons(); }
+}
+async function markStoryMemoryStale() {
+  if (!storyMemoryChapterId) return;
+  if (!await askCard({ title: "标记本章重大修改？", msg: "本章的故事记忆、AI 状态提议和连续性提醒会标记为需要重新分析；已确认的原始记录不会被删除。", okText: "标记并重新分析", danger: true })) return;
+  try {
+    const result = await api(`/api/chapters/${storyMemoryChapterId}/story-memories/mark-stale`, { body: {} });
+    storyMemorySearchResults = null;
+    await loadStoryMemories();
+    showToast(`已标记本章资料失效；后续 ${result.later_chapters || 0} 章可能受影响`, "ok");
+  } catch (e) { showToast(e.message, "err"); }
+}
+async function searchStoryMemories() {
+  if (!currentWorkId || !storyMemoryData) return;
+  const query = $("storyMemorySearch").value.trim();
+  if (!query) {
+    storyMemorySearchResults = null;
+    renderStoryMemories(storyMemoryData);
+    return;
+  }
+  try {
+    storyMemorySearchResults = await api(`/api/works/${currentWorkId}/story-memories/search?q=${encodeURIComponent(query)}&before_chapter_id=${storyMemoryChapterId || ""}`, { method: "GET" });
+    editingStoryMemoryId = null;
+    renderStoryMemories(storyMemoryData);
+  } catch (e) { showToast(e.message, "err"); }
+}
+
 function relationEntityOptions(selectedId) {
   const characters = entitiesCache.filter(item => item.kind === "人物");
   return `<option value="">选择人物</option>` + characters.map(item =>
@@ -2338,12 +2571,12 @@ async function deleteRelation(rid) {
 function renderConsistencyAlerts() {
   $("alertsMeta").textContent = currentChapterId ? storyChapterLabel(chapters.find(item => item.id === currentChapterId)) : "请先选择章节";
   $("alertsList").innerHTML = consistencyAlerts.length ? consistencyAlerts.map(item => `
-    <div class="consistency-alert severity-${esc(item.severity || "notice")}">
-      <div><span class="alert-mark">${svg(item.severity === "critical" ? "alert" : item.severity === "warning" ? "alert" : "eye")}</span><b>${esc(item.title)}</b><small>${esc(item.category || "连续性")}</small></div>
+    <div class="consistency-alert severity-${esc(item.severity || "notice")} ${item.is_stale ? "stale" : ""}">
+      <div><span class="alert-mark">${svg(item.severity === "critical" ? "alert" : item.severity === "warning" ? "alert" : "eye")}</span><b>${esc(item.title)}</b><small>${esc(item.category || "连续性")}</small>${item.is_stale ? '<small>来源已过期</small>' : ""}</div>
       ${item.detail ? `<p>${esc(item.detail)}</p>` : ""}
       ${item.evidence ? `<small class="alert-evidence">${esc(item.evidence)}</small>` : ""}
       ${item.suggestion ? `<p class="alert-suggestion">${esc(item.suggestion)}</p>` : ""}
-      ${item.status === "open" ? `<button class="ic" onclick="dismissConsistencyAlert(${item.id})" title="忽略此提醒">${svg("x")}</button>` : `<span class="alert-dismissed">已忽略</span>`}
+      ${item.status === "open" && !item.is_stale ? `<button class="ic" onclick="dismissConsistencyAlert(${item.id})" title="忽略此提醒">${svg("x")}</button>` : `<span class="alert-dismissed">${item.is_stale ? "已过期" : "已忽略"}</span>`}
     </div>`).join("") : '<div class="empty">本章还没有连续性提醒</div>';
 }
 async function loadConsistencyAlerts() {
@@ -2364,8 +2597,13 @@ function contextTextBlock(title, text, empty = "无") {
 function renderAgentContext(data) {
   agentContext = data;
   const chapter = data.chapter ? `第${data.chapter.ord}章《${data.chapter.title || "无标题"}》` : "未选择章节";
-  $("contextMeta").textContent = `${data.engine} · ${chapter} · ${data.model || "未设置模型"}`;
+  const estimate = data.estimated_tokens ? ` · 约 ${data.estimated_tokens} tokens` : "";
+  $("contextMeta").textContent = `${data.engine} · ${chapter} · ${data.model || "未设置模型"}${estimate}`;
   $("contextSelection").innerHTML = contextTextBlock("选区", data.selection?.present ? data.selection.text : "本回合没有选区");
+  const recalled = data.context_items || [];
+  $("contextRecall").innerHTML = `<div><b>本轮参考资料</b>${recalled.length ? recalled.map((item, index) =>
+    `<details ${index < 3 ? "open" : ""}><summary>${esc(item.title || item.type || "上下文")} · ${esc(item.reason || "系统上下文")}</summary><pre>${esc(item.content || "")}</pre></details>`
+  ).join("") : '<p>暂无可用的已确认故事资料</p>'}</div>`;
   const skills = data.skills || [];
   $("contextSkills").innerHTML = `<div><b>本回合 Skills</b>${skills.length ? skills.map(item =>
     `<details><summary>${esc(item.name)}${item.description ? ` · ${esc(item.description)}` : ""}</summary><pre>${esc(item.instruction)}</pre></details>`
@@ -2391,7 +2629,7 @@ async function loadAgentContext() {
   try {
     const data = await api("/api/agent/context", { body: {
       chapter_id: currentChapterId, selection: agentSelection,
-      skill_ids: activeAgentSkillIds.size ? [...activeAgentSkillIds] : [],
+      skill_ids: activeAgentSkillIds.size ? [...activeAgentSkillIds] : [], text: $("agentInput")?.value || "",
     }});
     renderAgentContext(data);
   } catch (e) { $("contextMeta").textContent = e.message; }

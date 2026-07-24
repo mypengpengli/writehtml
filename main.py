@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
-import config, db, llm, pi_agent, skill_runtime
+import config, context_builder, db, llm, pi_agent, skill_runtime
 
 app = FastAPI(title="写作")
 db.init_db()
@@ -268,6 +268,8 @@ def _state_error(result):
         raise HTTPException(400, "请至少填写一项人物状态")
     if result.get("resolved"):
         raise HTTPException(409, "该 AI 提议已经处理")
+    if result.get("stale"):
+        raise HTTPException(409, "正文已变化，该 AI 提议已过期，请重新分析")
     return result
 
 
@@ -344,6 +346,8 @@ def _plot_state_error(result):
         raise HTTPException(400, "请至少填写一项剧情状态")
     if result.get("resolved"):
         raise HTTPException(409, "该 AI 提议已经处理")
+    if result.get("stale"):
+        raise HTTPException(409, "正文已变化，该 AI 提议已过期，请重新分析")
     return result
 
 
@@ -400,6 +404,120 @@ async def accept_plot_state_proposal(pid: int, request: Request):
 @app.post("/api/plot-state-proposals/{pid}/reject")
 async def reject_plot_state_proposal(pid: int, request: Request):
     return _plot_state_error(db.reject_plot_state_proposal(pid, _auth(request)))
+
+
+# ---------- 故事记忆（正文提取 → 作者确认 → 检索召回）----------
+
+def _story_memory_error(result):
+    if result is None:
+        raise HTTPException(404, "故事记忆或作品不存在")
+    if isinstance(result, list):
+        return result
+    if result.get("invalid_chapter"):
+        raise HTTPException(404, "章节不存在")
+    if result.get("invalid") or result.get("invalid_type"):
+        raise HTTPException(400, "故事记忆格式不正确")
+    if result.get("not_confirmed"):
+        raise HTTPException(409, "只有已确认的故事记忆可以编辑")
+    if result.get("resolved"):
+        raise HTTPException(409, "该故事记忆提议已经处理")
+    if result.get("stale") is True:
+        raise HTTPException(409, "正文已变化，该故事记忆已过期，请重新分析")
+    return result
+
+
+def _query_list(request, name, allowed=None):
+    values = []
+    for raw in request.query_params.getlist(name):
+        values.extend(value.strip() for value in raw.split(",") if value.strip())
+    return [value for value in values if not allowed or value in allowed]
+
+
+@app.get("/api/works/{wid}/story-memory-overview")
+async def get_story_memory_overview(wid: int, request: Request):
+    result = _story_memory_error(db.get_story_memory_overview(
+        wid, _auth(request), _qparam_int(request, "chapter_id"),
+    ))
+    return result
+
+
+@app.get("/api/works/{wid}/story-memories")
+async def get_story_memories(wid: int, request: Request):
+    include_stale = request.query_params.get("include_stale", "true").lower() not in {"0", "false", "no"}
+    result = _story_memory_error(db.list_story_memories(
+        wid, _auth(request), _qparam_int(request, "chapter_id"),
+        _query_list(request, "status", db.STORY_MEMORY_STATUSES) or None,
+        _query_list(request, "memory_type", db.STORY_MEMORY_TYPES) or None,
+        include_stale=include_stale,
+        limit=_qparam_int(request, "limit") or 200,
+    ))
+    return result
+
+
+@app.get("/api/works/{wid}/story-memories/search")
+async def search_story_memories_api(wid: int, request: Request):
+    entity_ids = []
+    for value in _query_list(request, "entity_id"):
+        try:
+            entity_ids.append(int(value))
+        except ValueError:
+            continue
+    result = _story_memory_error(db.search_story_memories(
+        wid, _auth(request), request.query_params.get("q", ""), entity_ids or None,
+        _query_list(request, "memory_type", db.STORY_MEMORY_TYPES) or None,
+        _qparam_int(request, "before_chapter_id"), _qparam_int(request, "limit") or 15,
+    ))
+    return result
+
+
+@app.post("/api/chapters/{cid}/story-memories/analyze")
+async def analyze_story_memories(cid: int, request: Request):
+    proposals = _generate_story_memory_proposals(_auth(request), cid, raise_on_error=True)
+    return {"proposals": proposals}
+
+
+@app.post("/api/story-memories/{memory_id}/accept")
+async def accept_story_memory(memory_id: int, request: Request):
+    uid = _auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    changes = body.get("changes") if isinstance(body.get("changes"), dict) else None
+    result = _story_memory_error(db.accept_story_memory(memory_id, uid, changes))
+    return {"ok": True, "memory": result}
+
+
+@app.post("/api/story-memories/{memory_id}/reject")
+async def reject_story_memory(memory_id: int, request: Request):
+    return _story_memory_error(db.reject_story_memory(memory_id, _auth(request)))
+
+
+@app.put("/api/story-memories/{memory_id}")
+async def save_story_memory(memory_id: int, request: Request):
+    body = await request.json()
+    result = _story_memory_error(db.update_story_memory(memory_id, _auth(request), body))
+    return {"ok": True, "memory": result}
+
+
+@app.get("/api/story-memories/{memory_id}/source")
+async def get_story_memory_source(memory_id: int, request: Request):
+    result = db.get_story_memory_source(memory_id, _auth(request))
+    if result is None:
+        raise HTTPException(404, "故事记忆不存在")
+    return result
+
+
+@app.post("/api/chapters/{cid}/story-memories/mark-stale")
+async def mark_story_memory_stale(cid: int, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    result = db.mark_chapter_story_memory_stale(cid, _auth(request), body.get("reason", "作者标记正文发生重大修改"))
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    return result
 
 
 # ---------- 人物关系图 ----------
@@ -673,10 +791,16 @@ async def get_chapter(cid: int, request: Request):
 
 @app.put("/api/chapters/{cid}")
 async def save_chapter(cid: int, request: Request):
+    uid = _auth(request)
     body = await request.json()
-    if not db.update_chapter(cid, _auth(request), body.get("title"), body.get("content"), body.get("notes")):
+    if not db.update_chapter(cid, uid, body.get("title"), body.get("content"), body.get("notes")):
         raise HTTPException(404, "章节不存在")
-    return {"ok": True}
+    chapter = db.get_chapter_meta(cid, uid) or {}
+    return {"ok": True, "analysis": {
+        "content_revision": chapter.get("content_revision"),
+        "status": chapter.get("analysis_status"),
+        "reason": chapter.get("analysis_reason") or "",
+    }}
 
 
 # ---------- 章节工作流 / 复核提醒 ----------
@@ -714,6 +838,12 @@ async def get_chapter_consistency_alerts(cid: int, request: Request):
 
 @app.post("/api/chapters/{cid}/review")
 async def review_chapter(cid: int, request: Request):
+    return _run_chapter_review(_auth(request), cid, raise_on_error=True)
+
+
+@app.post("/api/chapters/{cid}/reanalyze")
+async def reanalyze_chapter(cid: int, request: Request):
+    """Explicit refresh for source-stale cards, alerts and story memory proposals."""
     return _run_chapter_review(_auth(request), cid, raise_on_error=True)
 
 
@@ -1235,6 +1365,55 @@ AGENT_TOOLS = [
         "description": "对照作品设定校验当前正文，列出矛盾（人物/时间线/设定冲突）。不改正文。",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "search_story_memory",
+        "description": "检索作者已确认且来源仍有效的故事记忆，用于回答某件事何时发生、谁知道什么或写作前核对历史。",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "要检索的人物、物品、事件或问题"},
+            "entity_ids": {"type": "array", "items": {"type": "integer"}, "description": "可选的人物/实体 id 过滤"},
+            "memory_types": {"type": "array", "items": {"type": "string"}, "description": "可选类型：event/fact/knowledge/relationship_change/item_change/location_change/ability_change/world_rule/promise/secret"},
+            "limit": {"type": "integer", "description": "最多返回条数，默认 12"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "list_recent_memories",
+        "description": "列出当前章节之前最近确认的故事记忆，用于快速回顾最近剧情。",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "最多返回条数，默认 12"}}}}},
+    {"type": "function", "function": {
+        "name": "list_entity_memories",
+        "description": "列出指定实体关联的已确认故事记忆。",
+        "parameters": {"type": "object", "properties": {
+            "entity_id": {"type": "integer", "description": "人物或实体 id"},
+            "limit": {"type": "integer", "description": "最多返回条数，默认 20"}},
+            "required": ["entity_id"]}}},
+    {"type": "function", "function": {
+        "name": "get_memory_source",
+        "description": "读取一条故事记忆的来源章节和证据。需要核对事实或用户追问依据时调用。",
+        "parameters": {"type": "object", "properties": {
+            "memory_id": {"type": "integer", "description": "故事记忆 id"}}, "required": ["memory_id"]}}},
+    {"type": "function", "function": {
+        "name": "analyze_chapter_memory",
+        "description": "从当前章节提取新的故事记忆提议；只生成待作者确认项，不会直接写入正式事实。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "accept_memory_proposal",
+        "description": "接受一条当前章节的故事记忆提议，写入正式记忆。正文版本不匹配时会拒绝并要求重新分析。",
+        "parameters": {"type": "object", "properties": {
+            "memory_id": {"type": "integer", "description": "待确认故事记忆 id"}}, "required": ["memory_id"]}}},
+    {"type": "function", "function": {
+        "name": "reject_memory_proposal",
+        "description": "拒绝一条不准确或不重要的故事记忆提议。",
+        "parameters": {"type": "object", "properties": {
+            "memory_id": {"type": "integer", "description": "待确认故事记忆 id"}}, "required": ["memory_id"]}}},
+    {"type": "function", "function": {
+        "name": "mark_chapter_memory_stale",
+        "description": "当作者确认当前章发生重大改写时，标记本章派生记忆、状态提议和提醒需要重新分析。",
+        "parameters": {"type": "object", "properties": {
+            "reason": {"type": "string", "description": "可选的失效原因"}}}}},
+    {"type": "function", "function": {
+        "name": "get_context_preview",
+        "description": "查看当前回合会参考哪些人物状态、剧情状态、故事记忆和 Skill，以及各自被召回的原因。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "activate_skill",
         "description": "按当前用户已安装 Skill 目录中的 id，加载一个与本次任务匹配的 Skill 完整规则。仅在用户明确提到某 Skill，或任务与其说明高度匹配时调用。",
         "parameters": {"type": "object", "properties": {
@@ -1255,14 +1434,15 @@ def _agent_err(msg):
 
 
 def _agent_bible(wid, uid, cid=None):
-    bible = db.get_work_notes(wid, uid) or ""
-    digest = db.get_entity_digest(wid, uid, cid)
-    if digest:
-        bible = (bible + "\n\n" + digest) if bible else digest
-    plot_digest = db.get_plot_digest(wid, uid, cid)
-    if plot_digest:
-        bible = (bible + "\n\n" + plot_digest) if bible else plot_digest
-    return bible
+    context = context_builder.build_context(
+        uid, "answer_story_question", wid, cid, token_budget=16000,
+    )
+    if not context:
+        return ""
+    return context_builder.render_context(
+        context,
+        {"work_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"},
+    )
 
 
 def _parse_json_from_model(raw):
@@ -1326,6 +1506,9 @@ def _generate_character_state_proposals(uid, cid, *, base_url=None, api_key=None
             "detail": (character.get("detail") or "")[:1800],
             "confirmed_state_at_this_point": _short_character_state(character.get("current_state")),
         })
+    context = context_builder.build_context(
+        uid, "extract_character_state", chapter["work_id"], cid, token_budget=14000,
+    ) or {"context_items": []}
     prompt = {
         "task": "阅读当前章节，只提取文本明确支持的人物动态变化；不要编造，也不要重写人物基础设定。",
         "output": {
@@ -1346,6 +1529,9 @@ def _generate_character_state_proposals(uid, cid, *, base_url=None, api_key=None
             "只能使用给定 entity_id，且只给本章实际涉及、状态发生实质变化的人物生成 update。",
         ],
         "characters": cards,
+        "story_context": context_builder.render_context(
+            context, {"work_bible", "plot_state", "relationships", "memory", "chapter_summary"}
+        )[:22000],
         "chapter": {
             "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
             "content": (chapter.get("content") or "")[-14000:],
@@ -1423,6 +1609,9 @@ def _generate_plot_state_proposal(uid, cid, *, base_url=None, api_key=None, mode
         if raise_on_error:
             raise HTTPException(500, "未配置 API Key，无法提取剧情状态")
         return None
+    context = context_builder.build_context(
+        uid, "extract_plot_state", chapter["work_id"], cid, token_budget=14000,
+    ) or {"context_items": []}
     prompt = {
         "task": "阅读当前章节，更新截至本章结束时的故事状态。只记录文本明确支持的推进，不编造后续剧情。",
         "output": {
@@ -1437,8 +1626,9 @@ def _generate_plot_state_proposal(uid, cid, *, base_url=None, api_key=None, mode
             "未回收伏笔要保留仍未解决的项；下一章目标只能是文本和既有大纲支持的合理目标。",
         ],
         "confirmed_state_at_this_point": before,
-        "work_memory": (db.get_work_notes(chapter["work_id"], uid) or "")[:10000],
-        "relationships": db.get_relationship_digest(chapter["work_id"], uid)[:6000],
+        "story_context": context_builder.render_context(
+            context, {"work_bible", "character_state", "relationships", "memory", "chapter_summary"}
+        )[:22000],
         "chapter": {
             "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
             "content": content[-16000:],
@@ -1474,6 +1664,90 @@ def _generate_plot_state_proposal(uid, cid, *, base_url=None, api_key=None, mode
     if saved and not saved.get("empty_state"):
         return saved
     return None
+
+
+def _generate_story_memory_proposals(uid, cid, *, base_url=None, api_key=None, model=None,
+                                     raise_on_error=False):
+    """Extract only source-backed story facts; all results remain author proposals."""
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    if not chapter:
+        if raise_on_error:
+            raise HTTPException(404, "章节不存在")
+        return []
+    content = (chapter.get("content") or "").strip()
+    if not content:
+        if raise_on_error:
+            raise HTTPException(400, "本章为空，无法提取故事记忆")
+        return []
+    settings = db.get_settings(uid) or {}
+    base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
+    model = model or settings.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        if raise_on_error:
+            raise HTTPException(500, "未配置 API Key，无法提取故事记忆")
+        return []
+    entities = db.list_entities(chapter["work_id"], uid, cid) or []
+    known_entities = [
+        {"entity_id": item["id"], "name": item["name"], "kind": item.get("kind") or ""}
+        for item in entities[:100]
+    ]
+    context = context_builder.build_context(
+        uid, "extract_memory", chapter["work_id"], cid, token_budget=15000,
+    ) or {"context_items": []}
+    prompt = {
+        "task": "从当前章节提取会影响后续写作的明确故事记忆。只提取重要事件、事实变化、"
+                "人物知情或关系变化、物品/地点/能力变化、世界规则、承诺和秘密。",
+        "output": {
+            "items": [{
+                "memory_type": "event|fact|knowledge|relationship_change|item_change|location_change|ability_change|world_rule|promise|secret",
+                "entity_ids": [1],
+                "entity_names": ["可选的实体名"],
+                "title": "短标题",
+                "content": "截至本章结束仍成立的简洁事实",
+                "evidence": "本章中的短证据，不要长引文",
+                "importance": 1,
+            }],
+        },
+        "rules": [
+            "只返回 JSON 对象，不要 Markdown、不要解释。",
+            "宁可少提取，也不要把普通动作、模糊情绪或推测当成长期事实。",
+            "每条内容必须能从当前章节得到支持，不要编造后续发展。",
+            "同一事实不要拆成重复项目；没有重要变化时返回 {\"items\": []}。",
+            "entity_ids 只能使用给定实体；没有匹配实体时可不填。",
+            "importance 为 1 到 5，4-5 只用于重要转折、关键秘密或主线事实。",
+        ],
+        "known_entities": known_entities,
+        "confirmed_context": context_builder.render_context(
+            context, {"work_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"}
+        )[:22000],
+        "chapter": {
+            "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
+            "content": content[-20000:],
+        },
+    }
+    try:
+        parsed = _parse_json_from_model(llm.chat([
+            {"role": "system", "content": "你是长篇小说故事记忆整理员。输出必须是可解析 JSON。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ], base_url=base_url, api_key=api_key, model=model))
+    except Exception as exc:
+        if raise_on_error:
+            raise HTTPException(502, "故事记忆提取失败：" + _provider_error(exc))
+        return []
+    items = parsed.get("items") if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
+    if not isinstance(items, list):
+        if raise_on_error:
+            raise HTTPException(502, "故事记忆提取没有返回有效 JSON")
+        return []
+    proposals = []
+    for item in items[:24]:
+        if not isinstance(item, dict):
+            continue
+        saved = db.upsert_story_memory_proposal(chapter["work_id"], uid, cid, item)
+        if saved and not saved.get("invalid") and not saved.get("invalid_type"):
+            proposals.append(saved)
+    return proposals
 
 
 def _run_chapter_review(uid, cid, *, base_url=None, api_key=None, model=None, raise_on_error=False):
@@ -1535,15 +1809,23 @@ def _run_chapter_review(uid, cid, *, base_url=None, api_key=None, model=None, ra
     summary = parsed.get("summary") if isinstance(parsed.get("summary"), str) else ""
     alerts = db.replace_chapter_consistency_alerts(cid, uid, parsed.get("alerts") or [])
     workflow = db.update_chapter_workflow(cid, uid, status="review", summary=summary, checked=True)
+    character_state_proposals = _generate_character_state_proposals(
+        uid, cid, base_url=base_url, api_key=api_key, model=model,
+    )
+    plot_state_proposal = _generate_plot_state_proposal(
+        uid, cid, base_url=base_url, api_key=api_key, model=model,
+    )
+    memory_proposals = _generate_story_memory_proposals(
+        uid, cid, base_url=base_url, api_key=api_key, model=model,
+    )
+    analysis = db.mark_chapter_analysis_reviewed(cid, uid)
     return {
         "workflow": workflow,
         "alerts": alerts or [],
-        "character_state_proposals": _generate_character_state_proposals(
-            uid, cid, base_url=base_url, api_key=api_key, model=model,
-        ),
-        "plot_state_proposal": _generate_plot_state_proposal(
-            uid, cid, base_url=base_url, api_key=api_key, model=model,
-        ),
+        "character_state_proposals": character_state_proposals,
+        "plot_state_proposal": plot_state_proposal,
+        "memory_proposals": memory_proposals,
+        "analysis": analysis,
     }
 
 
@@ -1561,14 +1843,27 @@ def _compact_split(msgs, preserve):
     return keep_from if keep_from < n else 0
 
 
-def _agent_system(uid, cid):
+def _agent_context_task(instruction, selection):
+    if isinstance(selection, dict) and isinstance(selection.get("text"), str) and selection["text"].strip():
+        return "rewrite_selection"
+    text = (instruction or "").strip()
+    if any(keyword in text for keyword in ("续写", "接着写", "下一段", "下一章")):
+        return "continue_writing"
+    if any(keyword in text for keyword in ("分析", "复核", "检查一致性")):
+        return "chapter_review"
+    return "answer_story_question"
+
+
+def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
     parts = [
         "你是作者的写作 agent。你可以通过工具直接操作作者的作品：改正文、续写、"
-        "回退到历史版本、改章节标题/备注、新建章节、存版本、摘要、设定校验。"
+        "回退到历史版本、改章节标题/备注、新建章节、存版本、摘要、设定校验，也能检索、提取和确认故事记忆。"
         "原则：1) 要改某段文字前，先 read_chapter 读准确原文，再用 replace_text 或 edit_passage，"
         "old_text 必须与正文逐字一致；2) 每个写操作都会自动存版本，用户可一键撤销，所以放心改；"
         "3) 不要替作者下不可逆的决定；4) 通过写作工具改动正文后，系统会生成待作者确认的人物和剧情状态提议，"
-        "未确认前不改变卡片；5) 回答简洁，做完事说一句即可。"
+        "未确认前不改变卡片；5) 故事记忆也必须先提议再确认，不能把推测当事实；"
+        "6) 当用户问历史事实或要求保持连续性时，优先调用 search_story_memory 或 get_memory_source 核对；"
+        "7) 回答简洁，做完事说一句即可。"
     ]
     if cid:
         c = db.get_chapter_meta(cid, uid)
@@ -1580,9 +1875,16 @@ def _agent_system(uid, cid):
             content = c["content"] or ""
             parts.append(("当前正文全文（修改时请从中逐字复制 old_text）：\n" + content)
                          if content else "（正文为空）")
-            bible = _agent_bible(c["work_id"], uid, cid)
-            if bible:
-                parts.append("作品设定（人物/世界观/大纲），操作时请保持一致：\n" + bible)
+            context = context_builder.build_context(
+                uid, _agent_context_task(instruction, selection), c["work_id"], cid,
+                instruction=instruction, selection=selection, skill_ids=skill_ids, token_budget=18000,
+            )
+            if context:
+                story_context = context_builder.render_context(
+                    context, {"work_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"},
+                )
+                if story_context:
+                    parts.append("系统为本回合检索到的可信创作上下文：\n" + story_context)
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
@@ -1689,12 +1991,16 @@ def _agent_skill_catalog_system(uid, cid):
     }
 
 
-def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None):
+def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instruction=""):
     """把下一回合真正拼装的上下文以可审阅结构返回，不暴露 API Key。"""
     chapter = db.get_chapter_meta(cid, uid) if cid else None
     if cid and not chapter:
         return None
-    system_messages = [_agent_system(uid, cid)]
+    context = context_builder.build_context(
+        uid, "answer_story_question", chapter["work_id"] if chapter else None, cid,
+        instruction=instruction, selection=selection, skill_ids=skill_ids, token_budget=18000,
+    ) if chapter else {"context_items": [], "estimated_tokens": 0, "recalled_memory_ids": []}
+    system_messages = [_agent_system(uid, cid, instruction=instruction, selection=selection, skill_ids=skill_ids)]
     catalog = _agent_skill_catalog_system(uid, cid)
     if catalog:
         system_messages.append(catalog)
@@ -1733,6 +2039,9 @@ def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None):
             "agent_id": config.AGENT_SKILL_AGENT_ID,
         },
         "model": (db.get_settings(uid) or {}).get("llm_model") or config.LLM_MODEL,
+        "context_items": context.get("context_items") or [],
+        "estimated_tokens": context.get("estimated_tokens") or 0,
+        "recalled_memory_ids": context.get("recalled_memory_ids") or [],
         "system_messages": [{"label": "系统上下文", "content": item["content"]}
                             for item in system_messages if item.get("content")],
         "conversation_messages": len(conversation.get("messages") or []),
@@ -1959,6 +2268,149 @@ def _tool_check_consistency(uid, cid, cfg, args):
     return {"changed": False, "issues": s}
 
 
+def _current_story_work(uid, cid):
+    if not cid:
+        return None
+    chapter = db.get_chapter_meta(cid, uid)
+    if not chapter:
+        return None
+    return chapter
+
+
+def _memory_tool_rows(rows):
+    return [{
+        "id": row["id"], "type": row["memory_type"], "title": row["title"],
+        "content": row["content"], "evidence": row.get("evidence") or "",
+        "importance": row.get("importance"), "chapter_id": row["chapter_id"],
+        "chapter_title": row.get("chapter_title") or "", "chapter_ord": row.get("chapter_ord"),
+        "entities": row.get("entity_names") or [],
+    } for row in rows]
+
+
+def _tool_search_story_memory(uid, cid, cfg, args):
+    chapter = _current_story_work(uid, cid)
+    if not chapter:
+        return _agent_err("当前没有可用章节")
+    query = (args.get("query") or "").strip()
+    if not query:
+        return _agent_err("请提供要检索的人物、事件或物品")
+    entity_ids = [value for value in (args.get("entity_ids") or [])
+                  if isinstance(value, int) and not isinstance(value, bool) and value > 0]
+    memory_types = [value for value in (args.get("memory_types") or []) if value in db.STORY_MEMORY_TYPES]
+    limit = args.get("limit", 12)
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        limit = 12
+    rows = db.search_story_memories(
+        chapter["work_id"], uid, query, entity_ids or None, memory_types or None, cid, limit,
+    )
+    if rows is None:
+        return _agent_err("作品不存在")
+    return {"changed": False, "memories": _memory_tool_rows(rows), "summary": f"找到 {len(rows)} 条有效故事记忆"}
+
+
+def _tool_list_recent_memories(uid, cid, cfg, args):
+    chapter = _current_story_work(uid, cid)
+    if not chapter:
+        return _agent_err("当前没有可用章节")
+    limit = args.get("limit", 12)
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        limit = 12
+    rows = db.list_recent_story_memories(chapter["work_id"], uid, cid, limit) or []
+    return {"changed": False, "memories": _memory_tool_rows(rows), "summary": f"最近 {len(rows)} 条有效故事记忆"}
+
+
+def _tool_list_entity_memories(uid, cid, cfg, args):
+    chapter = _current_story_work(uid, cid)
+    entity_id = args.get("entity_id")
+    if not chapter or not isinstance(entity_id, int) or isinstance(entity_id, bool):
+        return _agent_err("请提供当前作品中的实体 id")
+    entity = db.get_entity(entity_id, uid)
+    if not entity or entity["work_id"] != chapter["work_id"]:
+        return _agent_err("实体不存在或不属于当前作品")
+    limit = args.get("limit", 20)
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        limit = 20
+    rows = db.search_story_memories(chapter["work_id"], uid, "", [entity_id], None, cid, limit) or []
+    return {"changed": False, "entity": {"id": entity_id, "name": entity["name"]},
+            "memories": _memory_tool_rows(rows), "summary": f"{entity['name']} 关联 {len(rows)} 条有效故事记忆"}
+
+
+def _tool_get_memory_source(uid, cid, cfg, args):
+    memory_id = args.get("memory_id")
+    if not isinstance(memory_id, int) or isinstance(memory_id, bool):
+        return _agent_err("请提供故事记忆 id")
+    source = db.get_story_memory_source(memory_id, uid)
+    if not source:
+        return _agent_err("故事记忆不存在")
+    chapter = source.get("chapter") or {}
+    memory = source.get("memory") or {}
+    return {
+        "changed": False,
+        "memory": _memory_tool_rows([memory])[0],
+        "source": {"chapter_id": chapter.get("id"), "title": chapter.get("title"), "ord": chapter.get("ord"),
+                   "evidence": memory.get("evidence") or "", "content_excerpt": (chapter.get("content") or "")[:5000]},
+        "summary": f"记忆来源：第{chapter.get('ord') or '?'}章《{chapter.get('title') or '未命名'}》",
+    }
+
+
+def _tool_analyze_chapter_memory(uid, cid, cfg, args):
+    if not _current_story_work(uid, cid):
+        return _agent_err("当前没有可用章节")
+    proposals = _generate_story_memory_proposals(
+        uid, cid, base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
+    )
+    return {"changed": False, "proposals": _memory_tool_rows(proposals),
+            "summary": f"已生成 {len(proposals)} 条待确认故事记忆"}
+
+
+def _tool_accept_memory_proposal(uid, cid, cfg, args):
+    memory_id = args.get("memory_id")
+    if not isinstance(memory_id, int) or isinstance(memory_id, bool):
+        return _agent_err("请提供故事记忆 id")
+    result = db.accept_story_memory(memory_id, uid)
+    if result is None:
+        return _agent_err("故事记忆不存在")
+    if result.get("stale"):
+        return _agent_err("正文已变化，这条提议已过期，请重新分析")
+    if result.get("resolved"):
+        return _agent_err("这条提议已经处理")
+    return {"changed": False, "memory": _memory_tool_rows([result])[0], "summary": "已确认故事记忆"}
+
+
+def _tool_reject_memory_proposal(uid, cid, cfg, args):
+    memory_id = args.get("memory_id")
+    if not isinstance(memory_id, int) or isinstance(memory_id, bool):
+        return _agent_err("请提供故事记忆 id")
+    result = db.reject_story_memory(memory_id, uid)
+    if result is None:
+        return _agent_err("故事记忆不存在")
+    if result.get("resolved"):
+        return _agent_err("这条提议已经处理")
+    return {"changed": False, "summary": "已拒绝故事记忆提议"}
+
+
+def _tool_mark_chapter_memory_stale(uid, cid, cfg, args):
+    if not cid:
+        return _agent_err("当前没有可用章节")
+    result = db.mark_chapter_story_memory_stale(cid, uid, args.get("reason") or "Agent 标记正文发生重大修改")
+    if not result:
+        return _agent_err("章节不存在")
+    return {"changed": False, **result,
+            "summary": f"已标记本章派生资料失效；后续 {result.get('later_chapters', 0)} 章可能受影响"}
+
+
+def _tool_get_context_preview(uid, cid, cfg, args):
+    snapshot = _agent_context_snapshot(uid, cid)
+    if not snapshot:
+        return _agent_err("章节不存在")
+    return {
+        "changed": False,
+        "estimated_tokens": snapshot.get("estimated_tokens"),
+        "context_items": snapshot.get("context_items") or [],
+        "summary": f"本轮上下文约 {snapshot.get('estimated_tokens', 0)} tokens",
+    }
+
+
 _AGENT_TOOLS = {
     "read_chapter": _tool_read_chapter, "list_chapters": _tool_list_chapters,
     "activate_skill": _tool_activate_skill, "read_skill_resource": _tool_read_skill_resource,
@@ -1968,6 +2420,11 @@ _AGENT_TOOLS = {
     "set_notes": _tool_set_notes, "create_chapter": _tool_create_chapter,
     "save_revision": _tool_save_revision, "restore_revision": _tool_restore_revision,
     "summarize": _tool_summarize, "check_consistency": _tool_check_consistency,
+    "search_story_memory": _tool_search_story_memory, "list_recent_memories": _tool_list_recent_memories,
+    "list_entity_memories": _tool_list_entity_memories, "get_memory_source": _tool_get_memory_source,
+    "analyze_chapter_memory": _tool_analyze_chapter_memory,
+    "accept_memory_proposal": _tool_accept_memory_proposal, "reject_memory_proposal": _tool_reject_memory_proposal,
+    "mark_chapter_memory_stale": _tool_mark_chapter_memory_stale, "get_context_preview": _tool_get_context_preview,
 }
 
 
@@ -2120,8 +2577,8 @@ def _pi_recent_history(messages):
     return list(messages[start:]) if start else list(messages)
 
 
-def _pi_system_prompt(uid, cid, selection, skill_ids, runtime_system, summary, cfg):
-    system_messages = [_agent_system(uid, cid)]
+def _pi_system_prompt(uid, cid, selection, skill_ids, runtime_system, summary, cfg, instruction=""):
+    system_messages = [_agent_system(uid, cid, instruction=instruction, selection=selection, skill_ids=skill_ids)]
     if runtime_system:
         system_messages.append(runtime_system)
     skill_catalog = _agent_skill_catalog_system(uid, cid)
@@ -2155,6 +2612,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
                   runtime_system=None, persist=True):
     """Run the writing agent through the official Pi Coding Agent process."""
     audio = None
+    context_instruction = history_text
     if model_turn is not None:
         content = model_turn.get("content") if isinstance(model_turn, dict) else None
         if not isinstance(content, list):
@@ -2172,6 +2630,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
                     audio = {"data": data, "format": format_, "instruction": instruction}
         if not audio:
             raise HTTPException(400, "语音请求缺少可用音频")
+        context_instruction = instruction or history_text
     st = db.get_settings(uid) or {}
     base_url = st.get("llm_base_url") or config.LLM_BASE_URL
     api_key = st.get("llm_api_key") or config.LLM_API_KEY
@@ -2185,7 +2644,9 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
     conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
     summary = conv["summary"] or ""
     history = _legacy_messages_to_pi(conv["messages"], model)
-    system_prompt = _pi_system_prompt(uid, cid, selection, skill_ids, runtime_system, summary, cfg)
+    system_prompt = _pi_system_prompt(
+        uid, cid, selection, skill_ids, runtime_system, summary, cfg, context_instruction,
+    )
 
     def execute_tool(name, args):
         fn = _AGENT_TOOLS.get(name)
@@ -2294,7 +2755,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
     stored_turn = {"role": "user", "content": history_text}
 
     # 发给模型的数组：系统提示 + 早期摘要(若有) + 当前对话
-    messages = [_agent_system(uid, cid)]
+    messages = [_agent_system(uid, cid, instruction=history_text, selection=selection, skill_ids=skill_ids)]
     if runtime_system:
         messages.append(runtime_system)
     skill_catalog = _agent_skill_catalog_system(uid, cid)
@@ -2417,6 +2878,7 @@ def _apply_story_update_proposals(uid, state_request):
     return (
         _generate_character_state_proposals(uid, state_request["chapter_id"], **kwargs),
         _generate_plot_state_proposal(uid, state_request["chapter_id"], **kwargs),
+        _generate_story_memory_proposals(uid, state_request["chapter_id"], **kwargs),
     )
 
 
@@ -2446,9 +2908,10 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     state_request = result.pop("_character_state_request", None)
     if not turn:
         if state_request:
-            character_proposals, plot_proposal = _apply_story_update_proposals(uid, state_request)
+            character_proposals, plot_proposal, memory_proposals = _apply_story_update_proposals(uid, state_request)
             result["character_state_proposals"] = character_proposals
             result["plot_state_proposal"] = plot_proposal
+            result["memory_proposals"] = memory_proposals
         return result
 
     pending = result.pop("_pending_conversation")
@@ -2463,9 +2926,10 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     skill_runtime.mark_conversation_saved(turn.turn_id, uid)
     result["skill_runtime"] = runtime_state
     if state_request:
-        character_proposals, plot_proposal = _apply_story_update_proposals(uid, state_request)
+        character_proposals, plot_proposal, memory_proposals = _apply_story_update_proposals(uid, state_request)
         result["character_state_proposals"] = character_proposals
         result["plot_state_proposal"] = plot_proposal
+        result["memory_proposals"] = memory_proposals
     return result
 
 
@@ -2484,7 +2948,9 @@ async def agent(request: Request):
 async def inspect_agent_context(request: Request):
     uid = _auth(request)
     body = await request.json()
-    result = _agent_context_snapshot(uid, body.get("chapter_id"), body.get("selection"), body.get("skill_ids"))
+    result = _agent_context_snapshot(
+        uid, body.get("chapter_id"), body.get("selection"), body.get("skill_ids"), body.get("text", ""),
+    )
     if result is None:
         raise HTTPException(404, "章节不存在")
     return result

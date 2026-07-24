@@ -12,7 +12,7 @@ os.environ["LLM_API_KEY"] = ""           # 测试不调真 LLM；校验/摘要/�
 os.environ["WRITEHTML_ADMIN_PASSWORD"] = "admintest"  # 引导创建的 admin 用确定性密码
 
 from fastapi.testclient import TestClient
-import main, db, llm, config
+import main, db, llm, config, context_builder
 
 db.init_db()
 c = TestClient(main.app)
@@ -763,6 +763,37 @@ uidAdm = db.verify_user("admin", "admintest")["id"]
 ok(c.delete(f"/api/admin/users/{uidAdm}", headers=H(tokAdm)).status_code == 400, "管理员不能删自己(400)")
 ok(c.delete("/api/admin/users/99999", headers=H(tokAdm)).status_code == 404, "删不存在用户 404")
 
+# V2 故事记忆闭环：确认后可按本轮指令召回；源章节变化后不再用于上下文。
+memory_c1 = c.post(f"/api/works/{wid}/chapters", json={"title": "记忆来源章"}, headers=H(tokA)).json()["id"]
+memory_c2 = c.post(f"/api/works/{wid}/chapters", json={"title": "记忆召回章"}, headers=H(tokA)).json()["id"]
+c.put(f"/api/chapters/{memory_c1}", json={"content": "林晚在旧码头取得月钥，并决定用它开启档案室。"}, headers=H(tokA))
+_memory_proposal = db.upsert_story_memory_proposal(wid, uidA, memory_c1, {
+    "memory_type": "item_change", "entity_ids": [ent["id"]], "title": "林晚获得月钥",
+    "content": "林晚目前持有月钥，计划用它开启档案室。",
+    "evidence": "她把月钥收入掌心，转身走向档案室。", "importance": 4,
+})
+ok(_memory_proposal and _memory_proposal["status"] == "proposed", "故事记忆先进入待确认")
+_memory_confirmed = db.accept_story_memory(_memory_proposal["id"], uidA)
+ok(_memory_confirmed and _memory_confirmed["status"] == "confirmed", "故事记忆可确认入库")
+_memory_hits = db.search_story_memories(wid, uidA, "林晚要怎么使用月钥", before_chapter_id=memory_c2)
+ok(len(_memory_hits) == 1 and _memory_hits[0]["title"] == "林晚获得月钥", "故事记忆 FTS 可按章节时点召回")
+_v2_context = context_builder.build_context(
+    uidA, "continue_writing", wid, memory_c2, instruction="续写林晚使用月钥进入档案室",
+)
+ok(any(item["type"] == "memory" and "林晚获得月钥" in item["content"] for item in _v2_context["context_items"]),
+   "ContextBuilder 包含已确认故事记忆及召回来源")
+ok("林晚获得月钥" in main._agent_system(uidA, memory_c2, instruction="续写林晚使用月钥进入档案室")["content"],
+   "真实 Agent 系统提示按本轮指令召回故事记忆")
+_memory_source = db.get_story_memory_source(_memory_proposal["id"], uidA)
+ok(_memory_source["chapter"]["id"] == memory_c1 and "月钥" in _memory_source["memory"]["evidence"],
+   "故事记忆可定位来源章节和证据")
+c.put(f"/api/chapters/{memory_c1}", json={"content": "林晚离开旧码头，尚未取得任何钥匙。"}, headers=H(tokA))
+ok(not db.search_story_memories(wid, uidA, "月钥", before_chapter_id=memory_c2), "源正文变化后旧记忆不再参与召回")
+_memory_overview = db.get_story_memory_overview(wid, uidA, memory_c1)
+ok(_memory_overview["counts"]["stale"] >= 1, "来源版本变化后故事记忆标记过期")
+_memory_mark = db.mark_chapter_story_memory_stale(memory_c1, uidA)
+ok(_memory_mark["ok"] and _memory_mark["later_chapters"] >= 1, "重大修改可标记本章资料失效并提示后续风险")
+
 # 删除
 ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")
 ok(c.delete(f"/api/works/{wid}", headers=H(tokA)).status_code == 200, "删作品")
@@ -780,12 +811,15 @@ ok(_nskill == 0, "删作品级联清空作品 Skill")
 with db.get_conn() as conn:
     _nres = conn.execute("SELECT COUNT(*) FROM agent_skill_resources WHERE skill_id=?", (skill_pkg["id"],)).fetchone()[0]
 ok(_nres == 0, "删作品级联清空 Skill 资料")
+with db.get_conn() as conn:
+    _nmem = conn.execute("SELECT COUNT(*) FROM story_memory_items WHERE work_id=?", (wid,)).fetchone()[0]
+ok(_nmem == 0, "删作品级联清空故事记忆")
 # 同样应级联清掉该作品各章节的 agent 对话（cid 上留有一条压缩后的对话）
 ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260724-5" in _home.text and "app.js?v=ui-20260724-5" in _home.text,
+ok(_home.status_code == 200 and "style.css?v=ui-20260724-7" in _home.text and "app.js?v=ui-20260724-7" in _home.text,
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")
