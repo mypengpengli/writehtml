@@ -1249,7 +1249,11 @@ async function delSkill(skillId) {
 /* ---------- AI 助手（常驻侧栏，对话即操作，自动存版本可撤销） ---------- */
 
 function toggleAISide() {
-  const open = $("app").classList.toggle("ai-open");
+  const app = $("app");
+  const opening = !app.classList.contains("ai-open");
+  // 笔记本宽度下两个工具栏会挤压正文；一次只展开一个，手机仍由 CSS 处理为全屏面板。
+  if (opening && workspaceNeedsExclusivePane() && app.classList.contains("story-open")) closeStoryDrawer();
+  const open = app.classList.toggle("ai-open");
   localStorage.setItem("aiOpen", open ? "1" : "0");
   if (open) setTimeout(() => { setAiTtsBtn(); renderAgent(); renderAgentSelection(); renderAgentSkills(); $("agentInput").focus(); }, 50);
   else if ("speechSynthesis" in window) speechSynthesis.cancel(); // 收起侧栏时停止朗读
@@ -1923,9 +1927,18 @@ const plotStateFields = [
 ];
 const plotStateSourceLabels = { manual: "手动记录", ai_confirmed: "AI 提议已采纳", ai_edited: "AI 提议编辑后采纳" };
 
+function workspaceNeedsExclusivePane() {
+  return window.innerWidth > 700 && window.innerWidth < 1450;
+}
 function openStoryDrawer(tab = "plot") {
   if (!currentWorkId) { showToast("请先创建或选择一个作品", "err"); return; }
-  $("app").classList.add("story-open");
+  const app = $("app");
+  if (workspaceNeedsExclusivePane() && app.classList.contains("ai-open")) {
+    app.classList.remove("ai-open");
+    localStorage.setItem("aiOpen", "0");
+    if ("speechSynthesis" in window) speechSynthesis.cancel();
+  }
+  app.classList.add("story-open");
   selectStoryTab(tab);
 }
 function toggleStoryDrawer() {

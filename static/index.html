@@ -5,17 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ui-20260724-2">
+  <link rel="stylesheet" href="style.css?v=ui-20260724-4">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
-    #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: #fff; transform: translateX(104%); }
+    #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
     #app.story-open #storyDrawer { transform: none; }
-    #app.ai-open #storyDrawer { right: 380px; }
     #storyDrawer .story-body { flex: 1; min-height: 0; overflow: auto; }
     #storyDrawer .story-form-grid, #storyDrawer .relation-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     #storyDrawer input, #storyDrawer textarea, #storyDrawer select { max-width: 100%; min-width: 0; }
+    @media (min-width: 701px) {
+      #app.story-open .sidebar { order: 0; }
+      #app.story-open #storyDrawer { position: relative; z-index: 0; inset: auto; order: 1; flex: 0 0 460px; width: 460px; height: auto; min-height: 0; transform: none; }
+      #app.story-open .main { order: 2; }
+      #app.story-open .ai-side { order: 3; }
+    }
+    @media (min-width: 701px) and (max-width: 1540px) {
+      #app.story-open #storyDrawer { flex-basis: 400px; width: 400px; }
+    }
     @media (max-width: 700px) {
-      #storyDrawer, #app.ai-open #storyDrawer { top: 0; right: 0; width: 100vw; height: 100dvh; transform: translateX(100%); }
+      #storyDrawer { top: 0; right: 0; width: 100vw; height: 100dvh; transform: translateX(100%); }
       #app.story-open #storyDrawer { transform: none; }
       #storyDrawer .story-form-grid, #storyDrawer .relation-form-grid { grid-template-columns: minmax(0, 1fr); }
     }
@@ -544,6 +552,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=ui-20260724-2"></script>
+  <script src="app.js?v=ui-20260724-4"></script>
 </body>
 </html>

@@ -522,11 +522,23 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .voice-trace.err svg, .voice-trace.err b { color: var(--danger); }
 .voice-trace.ok svg, .voice-trace.ok b { color: var(--success); }
 
-/* 写作工作台：大屏右侧抽屉，信息按标签分组，编辑器始终保留主体空间。 */
+/* 写作工作台：展开后固定为目录与正文之间的中栏，右侧始终留给 AI 助手。 */
 .story-backdrop { display: none; }
 .story-drawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100dvh; display: flex; flex-direction: column; background: var(--panel); border-left: 1px solid var(--line); box-shadow: var(--shadow); transform: translateX(104%); transition: transform .2s ease; }
 #app.story-open .story-drawer { transform: none; }
-#app.ai-open .story-drawer { right: 380px; }
+@media (min-width: 701px) {
+  #app.story-open .sidebar { order: 0; }
+  #app.story-open .story-drawer {
+    position: relative; z-index: 0; inset: auto; order: 1; flex: 0 0 460px; width: 460px;
+    height: auto; min-height: 0; border-left: none; border-right: 1px solid var(--line); box-shadow: none;
+    transform: none;
+  }
+  #app.story-open .main { order: 2; }
+  #app.story-open .ai-side { order: 3; }
+}
+@media (min-width: 701px) and (max-width: 1540px) {
+  #app.story-open .story-drawer { flex-basis: 400px; width: 400px; }
+}
 .story-head { display: flex; align-items: center; justify-content: space-between; min-height: 56px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-weight: 600; }
 .story-head > [data-ic] { display: inline-flex; align-items: center; gap: 6px; }
 .story-head-actions { display: inline-flex; gap: 4px; }
@@ -639,7 +651,7 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 @media (max-width: 700px) {
   .chap-stage { display: none; }
   .top-workbench { min-width: 44px; }
-  .story-drawer, #app.ai-open .story-drawer { z-index: 47; top: var(--vp-top, 0px); right: 0; width: 100vw; height: var(--vp-h, 100dvh); transform: translateX(100%); border-left: none; }
+  .story-drawer { z-index: 47; top: var(--vp-top, 0px); right: 0; width: 100vw; height: var(--vp-h, 100dvh); transform: translateX(100%); border-left: none; }
   #app.story-open .story-drawer { transform: none; }
   #app.story-open .story-backdrop { display: block; position: fixed; inset: 0; z-index: 46; background: var(--scrim); }
   .story-head { padding: calc(8px + env(safe-area-inset-top)) 10px 8px; }
