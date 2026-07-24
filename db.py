@@ -871,6 +871,51 @@ def create_plot_state_version(wid, user_id, chapter_id, state, change_summary=""
         return _plot_state_version_payload(row)
 
 
+def autosave_plot_state_version(wid, user_id, chapter_id, state, change_summary="", evidence=""):
+    """自动保存当前章节的作者剧情卡，复用当前自动草稿而不覆盖已确认历史。"""
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if not _chapter_for_work(conn, chapter_id, wid):
+            return {"invalid_chapter": True}
+        normalized = normalize_plot_state(state)
+        if not plot_state_has_content(normalized):
+            return {"empty_state": True}
+        summary = (change_summary or "").strip()[:1400]
+        proof = (evidence or "").strip()[:4000]
+        # 手动保存和 AI 采纳都是可追溯的节点。只更新最后一个确认节点之后
+        # 新建出的自动草稿，避免自动输入篡改历史版本。
+        existing = conn.execute(
+            "SELECT id FROM plot_state_versions WHERE work_id=? AND chapter_id=? "
+            "AND proposal_id IS NULL AND source='autosave' AND id > COALESCE(("
+            "SELECT MAX(id) FROM plot_state_versions WHERE work_id=? AND chapter_id=? "
+            "AND proposal_id IS NULL AND source<>'autosave'"
+            "), 0) ORDER BY id DESC LIMIT 1",
+            (wid, chapter_id, wid, chapter_id),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE plot_state_versions SET state_json=?, change_summary=?, evidence=?, source=?, created_at=? WHERE id=?",
+                (json.dumps(normalized, ensure_ascii=False), summary, proof, "autosave", now, existing["id"]),
+            )
+            vid = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
+                "VALUES(?,?,?,?,?,'autosave',NULL,?)",
+                (wid, chapter_id, json.dumps(normalized, ensure_ascii=False), summary, proof, now),
+            )
+            vid = cur.lastrowid
+        row = conn.execute(
+            "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "FROM plot_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
+            (vid,),
+        ).fetchone()
+        return _plot_state_version_payload(row)
+
+
 def upsert_plot_state_proposal(wid, user_id, chapter_id, state, change_summary="", evidence=""):
     """同一作品×章节只保留一条待确认剧情更新，重复分析会覆盖陈旧建议。"""
     now = time.time()

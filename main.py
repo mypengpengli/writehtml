@@ -364,7 +364,11 @@ async def save_plot_state_version(wid: int, request: Request):
         raise HTTPException(400, "请选择状态生效章节")
     if not isinstance(state, dict):
         raise HTTPException(400, "剧情状态格式不正确")
-    result = _plot_state_error(db.create_plot_state_version(
+    autosave = body.get("autosave", False)
+    if not isinstance(autosave, bool):
+        raise HTTPException(400, "自动保存参数不正确")
+    save = db.autosave_plot_state_version if autosave else db.create_plot_state_version
+    result = _plot_state_error(save(
         wid, uid, chapter_id, state, body.get("change_summary", ""), body.get("evidence", ""),
     ))
     return {"ok": True, "version": result}

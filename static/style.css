@@ -554,6 +554,8 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .story-meta { color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
 .story-section { display: flex; flex-direction: column; gap: 7px; padding-top: 12px; border-top: 1px solid var(--line); }
 .story-section-head { font-size: 14px; }
+.story-section .msg.autosave-ok { color: var(--success); }
+.story-section .msg.autosave-warn { color: var(--muted); }
 .story-section > label, .story-form-grid > label, .relation-form-grid > label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
 .story-section input, .story-section textarea, .story-section select, .story-form-grid input, .story-form-grid textarea, .relation-form-grid input, .relation-form-grid select { width: 100%; min-width: 0; }
 .story-section textarea, .story-form-grid textarea { min-height: 64px; resize: vertical; }

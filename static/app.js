@@ -37,6 +37,7 @@ let storyTab = "plot";
 let plotStateChapterId = null;
 let plotStateProposalId = null;
 let plotStateData = null;
+let plotStateSaveTimer = null;
 let chapterWorkflow = null;
 let entityRelations = [];
 let editingRelationId = null;
@@ -1925,7 +1926,7 @@ const plotStateFields = [
   ["next_goal", "下一章目标", "plotStateNextGoal"],
   ["notes", "补充", "plotStateNotes"],
 ];
-const plotStateSourceLabels = { manual: "手动记录", ai_confirmed: "AI 提议已采纳", ai_edited: "AI 提议编辑后采纳" };
+const plotStateSourceLabels = { autosave: "自动保存", manual: "手动记录", ai_confirmed: "AI 提议已采纳", ai_edited: "AI 提议编辑后采纳" };
 
 function workspaceNeedsExclusivePane() {
   return window.innerWidth > 700 && window.innerWidth < 1450;
@@ -1993,6 +1994,84 @@ function plotStateFormValue() {
   for (const [key, , id] of plotStateFields) state[key] = $(id).value.trim();
   return state;
 }
+function plotStateDraftKey() {
+  if (!currentWorkId || !plotStateChapterId) return "";
+  return `writehtml:plot-state-draft:${currentUsername || "anonymous"}:${currentWorkId}:${plotStateChapterId}`;
+}
+function plotStateDraftValue() {
+  return {
+    state: plotStateFormValue(),
+    change_summary: $("plotStateSummary").value.trim(),
+    evidence: $("plotStateEvidence").value.trim(),
+    proposal_id: plotStateProposalId,
+    saved_at: Date.now(),
+  };
+}
+function plotStateHasContent(draft) {
+  return Object.values(draft?.state || {}).some(Boolean);
+}
+function plotStateDraftSignature(draft) {
+  return JSON.stringify({ state: draft?.state || {}, change_summary: draft?.change_summary || "", evidence: draft?.evidence || "" });
+}
+function readPlotStateDraft(key = plotStateDraftKey()) {
+  if (!key) return null;
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || "null");
+    return value && typeof value === "object" ? value : null;
+  } catch (e) { return null; }
+}
+function writePlotStateDraft(draft = plotStateDraftValue()) {
+  const key = plotStateDraftKey();
+  if (!key) return;
+  try { localStorage.setItem(key, JSON.stringify(draft)); } catch (e) {}
+}
+function clearPlotStateDraft(key = plotStateDraftKey()) {
+  if (!key) return;
+  try { localStorage.removeItem(key); } catch (e) {}
+}
+function setPlotStateSaveMessage(message, tone = "") {
+  const el = $("plotStateMsg");
+  el.textContent = message || "";
+  el.classList.toggle("autosave-ok", tone === "ok");
+  el.classList.toggle("autosave-warn", tone === "warn");
+}
+function queuePlotStateAutosave() {
+  const draft = plotStateDraftValue();
+  writePlotStateDraft(draft); // 先写本机，断电/网络短断也不会立即丢。
+  clearTimeout(plotStateSaveTimer);
+  if (plotStateProposalId) {
+    setPlotStateSaveMessage("已本机暂存。AI 提议仍需手动确认，不会自动采纳。", "warn");
+    return;
+  }
+  if (!plotStateHasContent(draft)) {
+    setPlotStateSaveMessage("已本机暂存；至少填写一项剧情状态后会自动同步。", "warn");
+    return;
+  }
+  setPlotStateSaveMessage("已本机暂存，正在自动同步…", "warn");
+  plotStateSaveTimer = setTimeout(() => {
+    plotStateSaveTimer = null;
+    savePlotState(true);
+  }, 1200);
+}
+function restorePlotStateDraft() {
+  const key = plotStateDraftKey();
+  const draft = readPlotStateDraft(key);
+  if (!draft || !draft.state || typeof draft.state !== "object") return;
+  if (draft.proposal_id && draft.proposal_id !== plotStateProposalId) {
+    clearPlotStateDraft(key);
+    return;
+  }
+  for (const [field, , id] of plotStateFields) $(id).value = draft.state[field] || "";
+  $("plotStateSummary").value = draft.change_summary || "";
+  $("plotStateEvidence").value = draft.evidence || "";
+  if (plotStateProposalId) {
+    setPlotStateSaveMessage("已恢复本机草稿。AI 提议仍需点击“确认并保存”。", "warn");
+  } else if (plotStateHasContent(draft)) {
+    setPlotStateSaveMessage("已恢复本机草稿，正在自动同步…", "warn");
+    clearTimeout(plotStateSaveTimer);
+    plotStateSaveTimer = setTimeout(() => { plotStateSaveTimer = null; savePlotState(true); }, 1200);
+  }
+}
 function renderPlotState(data) {
   plotStateData = data;
   if (!plotStateChapterId && data.target_chapter) plotStateChapterId = data.target_chapter.id;
@@ -2003,6 +2082,7 @@ function renderPlotState(data) {
     ? `${plotStateSourceLabels[version.source] || "已记录"} · 生效于第${version.chapter_ord}章`
     : "尚无已确认状态";
   setPlotStateForm(data.current_state || {});
+  restorePlotStateDraft();
   const proposals = (data.proposals || []).filter(item => item.status === "pending");
   $("plotStateProposals").innerHTML = proposals.map(item => `
     <div class="story-proposal">
@@ -2036,6 +2116,7 @@ async function loadPlotState() {
   renderPlotState(data);
 }
 async function changePlotStateChapter() {
+  clearTimeout(plotStateSaveTimer);
   plotStateChapterId = +$("plotStateChapter").value || null;
   plotStateProposalId = null;
   await loadPlotState();
@@ -2054,6 +2135,7 @@ async function analyzePlotState() {
 async function acceptPlotStateProposal(pid) {
   try {
     await api(`/api/plot-state-proposals/${pid}/accept`, { body: {} });
+    clearPlotStateDraft();
     plotStateProposalId = null;
     await loadPlotState();
     showToast("已采纳剧情状态", "ok");
@@ -2068,26 +2150,54 @@ function editPlotStateProposal(pid) {
 async function rejectPlotStateProposal(pid) {
   try {
     await api(`/api/plot-state-proposals/${pid}/reject`, { body: {} });
+    clearPlotStateDraft();
     if (plotStateProposalId === pid) setPlotStateForm(plotStateData?.current_state || {});
     await loadPlotState();
     showToast("已忽略该剧情提议");
   } catch (e) { $("plotStateMsg").textContent = e.message; }
 }
-async function savePlotState() {
+async function savePlotState(automatic = false) {
   if (!currentWorkId || !plotStateChapterId) return;
   const button = $("plotStateSaveBtn");
   const confirming = !!plotStateProposalId;
-  busy(button, true, confirming ? "确认中" : "保存中");
+  if (automatic && confirming) return;
+  if (!automatic) {
+    clearTimeout(plotStateSaveTimer);
+    busy(button, true, confirming ? "确认中" : "保存中");
+  }
+  const workId = currentWorkId;
+  const chapterId = plotStateChapterId;
   const body = { state: plotStateFormValue(), change_summary: $("plotStateSummary").value.trim(),
     evidence: $("plotStateEvidence").value.trim() };
+  const draftKey = plotStateDraftKey();
+  const signature = plotStateDraftSignature(body);
+  if (automatic && !plotStateHasContent(body)) return;
   try {
-    if (plotStateProposalId) await api(`/api/plot-state-proposals/${plotStateProposalId}/accept`, { body });
-    else await api(`/api/works/${currentWorkId}/plot-state-versions`, { body: { ...body, chapter_id: plotStateChapterId } });
+    let response;
+    if (plotStateProposalId) response = await api(`/api/plot-state-proposals/${plotStateProposalId}/accept`, { body });
+    else response = await api(`/api/works/${workId}/plot-state-versions`, { body: { ...body, chapter_id: chapterId, autosave: automatic } });
+    const storedDraft = readPlotStateDraft(draftKey);
+    if (storedDraft && plotStateDraftSignature(storedDraft) === signature) clearPlotStateDraft(draftKey);
     plotStateProposalId = null;
+    if (automatic) {
+      if (currentWorkId === workId && plotStateChapterId === chapterId) {
+        if (plotStateData) {
+          plotStateData.current_state = body.state;
+          plotStateData.state_version = response.version || plotStateData.state_version;
+        }
+        const version = response.version;
+        if (version) $("plotStateSource").textContent = `${plotStateSourceLabels[version.source] || "已记录"} · 生效于第${version.chapter_ord}章`;
+        setPlotStateSaveMessage("已自动保存到服务器。", "ok");
+      }
+      return;
+    }
     await loadPlotState();
     showToast("剧情状态已保存", "ok");
-  } catch (e) { $("plotStateMsg").textContent = e.message; }
-  finally { busy(button, false, "保存为本章剧情状态"); }
+  } catch (e) {
+    setPlotStateSaveMessage(automatic ? "服务器暂不可用，草稿已保存在本机。" : e.message, automatic ? "warn" : "");
+  } finally {
+    if (!automatic) busy(button, false, "保存为本章剧情状态");
+  }
 }
 
 function syncChapterWorkflow(workflow) {
@@ -2439,6 +2549,8 @@ $("content").addEventListener("mouseup", updateSelectionTools);
 $("content").addEventListener("select", updateSelectionTools);
 $("notes").addEventListener("input", onNotesInput);
 $("chapTitle").addEventListener("input", () => { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); });
+plotStateFields.map(([, , id]) => id).concat(["plotStateSummary", "plotStateEvidence"])
+  .forEach(id => $(id).addEventListener("input", queuePlotStateAutosave));
 document.addEventListener("click", (e) => {
   const m = $("moreMenu");
   if (m && !m.classList.contains("hidden") && !e.target.closest(".menu-wrap")) m.classList.add("hidden");

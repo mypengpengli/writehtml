@@ -341,6 +341,17 @@ plot_v1 = c.post(f"/api/works/{wid}/plot-state-versions", json={
     "change_summary": "主角开始调查失踪案", "evidence": "第一章结尾抵达北城",
 }, headers=H(tokA))
 ok(plot_v1.status_code == 200, "剧情状态可手动保存")
+plot_auto1 = c.post(f"/api/works/{wid}/plot-state-versions", json={
+    "chapter_id": state_c1,
+    "state": {"mainline": "调查北城失踪案", "current_event": "林晚抵达北城", "open_threads": "失踪者下落", "next_goal": "寻找目击者", "notes": "自动草稿 A"},
+    "change_summary": "主角开始调查失踪案", "evidence": "第一章结尾抵达北城", "autosave": True,
+}, headers=H(tokA)).json()["version"]
+plot_auto2 = c.post(f"/api/works/{wid}/plot-state-versions", json={
+    "chapter_id": state_c1,
+    "state": {"mainline": "调查北城失踪案", "current_event": "林晚抵达北城", "open_threads": "失踪者下落", "next_goal": "寻找目击者", "notes": "自动草稿 B"},
+    "change_summary": "主角开始调查失踪案", "evidence": "第一章结尾抵达北城", "autosave": True,
+}, headers=H(tokA)).json()["version"]
+ok(plot_auto1["id"] != plot_v1.json()["version"]["id"] and plot_auto1["id"] == plot_auto2["id"] and plot_auto2["state"]["notes"] == "自动草稿 B", "剧情自动保存更新当前草稿而不覆盖手动版本")
 plot_c2 = c.get(f"/api/works/{wid}/plot-state?chapter_id={state_c2}", headers=H(tokA)).json()
 ok(plot_c2["current_state"]["mainline"] == "调查北城失踪案", "剧情状态跨章节继承")
 plot_proposal = db.upsert_plot_state_proposal(
@@ -774,7 +785,7 @@ ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260724-4" in _home.text and "app.js?v=ui-20260724-4" in _home.text,
+ok(_home.status_code == 200 and "style.css?v=ui-20260724-5" in _home.text and "app.js?v=ui-20260724-5" in _home.text,
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")
