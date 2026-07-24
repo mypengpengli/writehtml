@@ -12,6 +12,50 @@ import config
 DB_PATH = config.DB_PATH
 
 
+# 人物的基础设定仍存放在 entities；下面这些字段只描述“截至某一章”的动态状态。
+# 统一为短文本，既便于作者编辑，也避免把瞬时状态再拆成难以维护的多张表。
+CHARACTER_STATE_FIELDS = (
+    "location", "goal", "emotion", "physical", "information",
+    "relationships", "assets", "secrets", "notes",
+)
+CHARACTER_STATE_LABELS = {
+    "location": "地点", "goal": "目标", "emotion": "情绪", "physical": "身体",
+    "information": "已知信息", "relationships": "关系", "assets": "能力/物品",
+    "secrets": "秘密/承诺", "notes": "补充",
+}
+
+
+def normalize_character_state(state, base=None):
+    """把 API/模型输入规整为可持久化的完整人物状态快照。"""
+    state = state if isinstance(state, dict) else {}
+    base = base if isinstance(base, dict) else {}
+    result = {}
+    for field in CHARACTER_STATE_FIELDS:
+        value = state.get(field, base.get(field, ""))
+        if value is None:
+            value = ""
+        elif isinstance(value, (list, tuple)):
+            value = "；".join(str(x).strip() for x in value if str(x).strip())
+        elif isinstance(value, dict):
+            value = "；".join(f"{k}：{v}" for k, v in value.items() if str(v).strip())
+        elif not isinstance(value, str):
+            value = str(value)
+        result[field] = value.strip()[:3000]
+    return result
+
+
+def _decode_character_state(raw):
+    try:
+        value = json.loads(raw or "{}")
+    except Exception:
+        value = {}
+    return normalize_character_state(value)
+
+
+def character_state_has_content(state):
+    return any((state or {}).get(field) for field in CHARACTER_STATE_FIELDS)
+
+
 @contextmanager
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -97,6 +141,33 @@ def init_db():
                 updated_at REAL,
                 FOREIGN KEY(work_id) REFERENCES works(id)
             );
+            CREATE TABLE IF NOT EXISTS entity_state_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id INTEGER NOT NULL,
+                chapter_id INTEGER NOT NULL,
+                state_json TEXT NOT NULL DEFAULT '{}',
+                change_summary TEXT DEFAULT '',
+                evidence TEXT DEFAULT '',
+                source TEXT DEFAULT 'manual',
+                proposal_id INTEGER,
+                created_at REAL,
+                FOREIGN KEY(entity_id) REFERENCES entities(id),
+                FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+            );
+            CREATE TABLE IF NOT EXISTS entity_state_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id INTEGER NOT NULL,
+                chapter_id INTEGER NOT NULL,
+                state_json TEXT NOT NULL DEFAULT '{}',
+                change_summary TEXT DEFAULT '',
+                evidence TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at REAL,
+                updated_at REAL,
+                resolved_at REAL,
+                FOREIGN KEY(entity_id) REFERENCES entities(id),
+                FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+            );
             CREATE TABLE IF NOT EXISTS agent_conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -136,6 +207,10 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_segments_chapter ON segments(chapter_id);
             CREATE INDEX IF NOT EXISTS idx_revisions_chapter ON chapter_revisions(chapter_id);
             CREATE INDEX IF NOT EXISTS idx_entities_work ON entities(work_id);
+            CREATE INDEX IF NOT EXISTS idx_entity_state_versions_entity_chapter
+                ON entity_state_versions(entity_id, chapter_id, id);
+            CREATE INDEX IF NOT EXISTS idx_entity_state_proposals_chapter_status
+                ON entity_state_proposals(chapter_id, status, entity_id);
             CREATE INDEX IF NOT EXISTS idx_conv_user ON agent_conversations(user_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_skills_user_work ON agent_skills(user_id, work_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_skill_resources_skill ON agent_skill_resources(skill_id, path);
@@ -342,8 +417,14 @@ def admin_delete_user(user_id):
             conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
         # 章节以上的作品级数据 + 该用户的无章节对话 + 设置 + 账号本身
         conn.execute("DELETE FROM chapters WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM entity_state_versions WHERE entity_id IN "
+                     "(SELECT id FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?))", (user_id,))
+        conn.execute("DELETE FROM entity_state_proposals WHERE entity_id IN "
+                     "(SELECT id FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?))", (user_id,))
         conn.execute("DELETE FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skills WHERE user_id=?", (user_id,))
@@ -467,7 +548,11 @@ def delete_work(wid, user_id):
             conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM entity_state_versions WHERE entity_id IN (SELECT id FROM entities WHERE work_id=?)", (wid,))
+        conn.execute("DELETE FROM entity_state_proposals WHERE entity_id IN (SELECT id FROM entities WHERE work_id=?)", (wid,))
         conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE work_id=?)", (wid,))
         conn.execute("DELETE FROM agent_skills WHERE work_id=?", (wid,))
@@ -513,14 +598,94 @@ def update_work_notes(wid, user_id, notes):
 
 # ---------- 实体卡片（作品级 wiki）----------
 
-def list_entities(wid, user_id):
+def _state_version_payload(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["state"] = _decode_character_state(item.pop("state_json", "{}"))
+    return item
+
+
+def _state_proposal_payload(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["state"] = _decode_character_state(item.pop("state_json", "{}"))
+    return item
+
+
+def _entity_row(conn, eid, user_id):
+    row = conn.execute(
+        "SELECT e.id, e.work_id, e.name, e.kind, e.summary, e.detail, e.created_at, e.updated_at "
+        "FROM entities e JOIN works w ON e.work_id=w.id WHERE e.id=? AND w.user_id=?",
+        (eid, user_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_entity(eid, user_id):
+    with get_conn() as conn:
+        return _entity_row(conn, eid, user_id)
+
+
+def _chapter_for_work(conn, cid, wid):
+    if cid is None:
+        return None
+    row = conn.execute(
+        "SELECT id, work_id, title, ord FROM chapters "
+        "WHERE id=? AND work_id=? AND deleted_at IS NULL",
+        (cid, wid),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _state_version_at(conn, eid, target_chapter_id, before=False):
+    if target_chapter_id is None:
+        return None
+    op = "<" if before else "<="
+    row = conn.execute(
+        "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+        "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+        "FROM entity_state_versions v "
+        "JOIN chapters c ON c.id=v.chapter_id "
+        "JOIN chapters target ON target.id=? "
+        f"WHERE v.entity_id=? AND c.deleted_at IS NULL AND target.deleted_at IS NULL "
+        f"AND c.work_id=target.work_id AND c.ord {op} target.ord "
+        "ORDER BY c.ord DESC, v.id DESC LIMIT 1",
+        (target_chapter_id, eid),
+    ).fetchone()
+    return _state_version_payload(row)
+
+
+def list_entities(wid, user_id, at_chapter_id=None):
+    """作品级基础卡；传入章节时附带该时点有效的动态人物状态。"""
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
             return None
-        return [dict(r) for r in conn.execute(
+        if at_chapter_id is not None and not _chapter_for_work(conn, at_chapter_id, wid):
+            return None
+        rows = [dict(r) for r in conn.execute(
             "SELECT id, name, kind, summary, detail, created_at, updated_at "
             "FROM entities WHERE work_id=? ORDER BY kind, id", (wid,)
         )]
+        if at_chapter_id is None:
+            return rows
+        for entity in rows:
+            entity["current_state"] = None
+            entity["state_version"] = None
+            entity["pending_count"] = 0
+            if entity["kind"] != "人物":
+                continue
+            version = _state_version_at(conn, entity["id"], at_chapter_id)
+            if version:
+                entity["current_state"] = version["state"]
+                entity["state_version"] = version
+            entity["pending_count"] = conn.execute(
+                "SELECT COUNT(*) FROM entity_state_proposals "
+                "WHERE entity_id=? AND chapter_id=? AND status='pending'",
+                (entity["id"], at_chapter_id),
+            ).fetchone()[0]
+        return rows
 
 
 def create_entity(wid, user_id, name, kind, summary, detail):
@@ -562,24 +727,231 @@ def delete_entity(eid, user_id):
     with get_conn() as conn:
         if not _entity_owned(conn, eid, user_id):
             return False
+        conn.execute("DELETE FROM entity_state_versions WHERE entity_id=?", (eid,))
+        conn.execute("DELETE FROM entity_state_proposals WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entities WHERE id=?", (eid,))
         return True
 
 
-def get_entity_digest(wid, user_id):
-    """把作品实体格式化成一行一条的摘要，拼进 bible 喂给 AI 当结构化设定。"""
+def list_character_cards(wid, user_id, at_chapter_id=None, before=False):
+    """供状态提取和 AI 上下文使用的人物基础卡 + 指定章节前/截至该章的状态。"""
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
-            return ""
-        rows = conn.execute(
-            "SELECT name, kind, summary FROM entities WHERE work_id=? ORDER BY kind, id",
-            (wid,)
+            return None
+        if at_chapter_id is not None and not _chapter_for_work(conn, at_chapter_id, wid):
+            return None
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, work_id, name, kind, summary, detail FROM entities "
+            "WHERE work_id=? AND kind='人物' ORDER BY id", (wid,)
+        )]
+        for entity in rows:
+            version = _state_version_at(conn, entity["id"], at_chapter_id, before=before)
+            entity["current_state"] = version["state"] if version else normalize_character_state({})
+            entity["state_version"] = version
+        return rows
+
+
+def get_entity_state_overview(eid, user_id, at_chapter_id=None):
+    """单个人物在一个章节时点的卡片、待确认提议和成长历史。"""
+    with get_conn() as conn:
+        entity = _entity_row(conn, eid, user_id)
+        if not entity:
+            return None
+        target = None
+        if at_chapter_id is not None:
+            target = _chapter_for_work(conn, at_chapter_id, entity["work_id"])
+            if not target:
+                return {"invalid_chapter": True}
+        version = _state_version_at(conn, eid, at_chapter_id)
+        history_rows = conn.execute(
+            "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord, "
+            "c.deleted_at AS chapter_deleted_at "
+            "FROM entity_state_versions v JOIN chapters c ON c.id=v.chapter_id "
+            "WHERE v.entity_id=? ORDER BY c.ord DESC, v.id DESC",
+            (eid,),
         ).fetchall()
+        proposal_rows = []
+        if at_chapter_id is not None:
+            proposal_rows = conn.execute(
+                "SELECT p.id, p.entity_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, "
+                "p.status, p.created_at, p.updated_at, p.resolved_at "
+                "FROM entity_state_proposals p WHERE p.entity_id=? AND p.chapter_id=? "
+                "ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END, p.id DESC",
+                (eid, at_chapter_id),
+            ).fetchall()
+        return {
+            "entity": entity,
+            "target_chapter": target,
+            "current_state": version["state"] if version else normalize_character_state({}),
+            "state_version": version,
+            "history": [_state_version_payload(row) for row in history_rows],
+            "proposals": [_state_proposal_payload(row) for row in proposal_rows],
+        }
+
+
+def create_character_state_version(eid, user_id, chapter_id, state, change_summary="", evidence="", source="manual", proposal_id=None):
+    """人工保存一个完整快照；基础卡与状态卡始终分开。"""
+    now = time.time()
+    with get_conn() as conn:
+        entity = _entity_row(conn, eid, user_id)
+        if not entity:
+            return None
+        if entity["kind"] != "人物":
+            return {"not_character": True}
+        if not _chapter_for_work(conn, chapter_id, entity["work_id"]):
+            return {"invalid_chapter": True}
+        normalized = normalize_character_state(state)
+        if not character_state_has_content(normalized):
+            return {"empty_state": True}
+        cur = conn.execute(
+            "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (eid, chapter_id, json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1000],
+             (evidence or "").strip()[:3000], source, proposal_id, now),
+        )
+        row = conn.execute(
+            "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "FROM entity_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return _state_version_payload(row)
+
+
+def upsert_character_state_proposal(eid, user_id, chapter_id, state, change_summary="", evidence=""):
+    """同一人物×章节只保留一条待确认 AI 提议，重新分析会刷新它而不是堆积噪音。"""
+    now = time.time()
+    with get_conn() as conn:
+        entity = _entity_row(conn, eid, user_id)
+        if not entity:
+            return None
+        if entity["kind"] != "人物":
+            return {"not_character": True}
+        if not _chapter_for_work(conn, chapter_id, entity["work_id"]):
+            return {"invalid_chapter": True}
+        normalized = normalize_character_state(state)
+        if not character_state_has_content(normalized):
+            return {"empty_state": True}
+        payload = (json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1000],
+                   (evidence or "").strip()[:3000], now)
+        existing = conn.execute(
+            "SELECT id FROM entity_state_proposals WHERE entity_id=? AND chapter_id=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1", (eid, chapter_id),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE entity_state_proposals SET state_json=?, change_summary=?, evidence=?, updated_at=? WHERE id=?",
+                (*payload, existing["id"]),
+            )
+            pid = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO entity_state_proposals(entity_id,chapter_id,state_json,change_summary,evidence,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'pending',?,?)",
+                (eid, chapter_id, payload[0], payload[1], payload[2], now, now),
+            )
+            pid = cur.lastrowid
+        row = conn.execute(
+            "SELECT id, entity_id, chapter_id, state_json, change_summary, evidence, status, "
+            "created_at, updated_at, resolved_at FROM entity_state_proposals WHERE id=?", (pid,)
+        ).fetchone()
+        return _state_proposal_payload(row)
+
+
+def list_character_state_proposals(chapter_id, user_id):
+    with get_conn() as conn:
+        chapter = conn.execute(
+            "SELECT c.id, c.work_id, c.title, c.ord FROM chapters c JOIN works w ON c.work_id=w.id "
+            "WHERE c.id=? AND c.deleted_at IS NULL AND w.user_id=?", (chapter_id, user_id),
+        ).fetchone()
+        if not chapter:
+            return None
+        rows = conn.execute(
+            "SELECT p.id, p.entity_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, "
+            "p.status, p.created_at, p.updated_at, p.resolved_at, e.name AS entity_name "
+            "FROM entity_state_proposals p JOIN entities e ON e.id=p.entity_id "
+            "WHERE p.chapter_id=? ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END, p.id DESC",
+            (chapter_id,),
+        ).fetchall()
+        return {"chapter": dict(chapter), "proposals": [_state_proposal_payload(row) for row in rows]}
+
+
+def accept_character_state_proposal(pid, user_id, state=None, change_summary=None, evidence=None):
+    now = time.time()
+    with get_conn() as conn:
+        proposal = conn.execute(
+            "SELECT p.id, p.entity_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status "
+            "FROM entity_state_proposals p JOIN entities e ON e.id=p.entity_id "
+            "JOIN works w ON w.id=e.work_id WHERE p.id=? AND w.user_id=?", (pid, user_id),
+        ).fetchone()
+        if not proposal:
+            return None
+        if proposal["status"] != "pending":
+            return {"resolved": True}
+        previous = _decode_character_state(proposal["state_json"])
+        normalized = normalize_character_state(state, previous)
+        if not character_state_has_content(normalized):
+            return {"empty_state": True}
+        summary = proposal["change_summary"] if change_summary is None else (change_summary or "").strip()[:1000]
+        proof = proposal["evidence"] if evidence is None else (evidence or "").strip()[:3000]
+        edited = state is not None or change_summary is not None or evidence is not None
+        cur = conn.execute(
+            "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (proposal["entity_id"], proposal["chapter_id"], json.dumps(normalized, ensure_ascii=False),
+             summary, proof, "ai_edited" if edited else "ai_confirmed", pid, now),
+        )
+        conn.execute(
+            "UPDATE entity_state_proposals SET status='accepted', updated_at=?, resolved_at=? WHERE id=?",
+            (now, now, pid),
+        )
+        version = conn.execute(
+            "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "FROM entity_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return {"version": _state_version_payload(version)}
+
+
+def reject_character_state_proposal(pid, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT p.id, p.status FROM entity_state_proposals p JOIN entities e ON e.id=p.entity_id "
+            "JOIN works w ON w.id=e.work_id WHERE p.id=? AND w.user_id=?", (pid, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] != "pending":
+            return {"resolved": True}
+        conn.execute(
+            "UPDATE entity_state_proposals SET status='rejected', updated_at=?, resolved_at=? WHERE id=?",
+            (now, now, pid),
+        )
+        return {"ok": True}
+
+
+def get_entity_digest(wid, user_id, at_chapter_id=None):
+    """基础实体 + 指定章节生效的人物状态，拼进 AI 的写作上下文。"""
+    rows = list_entities(wid, user_id, at_chapter_id)
     if not rows:
         return ""
-    return "作品实体（写作时保持一致）：\n" + "\n".join(
-        f"[{r['kind']}] {r['name']}" + (f"：{r['summary']}" if r['summary'] else "") for r in rows
-    )
+    lines = []
+    for row in rows:
+        line = f"[{row['kind']}] {row['name']}" + (f"：{row['summary']}" if row["summary"] else "")
+        detail = (row.get("detail") or "").strip()
+        if detail:
+            line += "\n  基础设定：" + detail[:1600]
+        state = row.get("current_state") or {}
+        details = [f"{CHARACTER_STATE_LABELS[field]}={state[field]}" for field in CHARACTER_STATE_FIELDS if state.get(field)]
+        if details:
+            version = row.get("state_version") or {}
+            chapter_name = version.get("chapter_title") or "当前时点"
+            line += f"\n  动态状态（截至《{chapter_name}》）：" + "；".join(details)
+        lines.append(line)
+    return "作品实体（写作时保持一致）：\n" + "\n".join(lines)
 
 
 # ---------- AI Skills（用户可复用的 agent 指令模板）----------
@@ -845,6 +1217,8 @@ def purge_chapter(cid, user_id):
         conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE id=?", (cid,))
         return True
 

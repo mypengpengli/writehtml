@@ -210,6 +210,51 @@
     </div>
   </div>
 
+  <!-- 人物动态卡：基础设定不覆盖；状态按章节版本查看、确认和回溯 -->
+  <div id="characterStateOverlay" class="overlay hidden">
+    <div class="overlay-card character-state-card">
+      <div class="overlay-head">
+        <span id="characterStateTitle">人物动态卡</span>
+        <span class="overlay-head-actions">
+          <button id="characterStateAnalyzeBtn" onclick="analyzeCharacterState()">提取本章变化</button>
+          <button class="ic" data-ic="x" onclick="closeCharacterState()" title="关闭"></button>
+        </span>
+      </div>
+      <div class="character-state-body">
+        <div class="character-state-context">
+          <label>查看时点<select id="characterStateChapter" onchange="changeCharacterStateChapter()"></select></label>
+          <span id="characterStateMeta" class="character-state-meta"></span>
+        </div>
+        <div id="characterStateBase" class="character-state-base"></div>
+        <div id="characterStateProposals" class="character-state-proposals"></div>
+        <section class="character-state-section">
+          <div class="character-state-section-head"><b>当前状态</b><span id="characterStateSource" class="character-state-meta"></span></div>
+          <div class="character-state-grid">
+            <label>所在地点<input id="characterStateLocation"></label>
+            <label>当前目标<input id="characterStateGoal"></label>
+            <label>当前情绪<input id="characterStateEmotion"></label>
+            <label>身体状态<input id="characterStatePhysical"></label>
+            <label>已知信息<textarea id="characterStateInformation"></textarea></label>
+            <label>关系变化<textarea id="characterStateRelationships"></textarea></label>
+            <label>能力 / 物品<textarea id="characterStateAssets"></textarea></label>
+            <label>秘密 / 承诺<textarea id="characterStateSecrets"></textarea></label>
+          </div>
+          <label class="character-state-wide">补充状态<textarea id="characterStateNotes"></textarea></label>
+          <label>本章变化摘要<input id="characterStateSummary"></label>
+          <label>剧情依据<textarea id="characterStateEvidence"></textarea></label>
+          <div class="set-actions">
+            <button id="characterStateSaveBtn" onclick="saveCharacterState()">保存为本章状态</button>
+          </div>
+          <span id="characterStateMsg" class="msg"></span>
+        </section>
+        <section class="character-state-section">
+          <div class="character-state-section-head"><b>成长记录</b></div>
+          <div id="characterStateHistory" class="character-state-history"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
   <!-- AI Skills：可复用的 agent 写作规则，通用或当前作品专用 -->
   <div id="skillsOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">

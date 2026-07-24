@@ -304,6 +304,11 @@ async function loadChapter() {
   updateWC();
   const cur = chapters.find(x => x.id === currentChapterId);
   if (cur) cur.chars = charCount(c.content || "");
+  if (entitiesCacheWorkId === currentWorkId) entitiesCacheChapterId = null;
+  if (!$("wikiOverlay").classList.contains("hidden")) await refreshCharacterCards();
+  if (!$("characterStateOverlay").classList.contains("hidden") && characterStateChapterId === currentChapterId) {
+    await loadCharacterState();
+  }
 }
 
 async function newWork() {
@@ -568,6 +573,10 @@ async function processAndAppend(text) {
     const r = await api("/api/process", { body: { mode, text, context: ctx, chapter_id: currentChapterId } });
     appendText(r.result);          // 本地追加结果，保留正在手打的内容
     onContentInput();
+    if (Array.isArray(r.character_state_proposals) && r.character_state_proposals.length) {
+      showToast(`已生成 ${r.character_state_proposals.length} 条人物状态待确认`, "ok");
+      await refreshCharacterCards();
+    }
     setMicStatus("");
   } catch (e) { setMicStatus("出错：" + e.message); }
 }
@@ -586,6 +595,10 @@ async function processSelection(m, style) {
     el.setRangeText(r.result, s, e, "end");   // 原地替换选区，保留撤销历史
     onContentInput();                          // 触发自动保存（走 PUT /api/chapters/{cid}）
     updateSelectionTools();
+    if (Array.isArray(r.character_state_proposals) && r.character_state_proposals.length) {
+      showToast(`已生成 ${r.character_state_proposals.length} 条人物状态待确认`, "ok");
+      await refreshCharacterCards();
+    }
     setMicStatus("");
   } catch (e) { setMicStatus("出错：" + e.message); }
 }
@@ -724,6 +737,10 @@ async function recoverFromRevision(rid) {
     appendText(r.result);          // 找回的段落追加进正文，非破坏式
     onContentInput();
     closeRevisions();
+    if (Array.isArray(r.character_state_proposals) && r.character_state_proposals.length) {
+      showToast(`已生成 ${r.character_state_proposals.length} 条人物状态待确认`, "ok");
+      await refreshCharacterCards();
+    }
     flash("已找回内容并追加");
   } catch (e) { setMicStatus("出错：" + e.message); }
 }
@@ -1106,6 +1123,14 @@ async function applyAgentResult(r, selection) {
   }
   if (sidebarDirty) await loadChapters();
   else if (contentChanged && currentChapterId) await loadChapter();
+  const proposals = Array.isArray(r.character_state_proposals) ? r.character_state_proposals : [];
+  if (proposals.length) {
+    showToast(`已生成 ${proposals.length} 条人物状态待确认`, "ok");
+    await refreshCharacterCards();
+    if (!$("characterStateOverlay").classList.contains("hidden") && characterStateChapterId === currentChapterId) {
+      await loadCharacterState();
+    }
+  }
 }
 function speakLatestAgentTurn() {
   const uIdx = agentMsgs.map(m => m.role).lastIndexOf("user");
@@ -1389,26 +1414,64 @@ function speakAgentText(txt) {
 
 let entitiesCache = [];
 let entitiesCacheWorkId = null;
+let entitiesCacheChapterId = null;
 let editingEntityId = null;
+let characterStateEntityId = null;
+let characterStateChapterId = null;
+let characterStateProposalId = null;
+let characterStateData = null;
+const characterStateFields = [
+  ["location", "所在地点", "characterStateLocation"],
+  ["goal", "当前目标", "characterStateGoal"],
+  ["emotion", "当前情绪", "characterStateEmotion"],
+  ["physical", "身体状态", "characterStatePhysical"],
+  ["information", "已知信息", "characterStateInformation"],
+  ["relationships", "关系变化", "characterStateRelationships"],
+  ["assets", "能力 / 物品", "characterStateAssets"],
+  ["secrets", "秘密 / 承诺", "characterStateSecrets"],
+  ["notes", "补充", "characterStateNotes"],
+];
+
+function entityChapterQuery() { return currentChapterId ? `?chapter_id=${currentChapterId}` : ""; }
+async function loadWikiEntities() {
+  if (!currentWorkId) { entitiesCache = []; entitiesCacheWorkId = null; entitiesCacheChapterId = null; return; }
+  entitiesCache = await api(`/api/works/${currentWorkId}/entities${entityChapterQuery()}`, { method: "GET" });
+  entitiesCacheWorkId = currentWorkId;
+  entitiesCacheChapterId = currentChapterId || null;
+}
 
 async function openWiki() {
   if (!currentWorkId) { showToast("先选一个作品", "err"); return; }
   try {
-    entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
-    entitiesCacheWorkId = currentWorkId;
+    await loadWikiEntities();
     renderWikiList();
     resetEntityForm();
     $("wikiOverlay").classList.remove("hidden");
   } catch (e) { showToast("加载失败：" + e.message, "err"); }
 }
 function closeWiki() { $("wikiOverlay").classList.add("hidden"); }
+function characterStateBrief(state) {
+  const parts = characterStateFields
+    .filter(([key]) => state && state[key])
+    .slice(0, 3)
+    .map(([key, label]) => `${label}：${state[key]}`);
+  const text = parts.join(" · ");
+  return text.length > 130 ? text.slice(0, 130) + "…" : text;
+}
+function characterStateSnapshot(state) {
+  const items = characterStateFields.filter(([key]) => state && state[key]).map(([key, label]) =>
+    `<span><b>${esc(label)}</b>${esc(state[key])}</span>`);
+  return items.length ? `<div class="character-state-snapshot">${items.join("")}</div>` : '<div class="character-state-empty">尚未记录动态状态</div>';
+}
 function renderWikiList() {
   $("wikiList").innerHTML = entitiesCache.length ? entitiesCache.map(e => `
     <div class="ent">
       <div class="ent-h"><b>${esc(e.kind)}</b> · ${esc(e.name)}</div>
       ${e.summary ? `<div class="ent-s">${esc(e.summary)}</div>` : ""}
       ${e.detail ? `<div class="ent-d">${esc(e.detail)}</div>` : ""}
+      ${e.kind === "人物" && currentChapterId ? `<div class="ent-state">${esc(characterStateBrief(e.current_state) || "截至本章未记录动态状态")}</div>` : ""}
       <div class="ent-a">
+        ${e.kind === "人物" ? `<button class="ic" onclick="openCharacterState(${e.id})">状态${e.pending_count ? ` · 待确认 ${e.pending_count}` : ""}</button>` : ""}
         <button class="ic" onclick="startEditEntity(${e.id})">编辑</button>
         <button class="ic" onclick="delEntity(${e.id})">删除</button>
       </div>
@@ -1432,7 +1495,7 @@ async function saveEntity() {
     } else {
       await api(`/api/works/${currentWorkId}/entities`, { method: "POST", body });
     }
-    entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
+    await loadWikiEntities();
     renderWikiList(); resetEntityForm();
     $("entMsg").textContent = "已保存";
     setTimeout(() => { $("entMsg").textContent = ""; }, 1200);
@@ -1453,7 +1516,7 @@ function startEditEntity(eid) {
 async function delEntity(eid) {
   if (!await askCard({ title: "删除这张卡片？", okText: "删除", danger: true })) return;
   await api(`/api/entities/${eid}`, { method: "DELETE" });
-  entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
+  await loadWikiEntities();
   if (editingEntityId === eid) resetEntityForm();
   renderWikiList();
 }
@@ -1464,6 +1527,166 @@ function insertEntity() {
   el.setRangeText("@" + name, el.selectionStart, el.selectionEnd, "end");
   onContentInput();
   el.focus();
+}
+
+function characterStateLabel(chapter) {
+  return chapter ? `第${chapter.ord}章《${chapter.title || "无标题"}》` : "未选择章节";
+}
+function characterStateSource(source) {
+  return ({ manual: "手动记录", ai_confirmed: "AI 提议已采纳", ai_edited: "AI 提议编辑后采纳" })[source] || "";
+}
+function setCharacterStateForm(state, summary = "", evidence = "", proposalId = null) {
+  for (const [key, , id] of characterStateFields) $(id).value = (state && state[key]) || "";
+  $("characterStateSummary").value = summary || "";
+  $("characterStateEvidence").value = evidence || "";
+  characterStateProposalId = proposalId;
+  $("characterStateSaveBtn").textContent = proposalId ? "确认并保存" : "保存为本章状态";
+}
+function characterStateFormValue() {
+  const state = {};
+  for (const [key, , id] of characterStateFields) state[key] = $(id).value.trim();
+  return state;
+}
+function characterStateOptions() {
+  return chapters.map(chapter =>
+    `<option value="${chapter.id}" ${chapter.id === characterStateChapterId ? "selected" : ""}>${esc(characterStateLabel(chapter))}</option>`
+  ).join("");
+}
+async function openCharacterState(eid) {
+  if (!chapters.length) { showToast("请先创建章节", "err"); return; }
+  characterStateEntityId = eid;
+  characterStateChapterId = currentChapterId || chapters[chapters.length - 1].id;
+  characterStateProposalId = null;
+  $("characterStateOverlay").classList.remove("hidden");
+  await loadCharacterState();
+}
+function closeCharacterState() {
+  $("characterStateOverlay").classList.add("hidden");
+  characterStateEntityId = null;
+  characterStateData = null;
+  characterStateProposalId = null;
+}
+async function changeCharacterStateChapter() {
+  characterStateChapterId = +$("characterStateChapter").value || null;
+  characterStateProposalId = null;
+  await loadCharacterState();
+}
+function renderCharacterState(data) {
+  characterStateData = data;
+  const entity = data.entity;
+  $("characterStateTitle").textContent = `${entity.name} · 动态卡`;
+  $("characterStateChapter").innerHTML = characterStateOptions();
+  $("characterStateMeta").textContent = characterStateLabel(data.target_chapter);
+  $("characterStateBase").innerHTML = `
+    <div><b>基础设定</b>${entity.summary ? ` · ${esc(entity.summary)}` : ""}</div>
+    ${entity.detail ? `<div>${esc(entity.detail)}</div>` : ""}`;
+  const version = data.state_version;
+  $("characterStateSource").textContent = version
+    ? `${characterStateSource(version.source)} · 生效于${characterStateLabel({ ord: version.chapter_ord, title: version.chapter_title })}`
+    : "尚无已确认状态";
+  setCharacterStateForm(data.current_state || {});
+  const proposals = (data.proposals || []).filter(p => p.status === "pending");
+  $("characterStateProposals").innerHTML = proposals.map(p => `
+    <div class="character-state-proposal">
+      <div class="character-state-proposal-head"><b>AI 待确认</b><span>${esc(p.change_summary || "状态更新")}</span></div>
+      ${p.evidence ? `<div class="character-state-proof">${esc(p.evidence)}</div>` : ""}
+      ${characterStateSnapshot(p.state)}
+      <div class="character-state-actions">
+        <button onclick="acceptCharacterStateProposal(${p.id})">采纳</button>
+        <button onclick="editCharacterStateProposal(${p.id})">编辑后采纳</button>
+        <button class="danger-lite" onclick="rejectCharacterStateProposal(${p.id})">忽略</button>
+      </div>
+    </div>`).join("");
+  const history = data.history || [];
+  $("characterStateHistory").innerHTML = history.length ? history.map(item => `
+    <div class="character-state-history-item">
+      <div><b>${esc(characterStateLabel({ ord: item.chapter_ord, title: item.chapter_title }))}</b><span>${esc(characterStateSource(item.source))}</span></div>
+      ${item.change_summary ? `<p>${esc(item.change_summary)}</p>` : ""}
+      ${item.evidence ? `<small>${esc(item.evidence)}</small>` : ""}
+      ${characterStateSnapshot(item.state)}
+    </div>`).join("") : '<div class="empty">尚无成长记录</div>';
+}
+async function loadCharacterState() {
+  if (!characterStateEntityId || !characterStateChapterId) return;
+  try {
+    const data = await api(`/api/entities/${characterStateEntityId}/state-history?chapter_id=${characterStateChapterId}`, { method: "GET" });
+    renderCharacterState(data);
+  } catch (e) {
+    $("characterStateMsg").textContent = e.message;
+  }
+}
+async function refreshCharacterCards() {
+  if (currentWorkId) {
+    await loadWikiEntities();
+    if (!$("wikiOverlay").classList.contains("hidden")) renderWikiList();
+  }
+}
+async function analyzeCharacterState() {
+  if (!characterStateChapterId) return;
+  const button = $("characterStateAnalyzeBtn");
+  busy(button, true, "提取中");
+  try {
+    const result = await api(`/api/chapters/${characterStateChapterId}/character-state-proposals/analyze`, { body: {} });
+    await loadCharacterState();
+    await refreshCharacterCards();
+    showToast(result.proposals.length ? `已生成 ${result.proposals.length} 条待确认状态` : "未发现需要记录的人物变化", result.proposals.length ? "ok" : "");
+  } catch (e) {
+    $("characterStateMsg").textContent = e.message;
+  } finally {
+    busy(button, false, "提取本章变化");
+  }
+}
+async function acceptCharacterStateProposal(pid) {
+  try {
+    await api(`/api/character-state-proposals/${pid}/accept`, { body: {} });
+    characterStateProposalId = null;
+    await loadCharacterState();
+    await refreshCharacterCards();
+    showToast("已采纳人物状态", "ok");
+  } catch (e) { $("characterStateMsg").textContent = e.message; }
+}
+function editCharacterStateProposal(pid) {
+  const proposal = (characterStateData?.proposals || []).find(item => item.id === pid);
+  if (!proposal) return;
+  setCharacterStateForm(proposal.state, proposal.change_summary, proposal.evidence, pid);
+  $("characterStateSummary").focus();
+}
+async function rejectCharacterStateProposal(pid) {
+  try {
+    await api(`/api/character-state-proposals/${pid}/reject`, { body: {} });
+    if (characterStateProposalId === pid) setCharacterStateForm(characterStateData?.current_state || {});
+    await loadCharacterState();
+    await refreshCharacterCards();
+    showToast("已忽略该提议");
+  } catch (e) { $("characterStateMsg").textContent = e.message; }
+}
+async function saveCharacterState() {
+  if (!characterStateEntityId || !characterStateChapterId) return;
+  const button = $("characterStateSaveBtn");
+  const confirming = !!characterStateProposalId;
+  busy(button, true, confirming ? "确认中" : "保存中");
+  const body = {
+    state: characterStateFormValue(),
+    change_summary: $("characterStateSummary").value.trim(),
+    evidence: $("characterStateEvidence").value.trim(),
+  };
+  try {
+    if (characterStateProposalId) {
+      await api(`/api/character-state-proposals/${characterStateProposalId}/accept`, { body });
+    } else {
+      await api(`/api/entities/${characterStateEntityId}/state-versions`, {
+        body: { ...body, chapter_id: characterStateChapterId },
+      });
+    }
+    characterStateProposalId = null;
+    await loadCharacterState();
+    await refreshCharacterCards();
+    showToast("人物状态已保存", "ok");
+  } catch (e) {
+    $("characterStateMsg").textContent = e.message;
+  } finally {
+    busy(button, false, "保存为本章状态");
+  }
 }
 
 // @提及：阅读视图里把 @名 包成可悬浮 span
@@ -1480,6 +1703,7 @@ function showMentionPop(m) {
   const pop = $("mentionPop");
   pop.innerHTML = `<div class="mp-head"><b>${esc(ent.kind)}</b> · ${esc(ent.name)}</div>`
     + (ent.summary ? `<div class="mp-sum">${esc(ent.summary)}</div>` : "")
+    + (ent.current_state && characterStateBrief(ent.current_state) ? `<div class="mp-state">${esc(characterStateBrief(ent.current_state))}</div>` : "")
     + (ent.detail ? `<div class="mp-det">${esc(ent.detail)}</div>` : "");
   pop.classList.remove("hidden");
   const r = m.getBoundingClientRect();
@@ -1488,9 +1712,8 @@ function showMentionPop(m) {
 }
 function hideMentionPop() { $("mentionPop").classList.add("hidden"); }
 async function ensureEntities() {
-  if (currentWorkId && entitiesCacheWorkId !== currentWorkId) {
-    try { entitiesCache = await api(`/api/works/${currentWorkId}/entities`, { method: "GET" });
-      entitiesCacheWorkId = currentWorkId; } catch (e) { entitiesCache = []; }
+  if (currentWorkId && (entitiesCacheWorkId !== currentWorkId || entitiesCacheChapterId !== (currentChapterId || null))) {
+    try { await loadWikiEntities(); } catch (e) { entitiesCache = []; }
   }
 }
 // 阅读视图 @提及 事件委托（只绑一次）

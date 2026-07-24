@@ -265,8 +265,59 @@ ok(c.put(f"/api/entities/{ent['id']}", json={"name": "hack"}, headers=H(tokB)).s
 ok(c.delete(f"/api/entities/{ent['id']}", headers=H(tokB)).status_code == 404, "bob 删 alice 实体 404")
 uidA = db.verify_user("alice", "pw1234")["id"]
 dig = db.get_entity_digest(wid, uidA)
-ok(dig.startswith("作品实体") and "[人物] 林晚" in dig and "女主角，冷静" in dig, "实体 digest 格式正确")
+ok(dig.startswith("作品实体") and "[人物] 林晚" in dig and "女主角，冷静" in dig and "基础设定：冷静" in dig,
+   "实体 digest 含摘要与基础设定")
 ok(db.get_entity_digest(wid, uidA + 9999) == "", "他人作品 digest 为空(隔离)")
+
+# 动态人物卡：基础设定不覆盖；状态按章节时点读取；AI 提议必须人工确认后才生效。
+state_c1 = c.post(f"/api/works/{wid}/chapters", json={"title": "人物状态一"}, headers=H(tokA)).json()["id"]
+state_c2 = c.post(f"/api/works/{wid}/chapters", json={"title": "人物状态二"}, headers=H(tokA)).json()["id"]
+_state1 = c.post(f"/api/entities/{ent['id']}/state-versions", json={
+    "chapter_id": state_c1,
+    "state": {"location": "北城", "goal": "调查失踪案", "emotion": "戒备"},
+    "change_summary": "抵达北城，开始调查",
+    "evidence": "第一章结尾抵达北城",
+}, headers=H(tokA))
+ok(_state1.status_code == 200, "人物状态手动保存")
+_state_at_c1 = c.get(f"/api/works/{wid}/entities?chapter_id={state_c1}", headers=H(tokA)).json()
+_state_at_c2 = c.get(f"/api/works/{wid}/entities?chapter_id={state_c2}", headers=H(tokA)).json()
+ok(_state_at_c1[0]["current_state"]["location"] == "北城" and _state_at_c2[0]["current_state"]["goal"] == "调查失踪案", "人物状态跨章节继承")
+_proposal = db.upsert_character_state_proposal(
+    ent["id"], uidA, state_c2,
+    {"location": "旧码头", "goal": "追查目击者", "emotion": "紧张"},
+    "追到旧码头", "本章明确前往旧码头",
+)
+ok(_proposal["status"] == "pending", "AI 状态提议先进入待确认")
+ok(c.get(f"/api/entities/{ent['id']}/state-history?chapter_id={state_c2}", headers=H(tokB)).status_code == 404,
+   "他人不能看人物状态历史")
+_accept = c.post(f"/api/character-state-proposals/{_proposal['id']}/accept", json={}, headers=H(tokA))
+ok(_accept.status_code == 200, "采纳 AI 人物状态提议")
+_state_at_c1 = c.get(f"/api/works/{wid}/entities?chapter_id={state_c1}", headers=H(tokA)).json()[0]
+_state_at_c2 = c.get(f"/api/works/{wid}/entities?chapter_id={state_c2}", headers=H(tokA)).json()[0]
+ok(_state_at_c1["current_state"]["location"] == "北城" and _state_at_c2["current_state"]["location"] == "旧码头",
+   "不同章节看到各自时点的人物状态")
+ok("旧码头" in main._agent_bible(wid, uidA, state_c2), "Agent 上下文带当前章节人物状态")
+
+# 手动触发提取：模型输出只生成 pending，不直接覆盖刚确认的版本。
+c.put(f"/api/chapters/{state_c2}", json={"content": "林晚在旧码头得知失踪者仍然活着。"}, headers=H(tokA))
+_orig_character_chat = llm.chat
+_character_prompt = {}
+def _character_extract(messages, **kw):
+    _character_prompt["messages"] = messages
+    return json.dumps({"updates": [{
+        "entity_id": ent["id"],
+        "state": {"location": "旧码头", "goal": "救出失踪者", "information": "失踪者仍然活着"},
+        "change_summary": "获得失踪者生还线索", "evidence": "正文明确得知其仍然活着",
+    }]}, ensure_ascii=False)
+llm.chat = _character_extract
+_analyzed = c.post(f"/api/chapters/{state_c2}/character-state-proposals/analyze", json={}, headers=H(tokA)).json()
+ok(len(_analyzed["proposals"]) == 1 and _analyzed["proposals"][0]["status"] == "pending", "AI 提取人物状态为待确认提议")
+ok("confirmed_state_at_this_point" in _character_prompt["messages"][-1]["content"], "状态提取收到当前已确认人物状态")
+_after_analyze = c.get(f"/api/works/{wid}/entities?chapter_id={state_c2}", headers=H(tokA)).json()[0]
+ok(_after_analyze["current_state"]["goal"] == "追查目击者" and _after_analyze["pending_count"] == 1,
+   "待确认提议不改变后续 AI 上下文")
+# 后续 Agent 写作测试不联网，但保留新的自动提议调用链。
+llm.chat = lambda *args, **kw: '{"updates": []}'
 
 # AI agent：对话即操作（monkeypatch llm.agent_chat 避免真联网）
 def _msg(content=None, tool_calls=None):
@@ -323,9 +374,16 @@ llm.agent_chat = _make_agent([
     _msg(None, [("c1", "replace_text", json.dumps({"old_text": "你好", "new_text": "你好呀"}))]),
     _msg("已改好。"),
 ])
+_orig_agent_state_chat = llm.chat
+llm.chat = lambda *args, **kw: json.dumps({"updates": [{
+    "entity_id": ent["id"], "state": {"location": "测试房间"},
+    "change_summary": "正文改动后生成的状态提议", "evidence": "测试提取",
+}]}, ensure_ascii=False)
 ag = c.post("/api/agent", json={"text": "把你好改成你好呀", "chapter_id": cid}, headers=H(tokA)).json()
+llm.chat = _orig_agent_state_chat
 _tr = [m for m in ag["messages"] if m.get("role") == "tool"]
 ok(len(_tr) == 1 and json.loads(_tr[0]["content"]).get("changed") is True, "agent replace_text 执行")
+ok(len(ag.get("character_state_proposals") or []) == 1, "Agent 写作后自动生成待确认人物状态")
 _undo = json.loads(_tr[0]["content"]).get("undo_rid")
 ok(isinstance(_undo, int), "agent 返回 undo_rid")
 ok(c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["content"] == "你好呀", "agent 改后正文=你好呀")
@@ -583,6 +641,10 @@ with db.get_conn() as conn:
     _nent = conn.execute("SELECT COUNT(*) FROM entities WHERE work_id=?", (wid,)).fetchone()[0]
 ok(_nent == 0, "删作品级联清空实体")
 with db.get_conn() as conn:
+    _nstate_versions = conn.execute("SELECT COUNT(*) FROM entity_state_versions WHERE entity_id=?", (ent["id"],)).fetchone()[0]
+    _nstate_proposals = conn.execute("SELECT COUNT(*) FROM entity_state_proposals WHERE entity_id=?", (ent["id"],)).fetchone()[0]
+ok(_nstate_versions == 0 and _nstate_proposals == 0, "删作品级联清空人物状态与提议")
+with db.get_conn() as conn:
     _nskill = conn.execute("SELECT COUNT(*) FROM agent_skills WHERE work_id=?", (wid,)).fetchone()[0]
 ok(_nskill == 0, "删作品级联清空作品 Skill")
 with db.get_conn() as conn:
@@ -594,5 +656,6 @@ ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 # 首页
 ok(c.get("/").status_code == 200, "首页可访问")
 
+llm.chat = _orig_character_chat
 print("\nAll smoke checks passed.")
 shutil.rmtree(_TMP, ignore_errors=True)
