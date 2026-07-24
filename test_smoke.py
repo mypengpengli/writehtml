@@ -319,6 +319,125 @@ ok(_after_analyze["current_state"]["goal"] == "追查目击者" and _after_analy
 # 后续 Agent 写作测试不联网，但保留新的自动提议调用链。
 llm.chat = lambda *args, **kw: '{"updates": []}'
 
+# 写作工作台：剧情状态按章节时点继承，AI 只生成待确认提议；关系、工作流、提醒和上下文均按作品隔离。
+rel_ent = c.post(f"/api/works/{wid}/entities", json={
+    "name": "周沉", "kind": "人物", "summary": "线人", "detail": "谨慎，欠林晚一次人情",
+}, headers=H(tokA)).json()
+rel = c.post(f"/api/works/{wid}/relationships", json={
+    "from_entity_id": ent["id"], "to_entity_id": rel_ent["id"], "relation": "暂时合作",
+    "detail": "旧码头事件后共享线索", "status": "active",
+}, headers=H(tokA))
+ok(rel.status_code == 200 and rel.json()["from_name"] == "林晚" and rel.json()["to_name"] == "周沉", "人物关系可保存")
+ok(c.get(f"/api/works/{wid}/relationships", headers=H(tokB)).status_code == 404, "人物关系按作品隔离")
+rel = c.put(f"/api/relationships/{rel.json()['id']}", json={
+    "from_entity_id": ent["id"], "to_entity_id": rel_ent["id"], "relation": "互信未满",
+    "detail": "仍保留各自的秘密", "status": "tense",
+}, headers=H(tokA)).json()
+ok(rel["relation"] == "互信未满" and "林晚 → 周沉：互信未满" in db.get_entity_digest(wid, uidA), "关系更新进入 AI 上下文")
+
+plot_v1 = c.post(f"/api/works/{wid}/plot-state-versions", json={
+    "chapter_id": state_c1,
+    "state": {"mainline": "调查北城失踪案", "current_event": "林晚抵达北城", "open_threads": "失踪者下落", "next_goal": "寻找目击者"},
+    "change_summary": "主角开始调查失踪案", "evidence": "第一章结尾抵达北城",
+}, headers=H(tokA))
+ok(plot_v1.status_code == 200, "剧情状态可手动保存")
+plot_c2 = c.get(f"/api/works/{wid}/plot-state?chapter_id={state_c2}", headers=H(tokA)).json()
+ok(plot_c2["current_state"]["mainline"] == "调查北城失踪案", "剧情状态跨章节继承")
+plot_proposal = db.upsert_plot_state_proposal(
+    wid, uidA, state_c2,
+    {"mainline": "确认失踪者仍然活着", "current_event": "旧码头得到线索", "open_threads": "谁在控制旧码头", "next_goal": "救出失踪者"},
+    "获得失踪者生还线索", "正文明确写到旧码头的消息",
+)
+ok(plot_proposal["status"] == "pending", "AI 剧情状态先进入待确认")
+plot_accept = c.post(f"/api/plot-state-proposals/{plot_proposal['id']}/accept", json={}, headers=H(tokA))
+ok(plot_accept.status_code == 200, "采纳 AI 剧情状态提议")
+plot_c1 = c.get(f"/api/works/{wid}/plot-state?chapter_id={state_c1}", headers=H(tokA)).json()
+plot_c2 = c.get(f"/api/works/{wid}/plot-state?chapter_id={state_c2}", headers=H(tokA)).json()
+ok(plot_c1["current_state"]["mainline"] == "调查北城失踪案" and plot_c2["current_state"]["mainline"] == "确认失踪者仍然活着", "不同章节读取各自剧情时点")
+ok("确认失踪者仍然活着" in main._agent_bible(wid, uidA, state_c2), "Agent 上下文带当前剧情状态")
+
+workflow = c.put(f"/api/chapters/{state_c2}/workflow", json={
+    "status": "planning", "goal": "确认线索来源", "summary": "旧码头线索待核验",
+}, headers=H(tokA))
+ok(workflow.status_code == 200 and workflow.json()["workflow_status"] == "planning", "章节工作流可保存")
+ok(c.put(f"/api/chapters/{state_c2}/workflow", json={"status": "unknown"}, headers=H(tokA)).status_code == 400, "非法章节阶段拒绝")
+seed_alerts = db.replace_chapter_consistency_alerts(state_c2, uidA, [{
+    "category": "伏笔", "severity": "warning", "title": "线索来源未交代",
+    "detail": "旧码头的消息来源尚未说明", "evidence": "本章结尾", "suggestion": "下一章补充来源或保留疑点",
+}])
+ok(len(seed_alerts) == 1 and seed_alerts[0]["status"] == "open", "连续性提醒可记录")
+alerts = c.get(f"/api/chapters/{state_c2}/consistency-alerts", headers=H(tokA)).json()
+ok(len(alerts) == 1 and c.post(f"/api/consistency-alerts/{alerts[0]['id']}/dismiss", headers=H(tokA)).status_code == 200, "连续性提醒可忽略")
+ok(c.get(f"/api/chapters/{state_c2}/consistency-alerts", headers=H(tokA)).json()[0]["status"] == "dismissed", "提醒忽略状态保留")
+
+context_snapshot = c.post("/api/agent/context", json={
+    "chapter_id": state_c2,
+    "selection": {"text": "林晚在旧码头得知真相", "start": 0, "end": 11, "before": "", "after": ""},
+    "skill_ids": [global_skill["id"], work_skill["id"]],
+}, headers=H(tokA)).json()
+context_system = "\n".join(item["content"] for item in context_snapshot["system_messages"])
+ok(context_snapshot["selection"]["present"] and len(context_snapshot["tools"]) > 0 and len(context_snapshot["skills"]) == 2,
+   "上下文检查器返回选区、工具和 Skill")
+ok("确认失踪者仍然活着" in context_system and "互信未满" in context_system, "上下文检查器展示真实故事约束")
+
+# AI 改稿必须先预览；只有作者确认、且正文仍为预览时的版本，才会真正落稿。
+preview_cid = c.post(f"/api/works/{wid}/chapters", json={"title": "预览改稿"}, headers=H(tokA)).json()["id"]
+c.put(f"/api/chapters/{preview_cid}", json={"content": "旧段落"}, headers=H(tokA))
+_orig_preview_process = llm.process
+llm.process = lambda mode, text, *args, **kw: "新段落"
+preview = c.post("/api/process", json={
+    "mode": "改写", "text": "旧段落", "chapter_id": preview_cid,
+    "preview": True, "preview_operation": "replace",
+}, headers=H(tokA)).json()
+ok(preview["preview"] is True and c.get(f"/api/chapters/{preview_cid}", headers=H(tokA)).json()["content"] == "旧段落", "AI 改稿预览不直接写入正文")
+applied = c.post(f"/api/chapters/{preview_cid}/edit-proposals/apply", json={
+    "base_content": "旧段落", "operation": "replace", "result": preview["result"], "mode": "改写",
+    "old_text": "旧段落", "start": 0, "end": 3,
+}, headers=H(tokA))
+ok(applied.status_code == 200 and applied.json()["content"] == "新段落", "确认预览后才写入正文")
+c.put(f"/api/chapters/{preview_cid}", json={"content": "作者已改"}, headers=H(tokA))
+stale = c.post(f"/api/chapters/{preview_cid}/edit-proposals/apply", json={
+    "base_content": "新段落", "operation": "replace", "result": "过期建议", "mode": "改写",
+    "old_text": "新段落", "start": 0, "end": 3,
+}, headers=H(tokA))
+ok(stale.status_code == 409, "正文变化后拒绝过期 AI 预览")
+llm.process = _orig_preview_process
+
+# 版本管理：命名版本、分支稿和整本快照均通过预览差异后恢复。
+version_cid = c.post(f"/api/works/{wid}/chapters", json={"title": "版本测试"}, headers=H(tokA)).json()["id"]
+c.put(f"/api/chapters/{version_cid}", json={"content": "版本甲"}, headers=H(tokA))
+named_revision = c.post(f"/api/chapters/{version_cid}/revisions", json={"label": "剧情节点 A"}, headers=H(tokA)).json()
+renamed = c.put(f"/api/chapters/{version_cid}/revisions/{named_revision['id']}", json={"label": "旧码头节点"}, headers=H(tokA)).json()
+ok(renamed["label"] == "旧码头节点", "章节版本可命名和重命名")
+branch = c.post(f"/api/chapters/{version_cid}/revisions/{named_revision['id']}/branch", json={"title": "旧码头分支稿"}, headers=H(tokA)).json()
+branch_meta = c.get(f"/api/chapters/{branch['id']}", headers=H(tokA)).json()
+ok(branch_meta["content"] == "版本甲" and branch_meta["branch_of_chapter_id"] == version_cid, "历史版本可创建独立分支稿")
+work_revision = c.post(f"/api/works/{wid}/revisions", json={"label": "整本节点 A"}, headers=H(tokA)).json()
+c.put(f"/api/chapters/{version_cid}", json={"content": "版本乙"}, headers=H(tokA))
+work_diff = c.get(f"/api/works/{wid}/revisions/{work_revision['id']}/diff", headers=H(tokA)).json()
+ok(any(item["chapter_id"] == version_cid and item["status"] == "changed" for item in work_diff["chapters"]), "整本版本差异能定位变更章节")
+work_restore = c.post(f"/api/works/{wid}/revisions/{work_revision['id']}/restore", headers=H(tokA)).json()
+ok(work_restore["backup"]["label"] == "恢复前自动备份" and c.get(f"/api/chapters/{version_cid}", headers=H(tokA)).json()["content"] == "版本甲", "整本恢复前自动备份并恢复正文")
+
+# 复核会把结构化提醒和状态提议一起产出，仍然不直接覆盖已确认的剧情卡。
+def _review_story_chat(messages, **kw):
+    payload = json.loads(messages[-1]["content"])
+    task = payload.get("task", "")
+    if "检查当前章节" in task:
+        return json.dumps({"summary": "旧码头线索已出现，建议核对来源。", "alerts": [{
+            "category": "伏笔", "severity": "notice", "title": "确认线索来源", "detail": "来源仍待展开",
+            "evidence": "旧码头消息", "suggestion": "在下一章给出侧面印证",
+        }]}, ensure_ascii=False)
+    if "人物动态变化" in task:
+        return '{"updates": []}'
+    if "故事状态" in task:
+        return json.dumps({"state": {"mainline": "确认失踪者仍然活着", "current_event": "旧码头线索待核验", "open_threads": "谁在控制旧码头", "next_goal": "核验线索来源"}, "change_summary": "线索进入核验阶段", "evidence": "本章旧码头消息"}, ensure_ascii=False)
+    return '{"updates": []}'
+llm.chat = _review_story_chat
+review = c.post(f"/api/chapters/{state_c2}/review", json={}, headers=H(tokA)).json()
+ok(review["workflow"]["workflow_status"] == "review" and any(item["status"] == "open" for item in review["alerts"]) and review["plot_state_proposal"], "AI 复核产生提醒和待确认剧情状态")
+llm.chat = lambda *args, **kw: '{"updates": []}'
+
 # AI agent：对话即操作（monkeypatch llm.agent_chat 避免真联网）
 def _msg(content=None, tool_calls=None):
     tcs = None

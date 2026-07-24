@@ -24,6 +24,18 @@ CHARACTER_STATE_LABELS = {
     "secrets": "秘密/承诺", "notes": "补充",
 }
 
+# 剧情状态与人物状态一样按章节生效，但描述的是故事整体而不是单个角色。
+PLOT_STATE_FIELDS = (
+    "mainline", "current_event", "timeline", "locations", "conflicts",
+    "open_threads", "next_goal", "notes",
+)
+PLOT_STATE_LABELS = {
+    "mainline": "主线进度", "current_event": "当前事件", "timeline": "时间线",
+    "locations": "地点", "conflicts": "核心冲突", "open_threads": "未回收伏笔",
+    "next_goal": "下一章目标", "notes": "补充",
+}
+WORKFLOW_STATUSES = ("planning", "drafting", "review", "final")
+
 
 def normalize_character_state(state, base=None):
     """把 API/模型输入规整为可持久化的完整人物状态快照。"""
@@ -54,6 +66,37 @@ def _decode_character_state(raw):
 
 def character_state_has_content(state):
     return any((state or {}).get(field) for field in CHARACTER_STATE_FIELDS)
+
+
+def normalize_plot_state(state, base=None):
+    """把剧情状态规整为完整快照，保留作者可编辑的短文本结构。"""
+    state = state if isinstance(state, dict) else {}
+    base = base if isinstance(base, dict) else {}
+    result = {}
+    for field in PLOT_STATE_FIELDS:
+        value = state.get(field, base.get(field, ""))
+        if value is None:
+            value = ""
+        elif isinstance(value, (list, tuple)):
+            value = "；".join(str(x).strip() for x in value if str(x).strip())
+        elif isinstance(value, dict):
+            value = "；".join(f"{k}：{v}" for k, v in value.items() if str(v).strip())
+        elif not isinstance(value, str):
+            value = str(value)
+        result[field] = value.strip()[:4000]
+    return result
+
+
+def _decode_plot_state(raw):
+    try:
+        value = json.loads(raw or "{}")
+    except Exception:
+        value = {}
+    return normalize_plot_state(value)
+
+
+def plot_state_has_content(state):
+    return any((state or {}).get(field) for field in PLOT_STATE_FIELDS)
 
 
 @contextmanager
@@ -168,6 +211,70 @@ def init_db():
                 FOREIGN KEY(entity_id) REFERENCES entities(id),
                 FOREIGN KEY(chapter_id) REFERENCES chapters(id)
             );
+            CREATE TABLE IF NOT EXISTS plot_state_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id INTEGER NOT NULL,
+                chapter_id INTEGER NOT NULL,
+                state_json TEXT NOT NULL DEFAULT '{}',
+                change_summary TEXT DEFAULT '',
+                evidence TEXT DEFAULT '',
+                source TEXT DEFAULT 'manual',
+                proposal_id INTEGER,
+                created_at REAL,
+                FOREIGN KEY(work_id) REFERENCES works(id),
+                FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+            );
+            CREATE TABLE IF NOT EXISTS plot_state_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id INTEGER NOT NULL,
+                chapter_id INTEGER NOT NULL,
+                state_json TEXT NOT NULL DEFAULT '{}',
+                change_summary TEXT DEFAULT '',
+                evidence TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at REAL,
+                updated_at REAL,
+                resolved_at REAL,
+                FOREIGN KEY(work_id) REFERENCES works(id),
+                FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+            );
+            CREATE TABLE IF NOT EXISTS entity_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id INTEGER NOT NULL,
+                from_entity_id INTEGER NOT NULL,
+                to_entity_id INTEGER NOT NULL,
+                relation TEXT NOT NULL,
+                detail TEXT DEFAULT '',
+                status TEXT DEFAULT 'active',
+                created_at REAL,
+                updated_at REAL,
+                FOREIGN KEY(work_id) REFERENCES works(id),
+                FOREIGN KEY(from_entity_id) REFERENCES entities(id),
+                FOREIGN KEY(to_entity_id) REFERENCES entities(id)
+            );
+            CREATE TABLE IF NOT EXISTS chapter_consistency_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chapter_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'notice',
+                title TEXT NOT NULL,
+                detail TEXT DEFAULT '',
+                evidence TEXT DEFAULT '',
+                suggestion TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at REAL,
+                updated_at REAL,
+                resolved_at REAL,
+                FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+            );
+            CREATE TABLE IF NOT EXISTS work_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id INTEGER NOT NULL,
+                label TEXT DEFAULT '',
+                snapshot_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL,
+                FOREIGN KEY(work_id) REFERENCES works(id)
+            );
             CREATE TABLE IF NOT EXISTS agent_conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -211,6 +318,13 @@ def init_db():
                 ON entity_state_versions(entity_id, chapter_id, id);
             CREATE INDEX IF NOT EXISTS idx_entity_state_proposals_chapter_status
                 ON entity_state_proposals(chapter_id, status, entity_id);
+            CREATE INDEX IF NOT EXISTS idx_plot_state_versions_work_chapter
+                ON plot_state_versions(work_id, chapter_id, id);
+            CREATE INDEX IF NOT EXISTS idx_plot_state_proposals_chapter_status
+                ON plot_state_proposals(chapter_id, status, work_id);
+            CREATE INDEX IF NOT EXISTS idx_entity_relations_work ON entity_relations(work_id, from_entity_id, to_entity_id);
+            CREATE INDEX IF NOT EXISTS idx_consistency_alerts_chapter ON chapter_consistency_alerts(chapter_id, status, id);
+            CREATE INDEX IF NOT EXISTS idx_work_revisions_work ON work_revisions(work_id, id);
             CREATE INDEX IF NOT EXISTS idx_conv_user ON agent_conversations(user_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_skills_user_work ON agent_skills(user_id, work_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_skill_resources_skill ON agent_skill_resources(skill_id, path);
@@ -226,6 +340,13 @@ def init_db():
         _add_col(conn, "users", "is_admin", "INTEGER DEFAULT 0")  # 后台管理员标记
         _add_col(conn, "agent_skills", "source_kind", "TEXT DEFAULT 'manual'")
         _add_col(conn, "agent_skills", "source_markdown", "TEXT DEFAULT ''")
+        _add_col(conn, "chapters", "workflow_status", "TEXT DEFAULT 'drafting'")
+        _add_col(conn, "chapters", "workflow_goal", "TEXT DEFAULT ''")
+        _add_col(conn, "chapters", "workflow_summary", "TEXT DEFAULT ''")
+        _add_col(conn, "chapters", "workflow_checked_at", "REAL")
+        _add_col(conn, "chapters", "branch_of_chapter_id", "INTEGER")
+        _add_col(conn, "chapters", "branch_from_revision_id", "INTEGER")
+        _add_col(conn, "chapter_revisions", "label", "TEXT DEFAULT ''")
         _bootstrap_admin(conn)
 
 
@@ -419,12 +540,19 @@ def admin_delete_user(user_id):
             conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM plot_state_versions WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM plot_state_proposals WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=?", (cid,))
         # 章节以上的作品级数据 + 该用户的无章节对话 + 设置 + 账号本身
         conn.execute("DELETE FROM chapters WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entity_state_versions WHERE entity_id IN "
                      "(SELECT id FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?))", (user_id,))
         conn.execute("DELETE FROM entity_state_proposals WHERE entity_id IN "
                      "(SELECT id FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?))", (user_id,))
+        conn.execute("DELETE FROM plot_state_versions WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM plot_state_proposals WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM entity_relations WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM work_revisions WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skills WHERE user_id=?", (user_id,))
@@ -550,9 +678,16 @@ def delete_work(wid, user_id):
             conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM plot_state_versions WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM plot_state_proposals WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entity_state_versions WHERE entity_id IN (SELECT id FROM entities WHERE work_id=?)", (wid,))
         conn.execute("DELETE FROM entity_state_proposals WHERE entity_id IN (SELECT id FROM entities WHERE work_id=?)", (wid,))
+        conn.execute("DELETE FROM plot_state_versions WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM plot_state_proposals WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM entity_relations WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM work_revisions WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE work_id=?)", (wid,))
         conn.execute("DELETE FROM agent_skills WHERE work_id=?", (wid,))
@@ -637,6 +772,209 @@ def _chapter_for_work(conn, cid, wid):
         (cid, wid),
     ).fetchone()
     return dict(row) if row else None
+
+
+# ---------- 剧情状态（作品级、按章节生效）----------
+
+def _plot_state_version_payload(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["state"] = _decode_plot_state(item.pop("state_json", "{}"))
+    return item
+
+
+def _plot_state_proposal_payload(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["state"] = _decode_plot_state(item.pop("state_json", "{}"))
+    return item
+
+
+def _plot_state_version_at(conn, wid, target_chapter_id, before=False):
+    if target_chapter_id is None:
+        return None
+    op = "<" if before else "<="
+    row = conn.execute(
+        "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+        "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+        "FROM plot_state_versions v "
+        "JOIN chapters c ON c.id=v.chapter_id "
+        "JOIN chapters target ON target.id=? "
+        f"WHERE v.work_id=? AND target.work_id=? AND c.deleted_at IS NULL AND target.deleted_at IS NULL "
+        f"AND c.work_id=target.work_id AND c.ord {op} target.ord "
+        "ORDER BY c.ord DESC, v.id DESC LIMIT 1",
+        (target_chapter_id, wid, wid),
+    ).fetchone()
+    return _plot_state_version_payload(row)
+
+
+def get_plot_state_overview(wid, user_id, at_chapter_id=None):
+    """剧情卡在指定章节时点的当前状态、待确认提议和历史。"""
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        target = _chapter_for_work(conn, at_chapter_id, wid) if at_chapter_id is not None else None
+        if at_chapter_id is not None and not target:
+            return {"invalid_chapter": True}
+        version = _plot_state_version_at(conn, wid, at_chapter_id)
+        history_rows = conn.execute(
+            "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "FROM plot_state_versions v JOIN chapters c ON c.id=v.chapter_id "
+            "WHERE v.work_id=? AND c.deleted_at IS NULL ORDER BY c.ord DESC, v.id DESC",
+            (wid,),
+        ).fetchall()
+        proposal_rows = []
+        if at_chapter_id is not None:
+            proposal_rows = conn.execute(
+                "SELECT id, work_id, chapter_id, state_json, change_summary, evidence, status, "
+                "created_at, updated_at, resolved_at FROM plot_state_proposals "
+                "WHERE work_id=? AND chapter_id=? "
+                "ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC",
+                (wid, at_chapter_id),
+            ).fetchall()
+        work = conn.execute("SELECT id, title FROM works WHERE id=?", (wid,)).fetchone()
+        return {
+            "work": dict(work) if work else {"id": wid},
+            "target_chapter": target,
+            "current_state": version["state"] if version else normalize_plot_state({}),
+            "state_version": version,
+            "history": [_plot_state_version_payload(row) for row in history_rows],
+            "proposals": [_plot_state_proposal_payload(row) for row in proposal_rows],
+        }
+
+
+def create_plot_state_version(wid, user_id, chapter_id, state, change_summary="", evidence="", source="manual", proposal_id=None):
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if not _chapter_for_work(conn, chapter_id, wid):
+            return {"invalid_chapter": True}
+        normalized = normalize_plot_state(state)
+        if not plot_state_has_content(normalized):
+            return {"empty_state": True}
+        cur = conn.execute(
+            "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (wid, chapter_id, json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1400],
+             (evidence or "").strip()[:4000], source, proposal_id, now),
+        )
+        row = conn.execute(
+            "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "FROM plot_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return _plot_state_version_payload(row)
+
+
+def upsert_plot_state_proposal(wid, user_id, chapter_id, state, change_summary="", evidence=""):
+    """同一作品×章节只保留一条待确认剧情更新，重复分析会覆盖陈旧建议。"""
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if not _chapter_for_work(conn, chapter_id, wid):
+            return {"invalid_chapter": True}
+        normalized = normalize_plot_state(state)
+        if not plot_state_has_content(normalized):
+            return {"empty_state": True}
+        payload = (json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1400],
+                   (evidence or "").strip()[:4000], now)
+        existing = conn.execute(
+            "SELECT id FROM plot_state_proposals WHERE work_id=? AND chapter_id=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1", (wid, chapter_id),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE plot_state_proposals SET state_json=?, change_summary=?, evidence=?, updated_at=? WHERE id=?",
+                (*payload, existing["id"]),
+            )
+            pid = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO plot_state_proposals(work_id,chapter_id,state_json,change_summary,evidence,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'pending',?,?)",
+                (wid, chapter_id, payload[0], payload[1], payload[2], now, now),
+            )
+            pid = cur.lastrowid
+        row = conn.execute(
+            "SELECT id, work_id, chapter_id, state_json, change_summary, evidence, status, "
+            "created_at, updated_at, resolved_at FROM plot_state_proposals WHERE id=?", (pid,)
+        ).fetchone()
+        return _plot_state_proposal_payload(row)
+
+
+def accept_plot_state_proposal(pid, user_id, state=None, change_summary=None, evidence=None):
+    now = time.time()
+    with get_conn() as conn:
+        proposal = conn.execute(
+            "SELECT p.id, p.work_id, p.chapter_id, p.state_json, p.change_summary, p.evidence, p.status "
+            "FROM plot_state_proposals p JOIN works w ON w.id=p.work_id WHERE p.id=? AND w.user_id=?",
+            (pid, user_id),
+        ).fetchone()
+        if not proposal:
+            return None
+        if proposal["status"] != "pending":
+            return {"resolved": True}
+        previous = _decode_plot_state(proposal["state_json"])
+        normalized = normalize_plot_state(state, previous)
+        if not plot_state_has_content(normalized):
+            return {"empty_state": True}
+        summary = proposal["change_summary"] if change_summary is None else (change_summary or "").strip()[:1400]
+        proof = proposal["evidence"] if evidence is None else (evidence or "").strip()[:4000]
+        edited = state is not None or change_summary is not None or evidence is not None
+        cur = conn.execute(
+            "INSERT INTO plot_state_versions(work_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (proposal["work_id"], proposal["chapter_id"], json.dumps(normalized, ensure_ascii=False),
+             summary, proof, "ai_edited" if edited else "ai_confirmed", pid, now),
+        )
+        conn.execute(
+            "UPDATE plot_state_proposals SET status='accepted', updated_at=?, resolved_at=? WHERE id=?",
+            (now, now, pid),
+        )
+        version = conn.execute(
+            "SELECT v.id, v.work_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
+            "v.source, v.proposal_id, v.created_at, c.title AS chapter_title, c.ord AS chapter_ord "
+            "FROM plot_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return {"version": _plot_state_version_payload(version)}
+
+
+def reject_plot_state_proposal(pid, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT p.id, p.status FROM plot_state_proposals p JOIN works w ON w.id=p.work_id "
+            "WHERE p.id=? AND w.user_id=?", (pid, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] != "pending":
+            return {"resolved": True}
+        conn.execute(
+            "UPDATE plot_state_proposals SET status='rejected', updated_at=?, resolved_at=? WHERE id=?",
+            (now, now, pid),
+        )
+        return {"ok": True}
+
+
+def get_plot_digest(wid, user_id, at_chapter_id=None):
+    overview = get_plot_state_overview(wid, user_id, at_chapter_id)
+    if not overview or overview.get("invalid_chapter"):
+        return ""
+    state = overview.get("current_state") or {}
+    facts = [f"{PLOT_STATE_LABELS[field]}={state[field]}" for field in PLOT_STATE_FIELDS if state.get(field)]
+    if not facts:
+        return ""
+    target = overview.get("target_chapter") or {}
+    point = f"第{target.get('ord')}章《{target.get('title') or '无标题'}》" if target else "当前时点"
+    return "剧情状态（截至" + point + "，写作时必须遵循）：\n" + "；".join(facts)
 
 
 def _state_version_at(conn, eid, target_chapter_id, before=False):
@@ -729,6 +1067,7 @@ def delete_entity(eid, user_id):
             return False
         conn.execute("DELETE FROM entity_state_versions WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entity_state_proposals WHERE entity_id=?", (eid,))
+        conn.execute("DELETE FROM entity_relations WHERE from_entity_id=? OR to_entity_id=?", (eid, eid))
         conn.execute("DELETE FROM entities WHERE id=?", (eid,))
         return True
 
@@ -951,7 +1290,113 @@ def get_entity_digest(wid, user_id, at_chapter_id=None):
             chapter_name = version.get("chapter_title") or "当前时点"
             line += f"\n  动态状态（截至《{chapter_name}》）：" + "；".join(details)
         lines.append(line)
-    return "作品实体（写作时保持一致）：\n" + "\n".join(lines)
+    relation_digest = get_relationship_digest(wid, user_id)
+    digest = "作品实体（写作时保持一致）：\n" + "\n".join(lines)
+    return digest + ("\n\n" + relation_digest if relation_digest else "")
+
+
+# ---------- 人物关系（作品级，可视化关系图和 AI 连续性上下文）----------
+
+def _relation_payload(row):
+    return dict(row) if row else None
+
+
+def list_entity_relations(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        rows = conn.execute(
+            "SELECT r.id, r.work_id, r.from_entity_id, r.to_entity_id, r.relation, r.detail, r.status, "
+            "r.created_at, r.updated_at, a.name AS from_name, b.name AS to_name "
+            "FROM entity_relations r JOIN entities a ON a.id=r.from_entity_id "
+            "JOIN entities b ON b.id=r.to_entity_id WHERE r.work_id=? "
+            "ORDER BY r.updated_at DESC, r.id DESC",
+            (wid,),
+        ).fetchall()
+        return [_relation_payload(row) for row in rows]
+
+
+def _entity_in_work(conn, eid, wid):
+    row = conn.execute("SELECT id FROM entities WHERE id=? AND work_id=?", (eid, wid)).fetchone()
+    return row is not None
+
+
+def create_entity_relation(wid, user_id, from_entity_id, to_entity_id, relation, detail="", status="active"):
+    now = time.time()
+    relation = (relation or "").strip()[:160]
+    detail = (detail or "").strip()[:2000]
+    status = (status or "active").strip()[:48] or "active"
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if from_entity_id == to_entity_id or not _entity_in_work(conn, from_entity_id, wid) or not _entity_in_work(conn, to_entity_id, wid):
+            return {"invalid_entity": True}
+        if not relation:
+            return {"invalid_relation": True}
+        cur = conn.execute(
+            "INSERT INTO entity_relations(work_id,from_entity_id,to_entity_id,relation,detail,status,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (wid, from_entity_id, to_entity_id, relation, detail, status, now, now),
+        )
+        row = conn.execute(
+            "SELECT r.id, r.work_id, r.from_entity_id, r.to_entity_id, r.relation, r.detail, r.status, "
+            "r.created_at, r.updated_at, a.name AS from_name, b.name AS to_name "
+            "FROM entity_relations r JOIN entities a ON a.id=r.from_entity_id "
+            "JOIN entities b ON b.id=r.to_entity_id WHERE r.id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return _relation_payload(row)
+
+
+def update_entity_relation(rid, user_id, from_entity_id, to_entity_id, relation, detail="", status="active"):
+    now = time.time()
+    relation = (relation or "").strip()[:160]
+    detail = (detail or "").strip()[:2000]
+    status = (status or "active").strip()[:48] or "active"
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT r.id, r.work_id FROM entity_relations r JOIN works w ON w.id=r.work_id "
+            "WHERE r.id=? AND w.user_id=?", (rid, user_id),
+        ).fetchone()
+        if not existing:
+            return None
+        if from_entity_id == to_entity_id or not _entity_in_work(conn, from_entity_id, existing["work_id"]) or not _entity_in_work(conn, to_entity_id, existing["work_id"]):
+            return {"invalid_entity": True}
+        if not relation:
+            return {"invalid_relation": True}
+        conn.execute(
+            "UPDATE entity_relations SET from_entity_id=?, to_entity_id=?, relation=?, detail=?, status=?, updated_at=? WHERE id=?",
+            (from_entity_id, to_entity_id, relation, detail, status, now, rid),
+        )
+        row = conn.execute(
+            "SELECT r.id, r.work_id, r.from_entity_id, r.to_entity_id, r.relation, r.detail, r.status, "
+            "r.created_at, r.updated_at, a.name AS from_name, b.name AS to_name "
+            "FROM entity_relations r JOIN entities a ON a.id=r.from_entity_id "
+            "JOIN entities b ON b.id=r.to_entity_id WHERE r.id=?",
+            (rid,),
+        ).fetchone()
+        return _relation_payload(row)
+
+
+def delete_entity_relation(rid, user_id):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM entity_relations WHERE id=? AND work_id IN (SELECT id FROM works WHERE user_id=?)",
+            (rid, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_relationship_digest(wid, user_id):
+    relations = list_entity_relations(wid, user_id)
+    if not relations:
+        return ""
+    lines = []
+    for item in relations[:80]:
+        status = f"（{item['status']}）" if item.get("status") and item.get("status") != "active" else ""
+        detail = f"：{item['detail']}" if item.get("detail") else ""
+        lines.append(f"{item['from_name']} → {item['to_name']}：{item['relation']}{status}{detail}")
+    return "人物关系（写作时保持连续）：\n" + "\n".join(lines)
 
 
 # ---------- AI Skills（用户可复用的 agent 指令模板）----------
@@ -1093,7 +1538,9 @@ def list_chapters(wid, user_id):
         if not _work_owned(conn, wid, user_id):
             return None
         return [dict(r) for r in conn.execute(
-            "SELECT id, work_id, title, ord, created_at, length(content) AS chars "
+            "SELECT id, work_id, title, ord, created_at, length(content) AS chars, "
+            "workflow_status, workflow_goal, workflow_summary, workflow_checked_at, "
+            "branch_of_chapter_id, branch_from_revision_id "
             "FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY ord", (wid,)
         )]
 
@@ -1149,10 +1596,124 @@ def get_chapter_meta(cid, user_id):
         if not _chapter_owned(conn, cid, user_id):
             return None
         r = conn.execute(
-            "SELECT id, work_id, title, content, notes FROM chapters WHERE id=? AND deleted_at IS NULL",
+            "SELECT id, work_id, title, ord, content, notes, workflow_status, workflow_goal, "
+            "workflow_summary, workflow_checked_at, branch_of_chapter_id, branch_from_revision_id "
+            "FROM chapters WHERE id=? AND deleted_at IS NULL",
             (cid,),
         ).fetchone()
         return dict(r) if r else None
+
+
+def get_chapter_workflow(cid, user_id):
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        row = conn.execute(
+            "SELECT id, work_id, title, ord, workflow_status, workflow_goal, workflow_summary, "
+            "workflow_checked_at, updated_at FROM chapters WHERE id=? AND deleted_at IS NULL",
+            (cid,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_chapter_workflow(cid, user_id, status=None, goal=None, summary=None, checked=False):
+    if status is not None and status not in WORKFLOW_STATUSES:
+        return {"invalid_status": True}
+    now = time.time()
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        conn.execute(
+            "UPDATE chapters SET workflow_status=COALESCE(?, workflow_status), "
+            "workflow_goal=COALESCE(?, workflow_goal), workflow_summary=COALESCE(?, workflow_summary), "
+            "workflow_checked_at=CASE WHEN ? THEN ? ELSE workflow_checked_at END, updated_at=? WHERE id=?",
+            (status, (goal or "").strip()[:2000] if goal is not None else None,
+             (summary or "").strip()[:4000] if summary is not None else None,
+             int(bool(checked)), now, now, cid),
+        )
+        conn.execute(
+            "UPDATE works SET updated_at=? WHERE id=(SELECT work_id FROM chapters WHERE id=?)",
+            (now, cid),
+        )
+    return get_chapter_workflow(cid, user_id)
+
+
+# ---------- 一致性提醒（章节复核的结构化结果）----------
+
+_ALERT_SEVERITIES = {"critical", "warning", "notice"}
+
+
+def _alert_payload(row):
+    return dict(row) if row else None
+
+
+def list_chapter_consistency_alerts(cid, user_id):
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        rows = conn.execute(
+            "SELECT id, chapter_id, category, severity, title, detail, evidence, suggestion, status, "
+            "created_at, updated_at, resolved_at FROM chapter_consistency_alerts "
+            "WHERE chapter_id=? ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, "
+            "CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, id DESC",
+            (cid,),
+        ).fetchall()
+        return [_alert_payload(row) for row in rows]
+
+
+def replace_chapter_consistency_alerts(cid, user_id, alerts):
+    """一轮复核覆盖旧的未处理提醒，已忽略的提醒留作审阅痕迹。"""
+    now = time.time()
+    alerts = alerts if isinstance(alerts, list) else []
+    normalized = []
+    for item in alerts[:20]:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or "").strip()[:240]
+        if not title:
+            continue
+        severity = (item.get("severity") or "notice").strip().lower()
+        if severity not in _ALERT_SEVERITIES:
+            severity = "notice"
+        normalized.append({
+            "category": (item.get("category") or "连续性").strip()[:80] or "连续性",
+            "severity": severity,
+            "title": title,
+            "detail": (item.get("detail") or "").strip()[:2400],
+            "evidence": (item.get("evidence") or "").strip()[:1200],
+            "suggestion": (item.get("suggestion") or "").strip()[:1600],
+        })
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=? AND status='open'", (cid,))
+        for item in normalized:
+            conn.execute(
+                "INSERT INTO chapter_consistency_alerts(chapter_id,category,severity,title,detail,evidence,suggestion,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,'open',?,?)",
+                (cid, item["category"], item["severity"], item["title"], item["detail"],
+                 item["evidence"], item["suggestion"], now, now),
+            )
+    return list_chapter_consistency_alerts(cid, user_id)
+
+
+def dismiss_chapter_consistency_alert(alert_id, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT a.id, a.status FROM chapter_consistency_alerts a "
+            "JOIN chapters c ON c.id=a.chapter_id JOIN works w ON w.id=c.work_id "
+            "WHERE a.id=? AND w.user_id=?", (alert_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] != "open":
+            return {"resolved": True}
+        conn.execute(
+            "UPDATE chapter_consistency_alerts SET status='dismissed', updated_at=?, resolved_at=? WHERE id=?",
+            (now, now, alert_id),
+        )
+        return {"ok": True}
 
 
 def update_chapter(cid, user_id, title, content, notes):
@@ -1199,6 +1760,59 @@ def replace_text_in_chapter(cid, user_id, old, new):
         return content
 
 
+def apply_chapter_edit_proposal(cid, user_id, base_content, operation, result_text, mode,
+                                old_text="", start=None, end=None):
+    """确认 AI 预览后再原子写入正文，并在写入前保存可恢复快照。"""
+    if not isinstance(base_content, str) or not isinstance(result_text, str):
+        return {"invalid": True}
+    if operation not in {"append", "replace"}:
+        return {"invalid": True}
+    now = time.time()
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        chapter = conn.execute(
+            "SELECT title, content FROM chapters WHERE id=? AND deleted_at IS NULL", (cid,)
+        ).fetchone()
+        if not chapter:
+            return None
+        current = chapter["content"] or ""
+        if current != base_content:
+            return {"stale": True}
+        if operation == "append":
+            content = current + ("\n" if current and not current.endswith("\n") else "") + result_text
+            raw = f"（AI {mode or '生成'} 预览确认）"
+        else:
+            if not old_text:
+                return {"invalid": True}
+            if isinstance(start, int) and isinstance(end, int) and 0 <= start <= end <= len(current) and current[start:end] == old_text:
+                content = current[:start] + result_text + current[end:]
+            else:
+                index = current.find(old_text)
+                if index < 0:
+                    return {"stale": True}
+                content = current[:index] + result_text + current[index + len(old_text):]
+            raw = old_text
+        snapshot = _add_revision_snapshot(conn, cid)
+        conn.execute(
+            "UPDATE chapters SET content=?, updated_at=? WHERE id=?",
+            (content, now, cid),
+        )
+        conn.execute(
+            "INSERT INTO segments(chapter_id, raw, result, mode, created_at) VALUES(?,?,?,?,?)",
+            (cid, raw, result_text, f"preview:{mode or 'edit'}", now),
+        )
+        conn.execute(
+            "UPDATE works SET updated_at=? WHERE id=(SELECT work_id FROM chapters WHERE id=?)",
+            (now, cid),
+        )
+        return {
+            "content": content,
+            "title": chapter["title"],
+            "revision": snapshot,
+        }
+
+
 def delete_chapter(cid, user_id):
     """软删（移入回收站），可恢复。"""
     now = time.time()
@@ -1219,6 +1833,9 @@ def purge_chapter(cid, user_id):
         conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM plot_state_versions WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM plot_state_proposals WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapters WHERE id=?", (cid,))
         return True
 
@@ -1330,27 +1947,36 @@ def undo_last_segment(cid, user_id):
     return get_chapter(cid, user_id)
 
 
-# ---------- 修订版本 ----------
+# ---------- 修订版本 / 分支 ----------
 
-def add_revision(cid, user_id):
+def _trim_revision_history(conn, cid):
+    # 仅清理未命名的自动快照；作者显式命名的版本始终保留。
+    conn.execute(
+        "DELETE FROM chapter_revisions WHERE chapter_id=? AND COALESCE(label,'')='' AND id NOT IN "
+        "(SELECT id FROM chapter_revisions WHERE chapter_id=? AND COALESCE(label,'')='' ORDER BY id DESC LIMIT 20)",
+        (cid, cid),
+    )
+
+
+def _add_revision_snapshot(conn, cid, label=""):
     now = time.time()
+    chap = conn.execute("SELECT title, content FROM chapters WHERE id=?", (cid,)).fetchone()
+    if not chap:
+        return None
+    label = (label or "").strip()[:120]
+    cur = conn.execute(
+        "INSERT INTO chapter_revisions(chapter_id, title, content, label, created_at) VALUES(?,?,?,?,?)",
+        (cid, chap["title"], chap["content"], label, now),
+    )
+    _trim_revision_history(conn, cid)
+    return {"id": cur.lastrowid, "label": label, "created_at": now}
+
+
+def add_revision(cid, user_id, label=""):
     with get_conn() as conn:
         if not _chapter_owned(conn, cid, user_id):
             return None
-        chap = conn.execute("SELECT title, content FROM chapters WHERE id=?", (cid,)).fetchone()
-        if not chap:
-            return None
-        cur = conn.execute(
-            "INSERT INTO chapter_revisions(chapter_id, title, content, created_at) VALUES(?,?,?,?)",
-            (cid, chap["title"], chap["content"], now),
-        )
-        # 每章只保留最近 20 个版本，老的自动清掉，省盘
-        conn.execute(
-            "DELETE FROM chapter_revisions WHERE chapter_id=? AND id NOT IN "
-            "(SELECT id FROM chapter_revisions WHERE chapter_id=? ORDER BY id DESC LIMIT 20)",
-            (cid, cid),
-        )
-        return {"id": cur.lastrowid, "created_at": now}
+        return _add_revision_snapshot(conn, cid, label)
 
 
 def list_revisions(cid, user_id):
@@ -1358,9 +1984,27 @@ def list_revisions(cid, user_id):
         if not _chapter_owned(conn, cid, user_id):
             return None
         return [dict(r) for r in conn.execute(
-            "SELECT id, title, length(content) AS chars, created_at "
+            "SELECT id, title, label, length(content) AS chars, created_at "
             "FROM chapter_revisions WHERE chapter_id=? ORDER BY id DESC", (cid,)
         )]
+
+
+def rename_revision(cid, user_id, rid, label):
+    label = (label or "").strip()[:120]
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        cur = conn.execute(
+            "UPDATE chapter_revisions SET label=? WHERE id=? AND chapter_id=?",
+            (label, rid, cid),
+        )
+        if not cur.rowcount:
+            return False
+        row = conn.execute(
+            "SELECT id, title, label, length(content) AS chars, created_at FROM chapter_revisions WHERE id=?",
+            (rid,),
+        ).fetchone()
+        return dict(row) if row else False
 
 
 def restore_revision(cid, user_id, rid):
@@ -1382,12 +2026,190 @@ def restore_revision(cid, user_id, rid):
 
 
 def get_revision(cid, user_id, rid):
-    """取单个历史版本的完整内容（供 AI 找回读取）。"""
+    """取单个历史版本的完整内容（供 AI 找回 / 预览 / 分支读取）。"""
     with get_conn() as conn:
         if not _chapter_owned(conn, cid, user_id):
             return None
         r = conn.execute(
-            "SELECT id, title, content, created_at FROM chapter_revisions WHERE id=? AND chapter_id=?",
+            "SELECT id, title, content, label, created_at FROM chapter_revisions WHERE id=? AND chapter_id=?",
             (rid, cid),
         ).fetchone()
         return dict(r) if r else None
+
+
+def create_chapter_branch(cid, user_id, rid, title=""):
+    """从某个章节快照复制出一章独立可编辑的分支稿，不污染主线正文。"""
+    now = time.time()
+    with get_conn() as conn:
+        if not _chapter_owned(conn, cid, user_id):
+            return None
+        source = conn.execute(
+            "SELECT work_id, notes, workflow_goal FROM chapters WHERE id=? AND deleted_at IS NULL", (cid,)
+        ).fetchone()
+        rev = conn.execute(
+            "SELECT title, content FROM chapter_revisions WHERE id=? AND chapter_id=?", (rid, cid)
+        ).fetchone()
+        if not source or not rev:
+            return False
+        title = (title or "").strip()[:200] or f"{rev['title'] or '章节'} · 分支"
+        ord_ = conn.execute(
+            "SELECT COALESCE(MAX(ord),0)+1 FROM chapters WHERE work_id=?", (source["work_id"],)
+        ).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO chapters(work_id,title,ord,content,notes,workflow_status,workflow_goal,"
+            "branch_of_chapter_id,branch_from_revision_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,'drafting',?,?,?,?,?)",
+            (source["work_id"], title, ord_, rev["content"] or "", source["notes"] or "",
+             source["workflow_goal"] or "", cid, rid, now, now),
+        )
+        conn.execute("UPDATE works SET updated_at=? WHERE id=?", (now, source["work_id"]))
+        return {"id": cur.lastrowid, "work_id": source["work_id"], "title": title, "ord": ord_,
+                "branch_of_chapter_id": cid, "branch_from_revision_id": rid}
+
+
+# ---------- 整本版本 ----------
+
+def _work_snapshot(conn, wid):
+    work = conn.execute("SELECT title, notes FROM works WHERE id=?", (wid,)).fetchone()
+    chapters = [dict(row) for row in conn.execute(
+        "SELECT id, title, ord, content, notes, workflow_status, workflow_goal, workflow_summary, "
+        "workflow_checked_at, branch_of_chapter_id, branch_from_revision_id "
+        "FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY ord", (wid,)
+    )]
+    return {"work": dict(work) if work else {}, "chapters": chapters}
+
+
+def save_work_revision(wid, user_id, label=""):
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        label = (label or "").strip()[:120]
+        snapshot = _work_snapshot(conn, wid)
+        cur = conn.execute(
+            "INSERT INTO work_revisions(work_id,label,snapshot_json,created_at) VALUES(?,?,?,?)",
+            (wid, label, json.dumps(snapshot, ensure_ascii=False), now),
+        )
+        conn.execute(
+            "DELETE FROM work_revisions WHERE work_id=? AND id NOT IN "
+            "(SELECT id FROM work_revisions WHERE work_id=? ORDER BY id DESC LIMIT 20)",
+            (wid, wid),
+        )
+        return {"id": cur.lastrowid, "label": label, "created_at": now,
+                "chapters": len(snapshot["chapters"])}
+
+
+def list_work_revisions(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        rows = conn.execute(
+            "SELECT id, label, snapshot_json, created_at FROM work_revisions WHERE work_id=? ORDER BY id DESC", (wid,)
+        ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                snapshot = json.loads(row["snapshot_json"] or "{}")
+            except Exception:
+                snapshot = {}
+            result.append({"id": row["id"], "label": row["label"] or "", "created_at": row["created_at"],
+                           "chapters": len(snapshot.get("chapters") or [])})
+        return result
+
+
+def get_work_revision(wid, user_id, rid):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        row = conn.execute(
+            "SELECT id, label, snapshot_json, created_at FROM work_revisions WHERE id=? AND work_id=?", (rid, wid)
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            snapshot = json.loads(row["snapshot_json"] or "{}")
+        except Exception:
+            snapshot = {}
+        return {"id": row["id"], "label": row["label"] or "", "created_at": row["created_at"],
+                "snapshot": snapshot if isinstance(snapshot, dict) else {}}
+
+
+def diff_work_revision(wid, user_id, rid):
+    revision = get_work_revision(wid, user_id, rid)
+    if not revision:
+        return revision
+    with get_conn() as conn:
+        current = _work_snapshot(conn, wid)
+    previous = {item.get("id"): item for item in revision["snapshot"].get("chapters", []) if isinstance(item, dict) and isinstance(item.get("id"), int)}
+    now = {item.get("id"): item for item in current.get("chapters", []) if isinstance(item, dict) and isinstance(item.get("id"), int)}
+    changes = []
+    for cid in sorted(set(previous) | set(now)):
+        old, new = previous.get(cid), now.get(cid)
+        if old is None:
+            changes.append({"chapter_id": cid, "title": new.get("title") or "", "status": "added",
+                            "chars_before": 0, "chars_now": len(new.get("content") or "")})
+            continue
+        if new is None:
+            changes.append({"chapter_id": cid, "title": old.get("title") or "", "status": "removed",
+                            "chars_before": len(old.get("content") or ""), "chars_now": 0})
+            continue
+        fields = [name for name in ("title", "content", "notes", "workflow_status", "workflow_goal", "workflow_summary")
+                  if (old.get(name) or "") != (new.get(name) or "")]
+        changes.append({"chapter_id": cid, "title": new.get("title") or old.get("title") or "",
+                        "status": "changed" if fields else "same", "changed_fields": fields,
+                        "chars_before": len(old.get("content") or ""), "chars_now": len(new.get("content") or "")})
+    return {"revision": {k: revision[k] for k in ("id", "label", "created_at")}, "chapters": changes}
+
+
+def restore_work_revision(wid, user_id, rid):
+    revision = get_work_revision(wid, user_id, rid)
+    if not revision:
+        return revision
+    snapshot = revision["snapshot"]
+    chapters = snapshot.get("chapters") if isinstance(snapshot.get("chapters"), list) else []
+    now = time.time()
+    restored = 0
+    created = 0
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        for item in chapters:
+            if not isinstance(item, dict):
+                continue
+            title = (item.get("title") or "新章节").strip()[:200]
+            ord_ = item.get("ord") if isinstance(item.get("ord"), int) else restored + created + 1
+            content = item.get("content") if isinstance(item.get("content"), str) else ""
+            notes = item.get("notes") if isinstance(item.get("notes"), str) else ""
+            workflow_status = item.get("workflow_status") if item.get("workflow_status") in WORKFLOW_STATUSES else "drafting"
+            workflow_goal = item.get("workflow_goal") if isinstance(item.get("workflow_goal"), str) else ""
+            workflow_summary = item.get("workflow_summary") if isinstance(item.get("workflow_summary"), str) else ""
+            old_id = item.get("id")
+            existing = conn.execute("SELECT id FROM chapters WHERE id=? AND work_id=?", (old_id, wid)).fetchone() if isinstance(old_id, int) else None
+            if existing:
+                conn.execute(
+                    "UPDATE chapters SET title=?, ord=?, content=?, notes=?, workflow_status=?, workflow_goal=?, "
+                    "workflow_summary=?, workflow_checked_at=?, deleted_at=NULL, updated_at=? WHERE id=?",
+                    (title, ord_, content, notes, workflow_status, workflow_goal[:2000], workflow_summary[:4000],
+                     item.get("workflow_checked_at"), now, old_id),
+                )
+                restored += 1
+            else:
+                conn.execute(
+                    "INSERT INTO chapters(work_id,title,ord,content,notes,workflow_status,workflow_goal,workflow_summary,"
+                    "workflow_checked_at,branch_of_chapter_id,branch_from_revision_id,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (wid, title, ord_, content, notes, workflow_status, workflow_goal[:2000], workflow_summary[:4000],
+                     item.get("workflow_checked_at"), item.get("branch_of_chapter_id"), item.get("branch_from_revision_id"), now, now),
+                )
+                created += 1
+        work_notes = snapshot.get("work", {}).get("notes") if isinstance(snapshot.get("work"), dict) else None
+        if isinstance(work_notes, str):
+            conn.execute("UPDATE works SET notes=?, updated_at=? WHERE id=?", (work_notes, now, wid))
+        else:
+            conn.execute("UPDATE works SET updated_at=? WHERE id=?", (now, wid))
+    return {"restored": restored, "created": created, "retained_current_chapters": max(0, len(_work_snapshot_after_restore(wid, user_id)) - restored - created)}
+
+
+def _work_snapshot_after_restore(wid, user_id):
+    """供整本恢复结果统计，避免把连接对象传出事务。"""
+    return list_chapters(wid, user_id) or []

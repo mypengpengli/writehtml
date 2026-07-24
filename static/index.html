@@ -44,6 +44,7 @@
         <input id="chapTitle" class="title-input" placeholder="章节标题">
         <span id="wc" class="wc">0 字</span>
         <span id="saveStat" class="save-stat"></span>
+        <button class="ic top-workbench" id="storyToggleBtn" data-ic="panel" onclick="toggleStoryDrawer()" title="写作工作台"></button>
         <button class="ic top-ai" id="aiToggleBtn" data-ic="bot" data-label="AI 助手" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
         <div class="menu-wrap">
           <button class="ic" data-ic="more" onclick="toggleMoreMenu(event)" title="更多"></button>
@@ -121,6 +122,7 @@
         <span data-ic="bot" data-label="AI 助手"></span>
         <span class="ai-head-tools">
           <button class="ic" data-ic="sparkles" onclick="openSkillPicker()" title="选择本轮 AI Skill"></button>
+          <button class="ic" data-ic="eye" onclick="openStoryDrawer('context')" title="查看本回合上下文"></button>
           <button class="ic" id="aiTtsBtn" data-ic="mute" onclick="toggleAiTts()" title="自动朗读"></button>
           <button class="ic" data-ic="trash" onclick="clearAgent()" title="清空对话"></button>
           <button class="ic" data-ic="x" onclick="toggleAISide()" title="收起"></button>
@@ -135,6 +137,7 @@
         <div id="agentSelectionText" class="agent-selection-text"></div>
       </div>
       <div id="agentSkills" class="agent-skills hidden"></div>
+      <div id="voiceTrace" class="voice-trace hidden" aria-live="polite"></div>
       <div class="chat-input-row">
         <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
@@ -142,7 +145,132 @@
         <button id="sendBtn" onclick="sendAgent()">发送</button>
       </div>
     </aside>
+
+    <div class="story-backdrop" onclick="closeStoryDrawer()"></div>
+    <aside id="storyDrawer" class="story-drawer" aria-label="写作工作台">
+      <div class="story-head">
+        <span data-ic="panel" data-label="写作工作台"></span>
+        <span class="story-head-actions">
+          <button class="ic" data-ic="refresh" onclick="refreshStoryDrawer()" title="刷新当前面板"></button>
+          <button class="ic" data-ic="x" onclick="closeStoryDrawer()" title="关闭"></button>
+        </span>
+      </div>
+      <div class="story-tabs" role="tablist" aria-label="写作工作台内容">
+        <button class="story-tab active" data-story-tab="plot" onclick="selectStoryTab('plot')">剧情</button>
+        <button class="story-tab" data-story-tab="workflow" onclick="selectStoryTab('workflow')">本章</button>
+        <button class="story-tab" data-story-tab="relations" onclick="selectStoryTab('relations')">关系</button>
+        <button class="story-tab" data-story-tab="alerts" onclick="selectStoryTab('alerts')">提醒</button>
+        <button class="story-tab" data-story-tab="context" onclick="selectStoryTab('context')">上下文</button>
+      </div>
+      <div class="story-body">
+        <section id="storyPanelPlot" class="story-panel">
+          <div class="story-panel-head">
+            <label>查看时点<select id="plotStateChapter" onchange="changePlotStateChapter()"></select></label>
+            <button id="plotStateAnalyzeBtn" class="ic" data-ic="sparkles" onclick="analyzePlotState()" title="提取本章剧情推进"></button>
+          </div>
+          <div id="plotStateMeta" class="story-meta"></div>
+          <div id="plotStateProposals" class="story-proposals"></div>
+          <div class="story-section">
+            <div class="story-section-head"><b>当前剧情状态</b><span id="plotStateSource" class="story-meta"></span></div>
+            <div class="story-form-grid">
+              <label>主线进度<textarea id="plotStateMainline"></textarea></label>
+              <label>当前事件<textarea id="plotStateCurrentEvent"></textarea></label>
+              <label>时间线<input id="plotStateTimeline"></label>
+              <label>地点<input id="plotStateLocations"></label>
+              <label>核心冲突<textarea id="plotStateConflicts"></textarea></label>
+              <label>未回收伏笔<textarea id="plotStateOpenThreads"></textarea></label>
+              <label>下一章目标<textarea id="plotStateNextGoal"></textarea></label>
+              <label>补充<textarea id="plotStateNotes"></textarea></label>
+            </div>
+            <label>本章推进摘要<input id="plotStateSummary"></label>
+            <label>剧情依据<textarea id="plotStateEvidence"></textarea></label>
+            <div class="set-actions">
+              <button id="plotStateSaveBtn" onclick="savePlotState()">保存为本章剧情状态</button>
+            </div>
+            <span id="plotStateMsg" class="msg"></span>
+          </div>
+          <div class="story-section">
+            <div class="story-section-head"><b>推进记录</b></div>
+            <div id="plotStateHistory" class="story-timeline"></div>
+          </div>
+        </section>
+
+        <section id="storyPanelWorkflow" class="story-panel hidden">
+          <div id="workflowMeta" class="story-meta"></div>
+          <div class="workflow-stages" role="group" aria-label="章节阶段">
+            <button data-workflow="planning" onclick="setWorkflowStatus('planning')">规划</button>
+            <button data-workflow="drafting" onclick="setWorkflowStatus('drafting')">写作</button>
+            <button data-workflow="review" onclick="setWorkflowStatus('review')">复核</button>
+            <button data-workflow="final" onclick="setWorkflowStatus('final')">定稿</button>
+          </div>
+          <div class="story-section">
+            <label>本章目标<textarea id="workflowGoal" placeholder="本章要推进什么、不能违背什么"></textarea></label>
+            <label>本章摘要<textarea id="workflowSummary" placeholder="已完成的剧情与下一步衔接"></textarea></label>
+            <div class="set-actions">
+              <button id="workflowSaveBtn" onclick="saveWorkflow()">保存本章计划</button>
+              <button id="workflowReviewBtn" onclick="runChapterReview()">AI 复核</button>
+            </div>
+            <span id="workflowMsg" class="msg"></span>
+          </div>
+        </section>
+
+        <section id="storyPanelRelations" class="story-panel hidden">
+          <div id="relationMap" class="relation-map"></div>
+          <div id="relationList" class="relation-list"></div>
+          <div class="story-section relation-edit">
+            <div class="story-section-head"><b id="relationFormTitle">新增关系</b></div>
+            <div class="relation-form-grid">
+              <label>人物 A<select id="relationFrom"></select></label>
+              <label>人物 B<select id="relationTo"></select></label>
+              <label>关系<input id="relationName" placeholder="师徒、敌对、信任…"></label>
+              <label>状态<input id="relationStatus" placeholder="active"></label>
+            </div>
+            <label>备注<textarea id="relationDetail" placeholder="关系来源、隐藏条件、变化节点"></textarea></label>
+            <div class="set-actions">
+              <button id="relationSaveBtn" onclick="saveRelation()">保存关系</button>
+              <button class="ic hidden" id="relationCancelBtn" data-ic="x" onclick="resetRelationForm()" title="取消编辑"></button>
+            </div>
+            <span id="relationMsg" class="msg"></span>
+          </div>
+        </section>
+
+        <section id="storyPanelAlerts" class="story-panel hidden">
+          <div id="alertsMeta" class="story-meta"></div>
+          <div id="alertsList" class="alerts-list"></div>
+        </section>
+
+        <section id="storyPanelContext" class="story-panel hidden">
+          <div class="story-panel-head">
+            <div id="contextMeta" class="story-meta"></div>
+            <button id="contextRefreshBtn" class="ic" data-ic="refresh" onclick="loadAgentContext()" title="刷新本回合上下文"></button>
+          </div>
+          <div id="contextSelection" class="context-block"></div>
+          <div id="contextSkills" class="context-block"></div>
+          <div id="contextRuntime" class="context-block"></div>
+          <div id="contextTools" class="context-block"></div>
+          <div id="contextSystem" class="context-system"></div>
+        </section>
+      </div>
+    </aside>
   </div>
+
+  <!-- AI 改稿先预览，作者确认后才写入正文 -->
+  <div id="editReviewBackdrop" class="edit-review-backdrop hidden" onclick="closeEditReview()"></div>
+  <aside id="editReviewDrawer" class="edit-review-drawer hidden" aria-label="AI 改稿预览">
+    <div class="edit-review-head">
+      <div><b>AI 改稿预览</b><span id="editReviewMeta" class="story-meta"></span></div>
+      <button class="ic" data-ic="x" onclick="closeEditReview()" title="关闭"></button>
+    </div>
+    <div id="editReviewScope" class="edit-review-scope"></div>
+    <div class="edit-review-diff">
+      <section><div class="edit-review-label">原文</div><pre id="editReviewOld"></pre></section>
+      <section><div class="edit-review-label">建议</div><pre id="editReviewNew"></pre></section>
+    </div>
+    <div class="edit-review-actions">
+      <button class="ic" data-ic="x" onclick="closeEditReview()" title="放弃这次改稿"></button>
+      <button id="editReviewApplyBtn" onclick="applyEditReview()">接受改稿</button>
+    </div>
+  </aside>
 
   <!-- 阅读视图 -->
   <div id="reader" class="reader hidden">
@@ -163,16 +291,26 @@
 
   <!-- 历史版本 -->
   <div id="revOverlay" class="overlay hidden">
-    <div class="overlay-card">
-      <div class="overlay-head"><span>历史版本</span><button class="ic" data-ic="x" onclick="closeRevisions()"></button></div>
-      <div id="revList" class="rev-list"></div>
+    <div class="overlay-card revision-card">
+      <div class="overlay-head">
+        <span>版本管理</span>
+        <span class="overlay-head-actions">
+          <button class="ic" data-ic="bookmark" onclick="saveNamedRevision()" title="保存命名章节版本"></button>
+          <button class="ic" data-ic="book" onclick="saveNamedWorkRevision()" title="保存整本版本"></button>
+          <button class="ic" data-ic="x" onclick="closeRevisions()"></button>
+        </span>
+      </div>
+      <div class="revision-columns">
+        <section><div class="revision-section-head"><b>本章版本</b></div><div id="revList" class="rev-list"></div></section>
+        <section><div class="revision-section-head"><b>整本版本</b></div><div id="workRevList" class="rev-list"></div></section>
+      </div>
     </div>
   </div>
 
   <!-- 版本对比 -->
   <div id="diffOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
-      <div class="overlay-head"><span>版本对比（历史 → 当前）</span><button class="ic" data-ic="x" onclick="closeDiff()"></button></div>
+      <div class="overlay-head"><span id="diffTitle">版本对比（历史 → 当前）</span><span class="overlay-head-actions"><button id="diffRestoreBtn" class="hidden" onclick="applyPendingRestore()">确认恢复</button><button class="ic" data-ic="x" onclick="closeDiff()"></button></span></div>
       <div id="diffSub" class="set-hint" style="padding:8px 14px 0"></div>
       <div id="diffBody" class="diff-body"></div>
     </div>

@@ -32,6 +32,20 @@ let agentSkills = [];
 let agentSkillsWorkId = undefined;
 let activeAgentSkillIds = new Set();
 let currentUsername = "";
+// 写作工作台：剧情、章节流程、关系、提醒与本回合上下文共用一个右侧抽屉。
+let storyTab = "plot";
+let plotStateChapterId = null;
+let plotStateProposalId = null;
+let plotStateData = null;
+let chapterWorkflow = null;
+let entityRelations = [];
+let editingRelationId = null;
+let consistencyAlerts = [];
+let agentContext = null;
+let pendingEditReview = null;
+let pendingRevisionRestore = null;
+let pendingWorkRevisionRestore = null;
+let voiceTraceState = null;
 
 /* ---------- 图标（内联 SVG，Lucide 风格 24×24 描边） ---------- */
 const _W = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
@@ -72,6 +86,12 @@ const ICONS = {
   feather:  `<svg ${_W}><path d="M20.2 12.2a6 6 0 0 0-8.5-8.5L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/></svg>`,
   type:     `<svg ${_W}><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><path d="M12 4v16"/></svg>`,
   grip:     `<svg ${_W}><circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none"/></svg>`,
+  panel:    `<svg ${_W}><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/><line x1="13" y1="9" x2="18" y2="9"/><line x1="13" y1="14" x2="18" y2="14"/></svg>`,
+  eye:      `<svg ${_W}><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="2.7"/></svg>`,
+  refresh:  `<svg ${_W}><path d="M20 11a8 8 0 1 0 2 5.5"/><polyline points="20 4 20 11 13 11"/></svg>`,
+  branch:   `<svg ${_W}><line x1="6" y1="3" x2="6" y2="15"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M6 6a12 12 0 0 0 12 0"/></svg>`,
+  alert:    `<svg ${_W}><path d="M10.3 3.8 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
+  check:    `<svg ${_W}><polyline points="20 6 9 17 4 12"/></svg>`,
 };
 function svg(n) { return ICONS[n] || ""; }
 // 把图标注入 [data-ic] 元素；data-label 存在则图标后跟文字（移动端更易用）
@@ -166,6 +186,8 @@ const tail = (s, n) => (!s ? "" : s.length > n ? s.slice(-n) : s);
 const charCount = (s) => (s || "").replace(/\s/g, "").length;
 const esc = (s) => (s || "").replace(/[&<>"]/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const workflowLabels = { planning: "规划", drafting: "写作", review: "复核", final: "定稿" };
+function workflowLabel(status) { return workflowLabels[status] || workflowLabels.drafting; }
 function appendText(t) {
   const el = $("content");
   if (el.value && !el.value.endsWith("\n")) el.value += "\n";
@@ -244,6 +266,8 @@ function renderTree() {
            ondrop="dragDrop(event,${c.id})">
         <span class="drag">${svg("grip")}</span>
         <span class="c-title">${esc(c.title) || "(无标题)"}</span>
+        ${c.branch_of_chapter_id ? `<span class="chap-branch" title="从历史版本创建的分支稿">${svg("branch")}</span>` : ""}
+        <span class="chap-stage stage-${esc(c.workflow_status || "drafting")}" title="章节阶段">${esc(workflowLabel(c.workflow_status))}</span>
         <span class="c-wc">${(c.chars || 0)}字</span>
         <button class="c-del" onclick="event.stopPropagation();delChapter(${c.id})" title="删除">${svg("x")}</button>
       </div>`).join("") : "";
@@ -309,6 +333,7 @@ async function loadChapter() {
   if (!$("characterStateOverlay").classList.contains("hidden") && characterStateChapterId === currentChapterId) {
     await loadCharacterState();
   }
+  if ($("app").classList.contains("story-open")) await refreshStoryDrawer();
 }
 
 async function newWork() {
@@ -563,44 +588,113 @@ function clearAgentSelection() {
   if (input) input.placeholder = "让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）";
 }
 
-/* ---------- AI 处理（本地追加，不覆盖正文，避免丢手打内容） ---------- */
+/* ---------- AI 处理：先生成预览，作者确认后才写入正文 ---------- */
+
+async function notifyStoryUpdates(result) {
+  const count = Array.isArray(result?.character_state_proposals) ? result.character_state_proposals.length : 0;
+  const plot = result?.plot_state_proposal ? 1 : 0;
+  if (count || plot) {
+    const labels = [];
+    if (count) labels.push(`${count} 条人物状态`);
+    if (plot) labels.push("剧情推进");
+    showToast(`已生成待确认：${labels.join("、")}`, "ok");
+    await refreshCharacterCards();
+    if ($("app").classList.contains("story-open")) await refreshStoryDrawer();
+  }
+}
+
+function openEditReview(proposal) {
+  pendingEditReview = proposal;
+  const replacing = proposal.operation === "replace";
+  $("editReviewMeta").textContent = `${proposal.mode || "AI 改稿"} · ${replacing ? "替换选区" : "追加到章末"}`;
+  $("editReviewScope").textContent = replacing
+    ? `将替换当前章节中的 ${charCount(proposal.old_text)} 字选区`
+    : "将追加到当前章节末尾";
+  $("editReviewOld").textContent = replacing ? proposal.old_text : proposal.base_content.slice(-1600) || "（当前正文为空）";
+  $("editReviewNew").textContent = proposal.result || "（模型没有返回内容）";
+  $("editReviewBackdrop").classList.remove("hidden");
+  $("editReviewDrawer").classList.remove("hidden");
+  $("editReviewApplyBtn").textContent = replacing ? "接受替换" : "接受追加";
+}
+
+function closeEditReview() {
+  $("editReviewBackdrop").classList.add("hidden");
+  $("editReviewDrawer").classList.add("hidden");
+  pendingEditReview = null;
+}
+
+async function applyEditReview() {
+  const proposal = pendingEditReview;
+  if (!proposal || proposal.chapter_id !== currentChapterId) { closeEditReview(); return; }
+  const button = $("editReviewApplyBtn");
+  busy(button, true, "应用中");
+  try {
+    const result = await api(`/api/chapters/${proposal.chapter_id}/edit-proposals/apply`, {
+      body: proposal,
+    });
+    $("content").value = result.content || "";
+    if (result.title != null) $("chapTitle").value = result.title;
+    dirty = false;
+    updateSaveStat("");
+    updateWC();
+    const chapter = chapters.find(item => item.id === currentChapterId);
+    if (chapter) chapter.chars = charCount(result.content || "");
+    renderTree();
+    updateSelectionTools();
+    closeEditReview();
+    await notifyStoryUpdates(result);
+    flash("已应用 AI 改稿");
+  } catch (e) {
+    showToast(e.message, "err");
+  } finally {
+    if (pendingEditReview) busy(button, false, proposal.operation === "replace" ? "接受替换" : "接受追加");
+  }
+}
 
 async function processAndAppend(text) {
   if (!currentChapterId) { showToast("先选择或新建一个章节", "err"); return; }
-  const ctx = tail($("content").value, 1500);
+  const el = $("content");
   setMicStatus("处理中…");
   try {
-    const r = await api("/api/process", { body: { mode, text, context: ctx, chapter_id: currentChapterId } });
-    appendText(r.result);          // 本地追加结果，保留正在手打的内容
-    onContentInput();
-    if (Array.isArray(r.character_state_proposals) && r.character_state_proposals.length) {
-      showToast(`已生成 ${r.character_state_proposals.length} 条人物状态待确认`, "ok");
-      await refreshCharacterCards();
+    // 纯转写仍按原有语音落稿方式直接追加；所有 AI 生成正文先进入预览。
+    if (mode === "转写") {
+      const r = await api("/api/process", { body: { mode, text, context: tail(el.value, 1500), chapter_id: currentChapterId } });
+      appendText(r.result);
+      onContentInput();
+      await notifyStoryUpdates(r);
+      return;
     }
-    setMicStatus("");
+    if (dirty) await saveNow();
+    const baseContent = el.value;
+    const r = await api("/api/process", {
+      body: { mode, text, context: tail(baseContent, 1500), chapter_id: currentChapterId,
+              preview: true, preview_operation: "append" },
+    });
+    openEditReview({ chapter_id: currentChapterId, mode: r.mode || mode, operation: r.operation || "append",
+      result: r.result || "", base_content: baseContent, old_text: "", start: null, end: null });
   } catch (e) { setMicStatus("出错：" + e.message); }
+  finally { setMicStatus(""); }
 }
 
-// 选区操作：缩写 / 改写风格。对正文里选中的一段原地替换，可 Ctrl+Z 撤销
+// 选区操作：缩写 / 改写风格。结果先进入预览，确认后由后端验证原文仍未变化再替换。
 async function processSelection(m, style) {
   const el = $("content");
   if (!currentChapterId) { showToast("先选择或新建一个章节", "err"); return; }
   const s = el.selectionStart, e = el.selectionEnd;
   if (s == null || s === e) { showToast("先在正文里选中一段文字再操作", "err"); return; }
+  const selected = el.value.slice(s, e);
   setMicStatus("处理中…");
   try {
+    if (dirty) await saveNow();
+    const baseContent = el.value;
     const r = await api("/api/process", {
-      body: { mode: m, text: el.value.slice(s, e), context: tail(el.value, 1500), chapter_id: currentChapterId, style }
+      body: { mode: m, text: selected, context: tail(baseContent, 1500), chapter_id: currentChapterId, style,
+              preview: true, preview_operation: "replace" },
     });
-    el.setRangeText(r.result, s, e, "end");   // 原地替换选区，保留撤销历史
-    onContentInput();                          // 触发自动保存（走 PUT /api/chapters/{cid}）
-    updateSelectionTools();
-    if (Array.isArray(r.character_state_proposals) && r.character_state_proposals.length) {
-      showToast(`已生成 ${r.character_state_proposals.length} 条人物状态待确认`, "ok");
-      await refreshCharacterCards();
-    }
-    setMicStatus("");
+    openEditReview({ chapter_id: currentChapterId, mode: r.mode || m, operation: r.operation || "replace",
+      result: r.result || "", base_content: baseContent, old_text: selected, start: s, end: e });
   } catch (e) { setMicStatus("出错：" + e.message); }
+  finally { setMicStatus(""); }
 }
 
 async function generate() {
@@ -687,24 +781,71 @@ async function saveRevision() {
   flash("已存为版本");
 }
 
-async function showRevisions() {
+async function saveNamedRevision() {
   if (!currentChapterId) return;
-  const list = await api(`/api/chapters/${currentChapterId}/revisions`, { method: "GET" });
+  if (dirty) await saveNow();
+  const label = await askCard({ title: "保存命名章节版本", input: "版本名称（可选）", def: "", okText: "保存" });
+  if (label === false) return;
+  await api(`/api/chapters/${currentChapterId}/revisions`, { body: { label: label || "" } });
+  await showRevisions();
+  showToast("章节版本已保存", "ok");
+}
+
+async function saveNamedWorkRevision() {
+  if (!currentWorkId) return;
+  if (dirty) await saveNow();
+  const label = await askCard({ title: "保存整本版本", input: "版本名称（可选）", def: "", okText: "保存" });
+  if (label === false) return;
+  await api(`/api/works/${currentWorkId}/revisions`, { body: { label: label || "" } });
+  await showRevisions();
+  showToast("整本版本已保存", "ok");
+}
+
+async function showRevisions() {
+  if (!currentChapterId || !currentWorkId) return;
+  const [list, workList] = await Promise.all([
+    api(`/api/chapters/${currentChapterId}/revisions`, { method: "GET" }),
+    api(`/api/works/${currentWorkId}/revisions`, { method: "GET" }),
+  ]);
   $("revList").innerHTML = list.length ? list.map(r => `
     <div class="rev">
-      <span>${new Date(r.created_at * 1000).toLocaleString()} · ${r.chars}字</span>
-      <button class="ic" onclick="openDiff(${r.id})" title="和当前正文逐行对比增删">对比</button>
-      <button class="ic" onclick="restoreRevision(${r.id})">恢复</button>
-      <button class="ic" onclick="recoverFromRevision(${r.id})" title="让 AI 读这版旧草稿，把被删掉的好内容找回成段落追加">AI 找回</button>
+      <span><b>${esc(r.label || "未命名快照")}</b><small>${new Date(r.created_at * 1000).toLocaleString()} · ${r.chars}字</small></span>
+      <span class="rev-actions">
+        <button class="ic" onclick="openDiff(${r.id}, true)" title="先查看差异再恢复">${svg("eye")}</button>
+        <button class="ic" onclick="renameRevision(${r.id})" title="重命名版本">${svg("pen")}</button>
+        <button class="ic" onclick="createBranchFromRevision(${r.id})" title="从此版本创建可编辑分支稿">${svg("branch")}</button>
+        <button class="ic" onclick="recoverFromRevision(${r.id})" title="让 AI 从旧草稿中找回内容并先预览">${svg("sparkles")}</button>
+      </span>
     </div>`).join("") : '<div class="empty">还没有存过版本</div>';
+  $("workRevList").innerHTML = workList.length ? workList.map(r => `
+    <div class="rev">
+      <span><b>${esc(r.label || "整本快照")}</b><small>${new Date(r.created_at * 1000).toLocaleString()} · ${r.chapters}章</small></span>
+      <span class="rev-actions"><button class="ic" onclick="openWorkDiff(${r.id}, true)" title="查看整本变化并恢复">${svg("eye")}</button></span>
+    </div>`).join("") : '<div class="empty">还没有整本版本</div>';
   $("revOverlay").classList.remove("hidden");
 }
 function closeRevisions() { $("revOverlay").classList.add("hidden"); }
-async function openDiff(rid) {
+async function renameRevision(rid, existing) {
+  const label = await askCard({ title: "重命名章节版本", input: "版本名称", def: existing || "", okText: "保存" });
+  if (label === false) return;
+  await api(`/api/chapters/${currentChapterId}/revisions/${rid}`, { method: "PUT", body: { label: label || "" } });
+  await showRevisions();
+}
+async function createBranchFromRevision(rid) {
+  const title = await askCard({ title: "创建分支稿", msg: "会在本作品中新增一章，可独立编辑，不会覆盖当前主线。", input: "分支章节标题", def: `${$("chapTitle").value || "章节"} · 分支`, okText: "创建" });
+  if (!title) return;
+  const result = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/branch`, { body: { title } });
+  currentChapterId = result.id;
+  closeRevisions();
+  await loadChapters();
+  showToast("已创建分支稿", "ok");
+}
+async function openDiff(rid, allowRestore = false) {
   if (!currentChapterId) return;
   setMicStatus("对比中…");
   try {
     const d = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/diff`, { method: "GET" });
+    $("diffTitle").textContent = "版本对比（历史 → 当前）";
     $("diffSub").textContent = `${d.rev_title || "(无标题)"}  →  ${d.cur_title || "(当前)"}  ·  ${new Date(d.rev_at * 1000).toLocaleString()}`;
     $("diffBody").innerHTML = (d.ops || []).map(o => {
       if (o.op === "equal")  return `<div class="d-eq">${esc(o.old)}</div>`;
@@ -713,18 +854,53 @@ async function openDiff(rid) {
       // replace：先旧（红）后新（绿）
       return `<div class="d-del">－ ${esc(o.old)}</div><div class="d-ins">＋ ${esc(o.new)}</div>`;
     }).join("") || '<div class="empty">无差异</div>';
+    pendingRevisionRestore = allowRestore ? rid : null;
+    pendingWorkRevisionRestore = null;
+    $("diffRestoreBtn").classList.toggle("hidden", !allowRestore);
+    $("diffRestoreBtn").textContent = "确认恢复此版本";
     $("diffOverlay").classList.remove("hidden");
   } catch (e) { showToast("对比失败：" + e.message, "err"); }
   setMicStatus("");
 }
-function closeDiff() { $("diffOverlay").classList.add("hidden"); }
-async function restoreRevision(rid) {
-  if (!await askCard({ title: "恢复此版本？", msg: "当前正文会被覆盖（可先存个版本备份）。", okText: "恢复" })) return;
-  const c = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/restore`, { method: "POST" });
-  $("content").value = c.content || ""; $("chapTitle").value = c.title || "";
-  onContentInput();
-  closeRevisions();
-  flash("已恢复");
+async function openWorkDiff(rid, allowRestore = false) {
+  if (!currentWorkId) return;
+  const data = await api(`/api/works/${currentWorkId}/revisions/${rid}/diff`, { method: "GET" });
+  $("diffTitle").textContent = "整本版本对比";
+  $("diffSub").textContent = `${data.revision.label || "整本快照"} · ${new Date(data.revision.created_at * 1000).toLocaleString()}`;
+  $("diffBody").innerHTML = (data.chapters || []).map(item => {
+    const fields = (item.changed_fields || []).join("、");
+    const label = { added: "新增", removed: "已移除", changed: "有修改", same: "无变化" }[item.status] || item.status;
+    return `<div class="work-diff-row work-diff-${esc(item.status)}"><b>${esc(item.title || "无标题")}</b><span>${esc(label)}${fields ? ` · ${esc(fields)}` : ""}</span><small>${item.chars_before} → ${item.chars_now} 字</small></div>`;
+  }).join("") || '<div class="empty">无章节变化</div>';
+  pendingRevisionRestore = null;
+  pendingWorkRevisionRestore = allowRestore ? rid : null;
+  $("diffRestoreBtn").classList.toggle("hidden", !allowRestore);
+  $("diffRestoreBtn").textContent = "确认恢复整本";
+  $("diffOverlay").classList.remove("hidden");
+}
+function closeDiff() {
+  $("diffOverlay").classList.add("hidden");
+  pendingRevisionRestore = null;
+  pendingWorkRevisionRestore = null;
+  $("diffRestoreBtn").classList.add("hidden");
+}
+async function applyPendingRestore() {
+  if (pendingRevisionRestore) {
+    const rid = pendingRevisionRestore;
+    const c = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/restore`, { method: "POST" });
+    $("content").value = c.content || ""; $("chapTitle").value = c.title || "";
+    dirty = false; updateSaveStat(""); updateWC();
+    closeDiff(); closeRevisions();
+    flash("已恢复章节版本");
+    return;
+  }
+  if (pendingWorkRevisionRestore) {
+    const rid = pendingWorkRevisionRestore;
+    await api(`/api/works/${currentWorkId}/revisions/${rid}/restore`, { body: {} });
+    closeDiff(); closeRevisions();
+    await loadChapters();
+    showToast("已恢复整本版本；恢复前快照已自动保存", "ok");
+  }
 }
 async function recoverFromRevision(rid) {
   if (!currentChapterId) return;
@@ -732,17 +908,13 @@ async function recoverFromRevision(rid) {
   setMicStatus("AI 找回中…");
   try {
     const r = await api("/api/process", {
-      body: { mode: "找回", chapter_id: currentChapterId, revision_id: rid },
+      body: { mode: "找回", chapter_id: currentChapterId, revision_id: rid, preview: true, preview_operation: "append" },
     });
-    appendText(r.result);          // 找回的段落追加进正文，非破坏式
-    onContentInput();
     closeRevisions();
-    if (Array.isArray(r.character_state_proposals) && r.character_state_proposals.length) {
-      showToast(`已生成 ${r.character_state_proposals.length} 条人物状态待确认`, "ok");
-      await refreshCharacterCards();
-    }
-    flash("已找回内容并追加");
+    openEditReview({ chapter_id: currentChapterId, mode: r.mode || "找回", operation: r.operation || "append",
+      result: r.result || "", base_content: $("content").value, old_text: "", start: null, end: null });
   } catch (e) { setMicStatus("出错：" + e.message); }
+  finally { setMicStatus(""); }
 }
 
 /* ---------- 导出 ---------- */
@@ -856,8 +1028,14 @@ async function aiCheck() {
   $("aiResult").textContent = "校验中…";
   busy($("aiCheckBtn"), true);
   try {
-    const r = await api("/api/process", { body: { mode: "校验", chapter_id: currentChapterId } });
-    $("aiResult").textContent = r.result;
+    if (dirty) await saveNow();
+    const r = await api(`/api/chapters/${currentChapterId}/review`, { body: {} });
+    consistencyAlerts = r.alerts || [];
+    syncChapterWorkflow(r.workflow);
+    $("aiResult").textContent = consistencyAlerts.length
+      ? consistencyAlerts.map(item => `[${item.severity}] ${item.title}\n${item.detail || item.suggestion || ""}`).join("\n\n")
+      : "未发现明确的连续性冲突。";
+    await notifyStoryUpdates(r);
   } catch (e) { $("aiResult").textContent = "出错：" + e.message; }
   finally { busy($("aiCheckBtn"), false); }
 }
@@ -1123,13 +1301,9 @@ async function applyAgentResult(r, selection) {
   }
   if (sidebarDirty) await loadChapters();
   else if (contentChanged && currentChapterId) await loadChapter();
-  const proposals = Array.isArray(r.character_state_proposals) ? r.character_state_proposals : [];
-  if (proposals.length) {
-    showToast(`已生成 ${proposals.length} 条人物状态待确认`, "ok");
-    await refreshCharacterCards();
-    if (!$("characterStateOverlay").classList.contains("hidden") && characterStateChapterId === currentChapterId) {
-      await loadCharacterState();
-    }
+  await notifyStoryUpdates(r);
+  if (!$('characterStateOverlay').classList.contains('hidden') && characterStateChapterId === currentChapterId) {
+    await loadCharacterState();
   }
 }
 function speakLatestAgentTurn() {
@@ -1202,6 +1376,25 @@ function openAdmin() { location.href = "admin.html"; }
 
 /* 智能体语音：默认直发当前模型；关闭直发时才走独立 ASR。 */
 
+function setVoiceTrace(state, detail = "", type = "") {
+  voiceTraceState = { state, detail, type };
+  const host = $("voiceTrace");
+  if (!host) return;
+  host.classList.remove("hidden", "err", "ok", "recording");
+  if (type) host.classList.add(type);
+  if (state === "录音中") host.classList.add("recording");
+  host.innerHTML = `${svg(state === "出错" ? "alert" : state === "录音中" ? "mic" : "check")}<span><b>${esc(state)}</b>${detail ? `<small>${esc(detail)}</small>` : ""}</span>`;
+}
+async function micPermissionHint() {
+  const parts = [];
+  if (!window.isSecureContext) parts.push("当前页面不是安全上下文，请使用 HTTPS 打开网站");
+  try {
+    const status = await navigator.permissions?.query?.({ name: "microphone" });
+    if (status?.state === "denied") parts.push("浏览器站点权限目前为拒绝");
+  } catch (e) {}
+  return parts.join("；");
+}
+
 function bestAudioMime() {
   const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
   return types.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
@@ -1255,6 +1448,7 @@ async function transcribeAgentAudio(blob) {
   const el = $("agentInput");
   if (!_agentPH) _agentPH = el.placeholder;
   el.placeholder = "语音转写中…";
+  setVoiceTrace("正在转写", "录音会先发送到配置的 /audio/transcriptions 接口");
   try {
     const res = await fetch("/api/asr", {
       method: "POST",
@@ -1271,10 +1465,16 @@ async function transcribeAgentAudio(blob) {
     if (!text) throw new Error("没有识别到文字");
     el.value = text;
     el.placeholder = _agentPH || "";
-    if (voiceAsrAutoSend) await sendAgent();
+    const route = r.voice?.route || "转写接口";
+    if (voiceAsrAutoSend) {
+      setVoiceTrace("转写完成", `${route} · 正在把文字发送给 AI`, "ok");
+      await sendAgent();
+    }
     else el.focus();
+    if (!voiceAsrAutoSend) setVoiceTrace("转写完成", `${route} · 已填入输入框`, "ok");
   } catch (e) {
     el.placeholder = "转写失败：" + e.message;
+    setVoiceTrace("出错", "转写链路：" + e.message, "err");
     showToast("转写失败：" + e.message, "err");
   } finally {
     btn.classList.remove("is-busy");
@@ -1290,6 +1490,7 @@ async function sendAgentAudio(blob) {
   btn.classList.add("is-busy");
   if (!_agentPH) _agentPH = el.placeholder;
   el.placeholder = "正在把语音发送给 AI…";
+  setVoiceTrace("正在直发", "录音将直接发送给当前 Agent 模型，不经过转写");
   renderAgent();
   try {
     const wav = await recordToMonoWav(blob);
@@ -1308,9 +1509,12 @@ async function sendAgentAudio(blob) {
     });
     if (res.status === 401) { showLogin(); throw new Error("未登录"); }
     if (!res.ok) throw new Error(await responseError(res));
-    await applyAgentResult(await res.json(), selection);
+    const result = await res.json();
+    setVoiceTrace("语音已发送", `${result.voice?.route || "当前 Agent 模型"} · ${result.voice?.model || ""}`, "ok");
+    await applyAgentResult(result, selection);
   } catch (e) {
     agentMsgs.push({ role: "assistant", content: "语音直发失败：" + e.message });
+    setVoiceTrace("出错", "直发链路：" + e.message, "err");
     showToast("语音直发失败：" + e.message, "err");
   } finally {
     agentBusy = false;
@@ -1323,7 +1527,7 @@ async function sendAgentAudio(blob) {
 }
 function explainMicStartError(e) {
   if (e?.name === "NotAllowedError") {
-    return "麦克风未获允许：请检查手机系统是否允许 Chrome 使用麦克风，并在浏览器站点设置中重置 xs.jiazhuangai.com 的麦克风权限";
+    return "麦克风未获允许：请检查手机系统是否允许 Chrome 使用麦克风，并在浏览器站点设置中把当前网站的麦克风权限改为允许";
   }
   if (e?.name === "NotReadableError") return "麦克风正被其他通话或录音应用占用";
   if (e?.name === "NotFoundError") return "没有检测到可用麦克风";
@@ -1332,6 +1536,12 @@ function explainMicStartError(e) {
 async function toggleAgentMic() {
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
     showToast("浏览器不支持录音上传，请用新版 Chrome/Edge", "err");
+    return;
+  }
+  if (!window.isSecureContext) {
+    const msg = "当前页面不是安全上下文，浏览器不会开放麦克风。请通过 HTTPS 访问网站。";
+    setVoiceTrace("出错", msg, "err");
+    showToast(msg, "err");
     return;
   }
   if (agentMicOn) {
@@ -1358,18 +1568,26 @@ async function toggleAgentMic() {
       const blob = new Blob(agentChunks, { type: mimeType || "audio/webm" });
       agentChunks = [];
       if (blob.size < 300) { showToast("录音太短", "err"); return; }
-      if (voiceDirectToModel) sendAgentAudio(blob);
-      else transcribeAgentAudio(blob);
+      if (voiceDirectToModel) {
+        setVoiceTrace("正在直发", "录音已结束，准备上传给当前 Agent 模型");
+        sendAgentAudio(blob);
+      } else {
+        setVoiceTrace("正在转写", "录音已结束，准备调用转写服务");
+        transcribeAgentAudio(blob);
+      }
     };
     agentRecorder.onerror = e => {
       agentMicOn = false;
       clearTimeout(agentMicTimer); agentMicTimer = null;
       setAgentMic(false);
       agentStream?.getTracks().forEach(t => t.stop());
-      showToast("录音失败：" + (e.error?.message || e.error?.name || "未知错误"), "err");
+      const msg = e.error?.message || e.error?.name || "未知错误";
+      setVoiceTrace("出错", "录音链路：" + msg, "err");
+      showToast("录音失败：" + msg, "err");
     };
     agentMicOn = true;
     setAgentMic(true);
+    setVoiceTrace("录音中", voiceDirectToModel ? "结束后将直接发送给当前 Agent 模型" : "结束后将先转写为文字");
     agentRecorder.start();
     agentMicTimer = setTimeout(() => {
       if (!agentMicOn) return;
@@ -1379,8 +1597,10 @@ async function toggleAgentMic() {
   } catch (e) {
     agentMicOn = false;
     setAgentMic(false);
-    const msg = explainMicStartError(e);
+    const extra = await micPermissionHint();
+    const msg = explainMicStartError(e) + (extra ? "；" + extra : "");
     el.placeholder = msg;
+    setVoiceTrace("出错", msg, "err");
     showToast(msg, "err");
   }
 }
@@ -1687,6 +1907,372 @@ async function saveCharacterState() {
   } finally {
     busy(button, false, "保存为本章状态");
   }
+}
+
+/* ---------- 写作工作台：大屏抽屉，按需展开而不挤占编辑区 ---------- */
+
+const plotStateFields = [
+  ["mainline", "主线进度", "plotStateMainline"],
+  ["current_event", "当前事件", "plotStateCurrentEvent"],
+  ["timeline", "时间线", "plotStateTimeline"],
+  ["locations", "地点", "plotStateLocations"],
+  ["conflicts", "核心冲突", "plotStateConflicts"],
+  ["open_threads", "未回收伏笔", "plotStateOpenThreads"],
+  ["next_goal", "下一章目标", "plotStateNextGoal"],
+  ["notes", "补充", "plotStateNotes"],
+];
+const plotStateSourceLabels = { manual: "手动记录", ai_confirmed: "AI 提议已采纳", ai_edited: "AI 提议编辑后采纳" };
+
+function openStoryDrawer(tab = "plot") {
+  if (!currentWorkId) { showToast("请先创建或选择一个作品", "err"); return; }
+  $("app").classList.add("story-open");
+  selectStoryTab(tab);
+}
+function toggleStoryDrawer() {
+  if ($("app").classList.contains("story-open")) closeStoryDrawer();
+  else openStoryDrawer(storyTab);
+}
+function closeStoryDrawer() { $("app").classList.remove("story-open"); }
+async function selectStoryTab(tab) {
+  storyTab = ["plot", "workflow", "relations", "alerts", "context"].includes(tab) ? tab : "plot";
+  document.querySelectorAll(".story-tab").forEach(button => {
+    button.classList.toggle("active", button.dataset.storyTab === storyTab);
+  });
+  document.querySelectorAll(".story-panel").forEach(panel => {
+    panel.classList.toggle("hidden", panel.id !== `storyPanel${storyTab[0].toUpperCase()}${storyTab.slice(1)}`);
+  });
+  if ($("app").classList.contains("story-open")) await refreshStoryDrawer();
+}
+async function refreshStoryDrawer() {
+  if (!currentWorkId) return;
+  try {
+    if (storyTab === "plot") await loadPlotState();
+    else if (storyTab === "workflow") await loadWorkflow();
+    else if (storyTab === "relations") await loadRelationships();
+    else if (storyTab === "alerts") await loadConsistencyAlerts();
+    else if (storyTab === "context") await loadAgentContext();
+  } catch (e) { showToast(e.message, "err"); }
+}
+
+function storyChapterLabel(chapter) {
+  return chapter ? `第${chapter.ord}章《${chapter.title || "无标题"}》` : "未选择章节";
+}
+function plotStateOptions() {
+  return chapters.map(chapter =>
+    `<option value="${chapter.id}" ${chapter.id === plotStateChapterId ? "selected" : ""}>${esc(storyChapterLabel(chapter))}</option>`
+  ).join("");
+}
+function plotStateSnapshot(state) {
+  const facts = plotStateFields.filter(([key]) => state?.[key]).map(([key, label]) =>
+    `<div><b>${esc(label)}</b><span>${esc(state[key])}</span></div>`
+  );
+  return facts.length ? `<div class="state-snapshot">${facts.join("")}</div>` : "";
+}
+function setPlotStateForm(state, summary = "", evidence = "", proposalId = null) {
+  for (const [key, , id] of plotStateFields) $(id).value = state?.[key] || "";
+  $("plotStateSummary").value = summary || "";
+  $("plotStateEvidence").value = evidence || "";
+  plotStateProposalId = proposalId;
+  $("plotStateSaveBtn").textContent = proposalId ? "确认并保存" : "保存为本章剧情状态";
+}
+function plotStateFormValue() {
+  const state = {};
+  for (const [key, , id] of plotStateFields) state[key] = $(id).value.trim();
+  return state;
+}
+function renderPlotState(data) {
+  plotStateData = data;
+  if (!plotStateChapterId && data.target_chapter) plotStateChapterId = data.target_chapter.id;
+  $("plotStateChapter").innerHTML = plotStateOptions();
+  $("plotStateMeta").textContent = storyChapterLabel(data.target_chapter);
+  const version = data.state_version;
+  $("plotStateSource").textContent = version
+    ? `${plotStateSourceLabels[version.source] || "已记录"} · 生效于第${version.chapter_ord}章`
+    : "尚无已确认状态";
+  setPlotStateForm(data.current_state || {});
+  const proposals = (data.proposals || []).filter(item => item.status === "pending");
+  $("plotStateProposals").innerHTML = proposals.map(item => `
+    <div class="story-proposal">
+      <div><b>AI 待确认</b><span>${esc(item.change_summary || "剧情推进")}</span></div>
+      ${item.evidence ? `<small>${esc(item.evidence)}</small>` : ""}
+      ${plotStateSnapshot(item.state)}
+      <div class="story-proposal-actions">
+        <button onclick="acceptPlotStateProposal(${item.id})">采纳</button>
+        <button class="ic" onclick="editPlotStateProposal(${item.id})" title="编辑后采纳">${svg("pen")}</button>
+        <button class="ic" onclick="rejectPlotStateProposal(${item.id})" title="忽略">${svg("x")}</button>
+      </div>
+    </div>`).join("");
+  $("plotStateHistory").innerHTML = (data.history || []).length ? data.history.map(item => `
+    <div class="story-timeline-item">
+      <div><b>第${item.chapter_ord}章《${esc(item.chapter_title || "无标题")}》</b><span>${esc(plotStateSourceLabels[item.source] || "已记录")}</span></div>
+      ${item.change_summary ? `<p>${esc(item.change_summary)}</p>` : ""}
+      ${item.evidence ? `<small>${esc(item.evidence)}</small>` : ""}
+      ${plotStateSnapshot(item.state)}
+    </div>`).join("") : '<div class="empty">尚无剧情推进记录</div>';
+}
+async function loadPlotState() {
+  if (!currentWorkId) return;
+  if (!chapters.length) {
+    $("plotStateMeta").textContent = "请先创建章节";
+    $("plotStateProposals").innerHTML = "";
+    $("plotStateHistory").innerHTML = '<div class="empty">暂无章节</div>';
+    return;
+  }
+  if (!chapters.some(item => item.id === plotStateChapterId)) plotStateChapterId = currentChapterId || chapters[chapters.length - 1].id;
+  const data = await api(`/api/works/${currentWorkId}/plot-state?chapter_id=${plotStateChapterId}`, { method: "GET" });
+  renderPlotState(data);
+}
+async function changePlotStateChapter() {
+  plotStateChapterId = +$("plotStateChapter").value || null;
+  plotStateProposalId = null;
+  await loadPlotState();
+}
+async function analyzePlotState() {
+  if (!plotStateChapterId) return;
+  const button = $("plotStateAnalyzeBtn");
+  busy(button, true, "提取中");
+  try {
+    const result = await api(`/api/chapters/${plotStateChapterId}/plot-state-proposals/analyze`, { body: {} });
+    await loadPlotState();
+    showToast(result.proposal ? "已生成剧情状态待确认" : "未发现需要记录的剧情推进", result.proposal ? "ok" : "");
+  } catch (e) { $("plotStateMsg").textContent = e.message; }
+  finally { busy(button, false); applyIcons(); }
+}
+async function acceptPlotStateProposal(pid) {
+  try {
+    await api(`/api/plot-state-proposals/${pid}/accept`, { body: {} });
+    plotStateProposalId = null;
+    await loadPlotState();
+    showToast("已采纳剧情状态", "ok");
+  } catch (e) { $("plotStateMsg").textContent = e.message; }
+}
+function editPlotStateProposal(pid) {
+  const proposal = (plotStateData?.proposals || []).find(item => item.id === pid);
+  if (!proposal) return;
+  setPlotStateForm(proposal.state, proposal.change_summary, proposal.evidence, pid);
+  $("plotStateSummary").focus();
+}
+async function rejectPlotStateProposal(pid) {
+  try {
+    await api(`/api/plot-state-proposals/${pid}/reject`, { body: {} });
+    if (plotStateProposalId === pid) setPlotStateForm(plotStateData?.current_state || {});
+    await loadPlotState();
+    showToast("已忽略该剧情提议");
+  } catch (e) { $("plotStateMsg").textContent = e.message; }
+}
+async function savePlotState() {
+  if (!currentWorkId || !plotStateChapterId) return;
+  const button = $("plotStateSaveBtn");
+  const confirming = !!plotStateProposalId;
+  busy(button, true, confirming ? "确认中" : "保存中");
+  const body = { state: plotStateFormValue(), change_summary: $("plotStateSummary").value.trim(),
+    evidence: $("plotStateEvidence").value.trim() };
+  try {
+    if (plotStateProposalId) await api(`/api/plot-state-proposals/${plotStateProposalId}/accept`, { body });
+    else await api(`/api/works/${currentWorkId}/plot-state-versions`, { body: { ...body, chapter_id: plotStateChapterId } });
+    plotStateProposalId = null;
+    await loadPlotState();
+    showToast("剧情状态已保存", "ok");
+  } catch (e) { $("plotStateMsg").textContent = e.message; }
+  finally { busy(button, false, "保存为本章剧情状态"); }
+}
+
+function syncChapterWorkflow(workflow) {
+  chapterWorkflow = workflow;
+  const chapter = chapters.find(item => item.id === workflow?.id);
+  if (chapter && workflow) {
+    chapter.workflow_status = workflow.workflow_status;
+    chapter.workflow_goal = workflow.workflow_goal;
+    chapter.workflow_summary = workflow.workflow_summary;
+    chapter.workflow_checked_at = workflow.workflow_checked_at;
+    renderTree();
+  }
+}
+function renderWorkflow(workflow) {
+  chapterWorkflow = workflow;
+  $("workflowMeta").textContent = workflow ? `${storyChapterLabel(workflow)} · ${workflowLabel(workflow.workflow_status)}` : "请先选择章节";
+  $("workflowGoal").value = workflow?.workflow_goal || "";
+  $("workflowSummary").value = workflow?.workflow_summary || "";
+  document.querySelectorAll("[data-workflow]").forEach(button => {
+    button.classList.toggle("active", button.dataset.workflow === (workflow?.workflow_status || "drafting"));
+    button.disabled = !workflow;
+  });
+}
+async function loadWorkflow() {
+  if (!currentChapterId) { renderWorkflow(null); return; }
+  const workflow = await api(`/api/chapters/${currentChapterId}/workflow`, { method: "GET" });
+  renderWorkflow(workflow);
+}
+async function saveWorkflow() {
+  if (!currentChapterId) return;
+  const button = $("workflowSaveBtn");
+  busy(button, true, "保存中");
+  try {
+    const workflow = await api(`/api/chapters/${currentChapterId}/workflow`, { method: "PUT", body: {
+      goal: $("workflowGoal").value, summary: $("workflowSummary").value,
+    }});
+    syncChapterWorkflow(workflow); renderWorkflow(workflow);
+    showToast("本章计划已保存", "ok");
+  } catch (e) { $("workflowMsg").textContent = e.message; }
+  finally { busy(button, false, "保存本章计划"); }
+}
+async function setWorkflowStatus(status) {
+  if (!currentChapterId) return;
+  try {
+    const workflow = await api(`/api/chapters/${currentChapterId}/workflow`, { method: "PUT", body: { status } });
+    syncChapterWorkflow(workflow); renderWorkflow(workflow);
+  } catch (e) { $("workflowMsg").textContent = e.message; }
+}
+async function runChapterReview() {
+  if (!currentChapterId) return;
+  if (dirty) await saveNow();
+  const button = $("workflowReviewBtn");
+  busy(button, true, "复核中");
+  try {
+    const result = await api(`/api/chapters/${currentChapterId}/review`, { body: {} });
+    syncChapterWorkflow(result.workflow); renderWorkflow(result.workflow);
+    consistencyAlerts = result.alerts || [];
+    await notifyStoryUpdates(result);
+    showToast(consistencyAlerts.length ? `复核完成：${consistencyAlerts.length} 条提醒` : "复核完成，未发现明确冲突", consistencyAlerts.length ? "" : "ok");
+  } catch (e) { $("workflowMsg").textContent = e.message; }
+  finally { busy(button, false, "AI 复核"); }
+}
+
+function relationEntityOptions(selectedId) {
+  const characters = entitiesCache.filter(item => item.kind === "人物");
+  return `<option value="">选择人物</option>` + characters.map(item =>
+    `<option value="${item.id}" ${item.id === selectedId ? "selected" : ""}>${esc(item.name)}</option>`
+  ).join("");
+}
+function renderRelationForm() {
+  const current = entityRelations.find(item => item.id === editingRelationId);
+  $("relationFrom").innerHTML = relationEntityOptions(current?.from_entity_id);
+  $("relationTo").innerHTML = relationEntityOptions(current?.to_entity_id);
+  $("relationName").value = current?.relation || "";
+  $("relationStatus").value = current?.status || "active";
+  $("relationDetail").value = current?.detail || "";
+  $("relationFormTitle").textContent = current ? "编辑关系" : "新增关系";
+  $("relationSaveBtn").textContent = current ? "保存修改" : "保存关系";
+  $("relationCancelBtn").classList.toggle("hidden", !current);
+}
+function renderRelations() {
+  const nodes = new Map();
+  entityRelations.forEach(item => {
+    nodes.set(item.from_entity_id, item.from_name);
+    nodes.set(item.to_entity_id, item.to_name);
+  });
+  $("relationMap").innerHTML = entityRelations.length ? `
+    <div class="relation-map-nodes">${[...nodes].map(([id, name]) => `<span class="relation-node" title="人物关系节点">${esc(name)}</span>`).join("")}</div>
+    <div class="relation-map-links">${entityRelations.map(item => `<div><span>${esc(item.from_name)}</span><b>${esc(item.relation)}</b><span>${esc(item.to_name)}</span></div>`).join("")}</div>`
+    : '<div class="empty">尚未记录人物关系</div>';
+  $("relationList").innerHTML = entityRelations.length ? entityRelations.map(item => `
+    <div class="relation-row">
+      <div><b>${esc(item.from_name)}</b><span>${esc(item.relation)}</span><b>${esc(item.to_name)}</b>${item.status && item.status !== "active" ? `<small>${esc(item.status)}</small>` : ""}</div>
+      ${item.detail ? `<p>${esc(item.detail)}</p>` : ""}
+      <span class="relation-actions"><button class="ic" onclick="editRelation(${item.id})" title="编辑关系">${svg("pen")}</button><button class="ic" onclick="deleteRelation(${item.id})" title="删除关系">${svg("x")}</button></span>
+    </div>`).join("") : "";
+  renderRelationForm();
+}
+async function loadRelationships() {
+  if (!currentWorkId) return;
+  await loadWikiEntities();
+  entityRelations = await api(`/api/works/${currentWorkId}/relationships`, { method: "GET" });
+  renderRelations();
+}
+function resetRelationForm() {
+  editingRelationId = null;
+  renderRelationForm();
+  $("relationMsg").textContent = "";
+}
+function editRelation(rid) {
+  editingRelationId = rid;
+  renderRelationForm();
+  $("relationName").focus();
+}
+async function saveRelation() {
+  if (!currentWorkId) return;
+  const from_entity_id = +$("relationFrom").value;
+  const to_entity_id = +$("relationTo").value;
+  const body = { from_entity_id, to_entity_id, relation: $("relationName").value,
+    status: $("relationStatus").value, detail: $("relationDetail").value };
+  try {
+    if (editingRelationId) await api(`/api/relationships/${editingRelationId}`, { method: "PUT", body });
+    else await api(`/api/works/${currentWorkId}/relationships`, { body });
+    resetRelationForm();
+    await loadRelationships();
+    showToast("人物关系已保存", "ok");
+  } catch (e) { $("relationMsg").textContent = e.message; }
+}
+async function deleteRelation(rid) {
+  if (!await askCard({ title: "删除这条人物关系？", okText: "删除", danger: true })) return;
+  try {
+    await api(`/api/relationships/${rid}`, { method: "DELETE" });
+    if (editingRelationId === rid) resetRelationForm();
+    await loadRelationships();
+  } catch (e) { $("relationMsg").textContent = e.message; }
+}
+
+function renderConsistencyAlerts() {
+  $("alertsMeta").textContent = currentChapterId ? storyChapterLabel(chapters.find(item => item.id === currentChapterId)) : "请先选择章节";
+  $("alertsList").innerHTML = consistencyAlerts.length ? consistencyAlerts.map(item => `
+    <div class="consistency-alert severity-${esc(item.severity || "notice")}">
+      <div><span class="alert-mark">${svg(item.severity === "critical" ? "alert" : item.severity === "warning" ? "alert" : "eye")}</span><b>${esc(item.title)}</b><small>${esc(item.category || "连续性")}</small></div>
+      ${item.detail ? `<p>${esc(item.detail)}</p>` : ""}
+      ${item.evidence ? `<small class="alert-evidence">${esc(item.evidence)}</small>` : ""}
+      ${item.suggestion ? `<p class="alert-suggestion">${esc(item.suggestion)}</p>` : ""}
+      ${item.status === "open" ? `<button class="ic" onclick="dismissConsistencyAlert(${item.id})" title="忽略此提醒">${svg("x")}</button>` : `<span class="alert-dismissed">已忽略</span>`}
+    </div>`).join("") : '<div class="empty">本章还没有连续性提醒</div>';
+}
+async function loadConsistencyAlerts() {
+  if (!currentChapterId) { consistencyAlerts = []; renderConsistencyAlerts(); return; }
+  consistencyAlerts = await api(`/api/chapters/${currentChapterId}/consistency-alerts`, { method: "GET" });
+  renderConsistencyAlerts();
+}
+async function dismissConsistencyAlert(alertId) {
+  try {
+    await api(`/api/consistency-alerts/${alertId}/dismiss`, { body: {} });
+    await loadConsistencyAlerts();
+  } catch (e) { showToast(e.message, "err"); }
+}
+
+function contextTextBlock(title, text, empty = "无") {
+  return `<div><b>${esc(title)}</b><pre>${esc(text || empty)}</pre></div>`;
+}
+function renderAgentContext(data) {
+  agentContext = data;
+  const chapter = data.chapter ? `第${data.chapter.ord}章《${data.chapter.title || "无标题"}》` : "未选择章节";
+  $("contextMeta").textContent = `${data.engine} · ${chapter} · ${data.model || "未设置模型"}`;
+  $("contextSelection").innerHTML = contextTextBlock("选区", data.selection?.present ? data.selection.text : "本回合没有选区");
+  const skills = data.skills || [];
+  $("contextSkills").innerHTML = `<div><b>本回合 Skills</b>${skills.length ? skills.map(item =>
+    `<details><summary>${esc(item.name)}${item.description ? ` · ${esc(item.description)}` : ""}</summary><pre>${esc(item.instruction)}</pre></details>`
+  ).join("") : '<p>未手动选中 Skill</p>'}</div>`;
+  const runtime = data.runtime || {};
+  $("contextRuntime").innerHTML = contextTextBlock("运行时", [
+    `Pi：${runtime.pi_enabled ? "已启用" : "未启用"}`,
+    `本机工具：${(runtime.native_capabilities || []).join("、") || "无"}`,
+    `工作目录：${runtime.cwd || "无"}`,
+    `本机 Skill 目录：${(runtime.skill_dirs || []).join("、") || "无"}`,
+    `launcher 生命周期：${runtime.launcher_lifecycle ? "已启用" : "未启用"}`,
+  ].join("\n"));
+  $("contextTools").innerHTML = `<div><b>应用工具</b><div class="context-tool-list">${(data.tools || []).map(item =>
+    `<details><summary>${esc(item.name)}</summary><p>${esc(item.description)}</p></details>`
+  ).join("")}</div></div>`;
+  $("contextSystem").innerHTML = (data.system_messages || []).map((item, index) =>
+    `<details ${index === 0 ? "open" : ""}><summary>${esc(item.label || "系统上下文")} ${index + 1}</summary><pre>${esc(item.content)}</pre></details>`
+  ).join("") || '<div class="empty">本回合没有系统上下文</div>';
+}
+async function loadAgentContext() {
+  const button = $("contextRefreshBtn");
+  busy(button, true);
+  try {
+    const data = await api("/api/agent/context", { body: {
+      chapter_id: currentChapterId, selection: agentSelection,
+      skill_ids: activeAgentSkillIds.size ? [...activeAgentSkillIds] : [],
+    }});
+    renderAgentContext(data);
+  } catch (e) { $("contextMeta").textContent = e.message; }
+  finally { busy(button, false); applyIcons(); }
 }
 
 // @提及：阅读视图里把 @名 包成可悬浮 span

@@ -329,6 +329,120 @@ async def reject_character_state_proposal(pid: int, request: Request):
     return result
 
 
+# ---------- 剧情动态卡（作品主线 / 伏笔 / 目标，按章节版本查看）----------
+
+def _plot_state_error(result):
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    if result.get("invalid_chapter"):
+        raise HTTPException(404, "章节不存在")
+    if result.get("empty_state"):
+        raise HTTPException(400, "请至少填写一项剧情状态")
+    if result.get("resolved"):
+        raise HTTPException(409, "该 AI 提议已经处理")
+    return result
+
+
+@app.get("/api/works/{wid}/plot-state")
+async def get_plot_state(wid: int, request: Request):
+    uid = _auth(request)
+    chapter_id = _qparam_int(request, "chapter_id")
+    return _plot_state_error(db.get_plot_state_overview(wid, uid, chapter_id))
+
+
+@app.post("/api/works/{wid}/plot-state-versions")
+async def save_plot_state_version(wid: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    chapter_id = body.get("chapter_id")
+    state = body.get("state")
+    if not isinstance(chapter_id, int):
+        raise HTTPException(400, "请选择状态生效章节")
+    if not isinstance(state, dict):
+        raise HTTPException(400, "剧情状态格式不正确")
+    result = _plot_state_error(db.create_plot_state_version(
+        wid, uid, chapter_id, state, body.get("change_summary", ""), body.get("evidence", ""),
+    ))
+    return {"ok": True, "version": result}
+
+
+@app.post("/api/chapters/{cid}/plot-state-proposals/analyze")
+async def analyze_plot_state_proposals(cid: int, request: Request):
+    proposal = _generate_plot_state_proposal(_auth(request), cid, raise_on_error=True)
+    return {"proposal": proposal}
+
+
+@app.post("/api/plot-state-proposals/{pid}/accept")
+async def accept_plot_state_proposal(pid: int, request: Request):
+    uid = _auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    state = body.get("state") if "state" in body else None
+    if state is not None and not isinstance(state, dict):
+        raise HTTPException(400, "剧情状态格式不正确")
+    result = _plot_state_error(db.accept_plot_state_proposal(
+        pid, uid, state, body.get("change_summary") if "change_summary" in body else None,
+        body.get("evidence") if "evidence" in body else None,
+    ))
+    return {"ok": True, **result}
+
+
+@app.post("/api/plot-state-proposals/{pid}/reject")
+async def reject_plot_state_proposal(pid: int, request: Request):
+    return _plot_state_error(db.reject_plot_state_proposal(pid, _auth(request)))
+
+
+# ---------- 人物关系图 ----------
+
+def _relation_error(result):
+    if result is None:
+        raise HTTPException(404, "关系或作品不存在")
+    if result.get("invalid_entity"):
+        raise HTTPException(400, "关系两端必须是当前作品中的两个不同实体")
+    if result.get("invalid_relation"):
+        raise HTTPException(400, "请填写关系名称")
+    return result
+
+
+def _relation_payload(body):
+    from_id = body.get("from_entity_id")
+    to_id = body.get("to_entity_id")
+    if not isinstance(from_id, int) or isinstance(from_id, bool) or not isinstance(to_id, int) or isinstance(to_id, bool):
+        raise HTTPException(400, "请选择关系两端的实体")
+    return from_id, to_id, body.get("relation", ""), body.get("detail", ""), body.get("status", "active")
+
+
+@app.get("/api/works/{wid}/relationships")
+async def get_entity_relations(wid: int, request: Request):
+    result = db.list_entity_relations(wid, _auth(request))
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return result
+
+
+@app.post("/api/works/{wid}/relationships")
+async def create_entity_relation(wid: int, request: Request):
+    body = await request.json()
+    from_id, to_id, relation, detail, status = _relation_payload(body)
+    return _relation_error(db.create_entity_relation(wid, _auth(request), from_id, to_id, relation, detail, status))
+
+
+@app.put("/api/relationships/{rid}")
+async def save_entity_relation(rid: int, request: Request):
+    body = await request.json()
+    from_id, to_id, relation, detail, status = _relation_payload(body)
+    return _relation_error(db.update_entity_relation(rid, _auth(request), from_id, to_id, relation, detail, status))
+
+
+@app.delete("/api/relationships/{rid}")
+async def del_entity_relation(rid: int, request: Request):
+    if not db.delete_entity_relation(rid, _auth(request)):
+        raise HTTPException(404, "关系不存在")
+    return {"ok": True}
+
+
 # ---------- AI Skills（Agent Skills / SKILL.md）----------
 
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -557,6 +671,54 @@ async def save_chapter(cid: int, request: Request):
     return {"ok": True}
 
 
+# ---------- 章节工作流 / 复核提醒 ----------
+
+@app.get("/api/chapters/{cid}/workflow")
+async def get_chapter_workflow(cid: int, request: Request):
+    result = db.get_chapter_workflow(cid, _auth(request))
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    return result
+
+
+@app.put("/api/chapters/{cid}/workflow")
+async def save_chapter_workflow(cid: int, request: Request):
+    body = await request.json()
+    status = body.get("status") if "status" in body else None
+    result = db.update_chapter_workflow(
+        cid, _auth(request), status=status, goal=body.get("goal") if "goal" in body else None,
+        summary=body.get("summary") if "summary" in body else None,
+    )
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    if result.get("invalid_status"):
+        raise HTTPException(400, "章节阶段不正确")
+    return result
+
+
+@app.get("/api/chapters/{cid}/consistency-alerts")
+async def get_chapter_consistency_alerts(cid: int, request: Request):
+    result = db.list_chapter_consistency_alerts(cid, _auth(request))
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    return result
+
+
+@app.post("/api/chapters/{cid}/review")
+async def review_chapter(cid: int, request: Request):
+    return _run_chapter_review(_auth(request), cid, raise_on_error=True)
+
+
+@app.post("/api/consistency-alerts/{alert_id}/dismiss")
+async def dismiss_consistency_alert(alert_id: int, request: Request):
+    result = db.dismiss_chapter_consistency_alert(alert_id, _auth(request))
+    if result is None:
+        raise HTTPException(404, "提醒不存在")
+    if result.get("resolved"):
+        raise HTTPException(409, "该提醒已经处理")
+    return result
+
+
 @app.delete("/api/chapters/{cid}")
 async def del_chapter(cid: int, request: Request):
     if not db.delete_chapter(cid, _auth(request)):
@@ -615,10 +777,25 @@ async def get_revisions(cid: int, request: Request):
 
 @app.post("/api/chapters/{cid}/revisions")
 async def save_revision(cid: int, request: Request):
-    r = db.add_revision(cid, _auth(request))
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    r = db.add_revision(cid, _auth(request), body.get("label", ""))
     if r is None:
         raise HTTPException(404, "章节不存在")
     return r
+
+
+@app.put("/api/chapters/{cid}/revisions/{rid}")
+async def rename_revision(cid: int, rid: int, request: Request):
+    body = await request.json()
+    result = db.rename_revision(cid, _auth(request), rid, body.get("label", ""))
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    if result is False:
+        raise HTTPException(404, "历史版本不存在")
+    return result
 
 
 @app.post("/api/chapters/{cid}/revisions/{rid}/restore")
@@ -645,6 +822,65 @@ async def diff_revision(cid: int, rid: int, request: Request):
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
         ops.append({"op": tag, "old": "\n".join(a[i1:i2]), "new": "\n".join(b[j1:j2])})
     return {"ops": ops, "rev_title": rev["title"], "cur_title": cur["title"], "rev_at": rev["created_at"]}
+
+
+@app.post("/api/chapters/{cid}/revisions/{rid}/branch")
+async def branch_from_revision(cid: int, rid: int, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    result = db.create_chapter_branch(cid, _auth(request), rid, body.get("title", ""))
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    if result is False:
+        raise HTTPException(404, "历史版本不存在")
+    return result
+
+
+@app.get("/api/works/{wid}/revisions")
+async def get_work_revisions(wid: int, request: Request):
+    result = db.list_work_revisions(wid, _auth(request))
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return result
+
+
+@app.post("/api/works/{wid}/revisions")
+async def save_work_revision(wid: int, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    result = db.save_work_revision(wid, _auth(request), body.get("label", ""))
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return result
+
+
+@app.get("/api/works/{wid}/revisions/{rid}/diff")
+async def diff_work_revision(wid: int, rid: int, request: Request):
+    result = db.diff_work_revision(wid, _auth(request), rid)
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    if result is False:
+        raise HTTPException(404, "整本版本不存在")
+    return result
+
+
+@app.post("/api/works/{wid}/revisions/{rid}/restore")
+async def restore_work_revision(wid: int, rid: int, request: Request):
+    uid = _auth(request)
+    # 恢复前先保留一个整本快照，避免误操作后无路可退。
+    backup = db.save_work_revision(wid, uid, "恢复前自动备份")
+    if backup is None:
+        raise HTTPException(404, "作品不存在")
+    result = db.restore_work_revision(wid, uid, rid)
+    if result is False:
+        raise HTTPException(404, "整本版本不存在")
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return {**result, "backup": backup}
 
 
 # ---------- 导出 ----------
@@ -721,6 +957,36 @@ async def export_work(wid: int, request: Request, format: str = "txt"):
     )
 
 
+# ---------- AI 改稿预览确认 ----------
+
+@app.post("/api/chapters/{cid}/edit-proposals/apply")
+async def apply_edit_proposal(cid: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    operation = body.get("operation")
+    result_text = body.get("result")
+    base_content = body.get("base_content")
+    if operation not in {"append", "replace"}:
+        raise HTTPException(400, "改稿操作不正确")
+    if not isinstance(result_text, str) or not isinstance(base_content, str):
+        raise HTTPException(400, "改稿内容不正确")
+    result = db.apply_chapter_edit_proposal(
+        cid, uid, base_content, operation, result_text, body.get("mode", ""),
+        body.get("old_text", ""), body.get("start"), body.get("end"),
+    )
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    if result.get("stale"):
+        raise HTTPException(409, "正文已变化，请重新生成预览后再确认")
+    if result.get("invalid"):
+        raise HTTPException(400, "改稿预览已经失效")
+    # 只有作者确认落稿后才生成状态建议，避免预览阶段产生幽灵剧情记录。
+    character_proposals = _generate_character_state_proposals(uid, cid)
+    plot_proposal = _generate_plot_state_proposal(uid, cid)
+    return {**result, "character_state_proposals": character_proposals,
+            "plot_state_proposal": plot_proposal}
+
+
 # ---------- AI 处理 ----------
 
 @app.post("/api/process")
@@ -732,6 +998,8 @@ async def do_process(request: Request):
     context = body.get("context") or ""
     cid = body.get("chapter_id")
     style = body.get("style")  # 改写风格预设（更生动/更精炼/文艺风/…），仅改写模式用
+    preview = bool(body.get("preview"))
+    preview_operation = body.get("preview_operation")
 
     notes = ""
     chap = None
@@ -784,17 +1052,31 @@ async def do_process(request: Request):
     else:
         raise HTTPException(400, "未知模式")
 
+    if preview:
+        if not cid:
+            raise HTTPException(400, "请先选择章节")
+        if mode not in ("润色", "扩写", "续写", "找回", "缩写", "改写"):
+            raise HTTPException(400, "该操作不支持预览确认")
+        default_operation = "replace" if mode in ("缩写", "改写") else "append"
+        operation = preview_operation if preview_operation in {"append", "replace"} else default_operation
+        return {"result": result, "raw": seg_raw, "mode": mode, "preview": True,
+                "operation": operation, "character_state_proposals": [], "plot_state_proposal": None}
+
     # 只有这些模式把结果写进正文；校验/摘要不污染正文
     seg = None
     if cid and mode in ("转写", "润色", "扩写", "续写", "找回"):
         seg = db.add_segment(cid, uid, seg_raw, result, mode)
     proposals = []
+    plot_proposal = None
     if seg and mode in ("润色", "扩写", "续写", "找回"):
         proposals = _generate_character_state_proposals(
             uid, cid, base_url=base_url, api_key=api_key, model=model,
         )
+        plot_proposal = _generate_plot_state_proposal(
+            uid, cid, base_url=base_url, api_key=api_key, model=model,
+        )
     return {"result": result, "raw": seg_raw, "mode": mode, "content": seg["content"] if seg else None,
-            "character_state_proposals": proposals}
+            "character_state_proposals": proposals, "plot_state_proposal": plot_proposal}
 
 
 @app.post("/api/chat")
@@ -862,7 +1144,10 @@ async def transcribe_audio(request: Request):
                             f" 详情：{_provider_error(e)}")
     if not text:
         raise HTTPException(500, "语音转写没有返回文字")
-    return {"text": text}
+    return {"text": text, "voice": {
+        "mode": "transcribe", "route": "/api/asr → /audio/transcriptions",
+        "model": asr["model"], "format": ext,
+    }}
 
 
 # ---------- AI agent（对话即操作） ----------
@@ -966,6 +1251,9 @@ def _agent_bible(wid, uid, cid=None):
     digest = db.get_entity_digest(wid, uid, cid)
     if digest:
         bible = (bible + "\n\n" + digest) if bible else digest
+    plot_digest = db.get_plot_digest(wid, uid, cid)
+    if plot_digest:
+        bible = (bible + "\n\n" + plot_digest) if bible else plot_digest
     return bible
 
 
@@ -991,6 +1279,10 @@ def _parse_json_from_model(raw):
 
 def _short_character_state(state):
     return {field: (state or {}).get(field, "") for field in db.CHARACTER_STATE_FIELDS}
+
+
+def _short_plot_state(state):
+    return {field: (state or {}).get(field, "") for field in db.PLOT_STATE_FIELDS}
 
 
 def _generate_character_state_proposals(uid, cid, *, base_url=None, api_key=None, model=None,
@@ -1098,6 +1390,155 @@ def _generate_character_state_proposals(uid, cid, *, base_url=None, api_key=None
     return proposals
 
 
+def _generate_plot_state_proposal(uid, cid, *, base_url=None, api_key=None, model=None,
+                                  raise_on_error=False):
+    """从本章提取整体剧情推进，只形成作者可确认的待处理提议。"""
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    if not chapter:
+        if raise_on_error:
+            raise HTTPException(404, "章节不存在")
+        return None
+    content = (chapter.get("content") or "").strip()
+    if not content:
+        return None
+    overview = db.get_plot_state_overview(chapter["work_id"], uid, cid)
+    if not overview or overview.get("invalid_chapter"):
+        if raise_on_error:
+            raise HTTPException(404, "剧情状态不存在")
+        return None
+    before = _short_plot_state(overview.get("current_state"))
+    settings = db.get_settings(uid) or {}
+    base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
+    model = model or settings.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        if raise_on_error:
+            raise HTTPException(500, "未配置 API Key，无法提取剧情状态")
+        return None
+    prompt = {
+        "task": "阅读当前章节，更新截至本章结束时的故事状态。只记录文本明确支持的推进，不编造后续剧情。",
+        "output": {
+            "state": {field: "" for field in db.PLOT_STATE_FIELDS},
+            "change_summary": "一句话概括本章的故事推进",
+            "evidence": "来自本章的简短事实依据，不要长引文",
+        },
+        "rules": [
+            "只返回 JSON 对象，不要 Markdown、不要解释。",
+            "state 必须是截至本章结束的完整当前状态：保留仍成立的既有事实；未知字段用空字符串。",
+            "如果没有实质剧情推进，返回 {\"state\": {}, \"change_summary\": \"\", \"evidence\": \"\"}。",
+            "未回收伏笔要保留仍未解决的项；下一章目标只能是文本和既有大纲支持的合理目标。",
+        ],
+        "confirmed_state_at_this_point": before,
+        "work_memory": (db.get_work_notes(chapter["work_id"], uid) or "")[:10000],
+        "relationships": db.get_relationship_digest(chapter["work_id"], uid)[:6000],
+        "chapter": {
+            "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
+            "content": content[-16000:],
+        },
+    }
+    messages = [
+        {"role": "system", "content": "你是小说剧情连续性记录员。输出必须是可解析 JSON，不能添加额外文字。"},
+        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+    ]
+    try:
+        parsed = _parse_json_from_model(llm.chat(messages, base_url=base_url, api_key=api_key, model=model))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if raise_on_error:
+            raise HTTPException(502, "剧情状态提取失败：" + _provider_error(exc))
+        return None
+    if isinstance(parsed, dict) and isinstance(parsed.get("update"), dict):
+        parsed = parsed["update"]
+    if not isinstance(parsed, dict):
+        if raise_on_error:
+            raise HTTPException(502, "剧情状态提取没有返回有效 JSON")
+        return None
+    raw_state = parsed.get("state") if isinstance(parsed.get("state"), dict) else {
+        field: parsed.get(field, "") for field in db.PLOT_STATE_FIELDS
+    }
+    state = db.normalize_plot_state(raw_state, before)
+    summary = parsed.get("change_summary") if isinstance(parsed.get("change_summary"), str) else ""
+    evidence = parsed.get("evidence") if isinstance(parsed.get("evidence"), str) else ""
+    if state == before or not db.plot_state_has_content(state) or not summary.strip():
+        return None
+    saved = db.upsert_plot_state_proposal(chapter["work_id"], uid, cid, state, summary, evidence)
+    if saved and not saved.get("empty_state"):
+        return saved
+    return None
+
+
+def _run_chapter_review(uid, cid, *, base_url=None, api_key=None, model=None, raise_on_error=False):
+    """生成可操作的一致性提醒，并把本章推进到“复核”工作流阶段。"""
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    if not chapter:
+        if raise_on_error:
+            raise HTTPException(404, "章节不存在")
+        return None
+    content = (chapter.get("content") or "").strip()
+    if not content:
+        if raise_on_error:
+            raise HTTPException(400, "本章为空，无法复核")
+        return None
+    settings = db.get_settings(uid) or {}
+    base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
+    model = model or settings.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        if raise_on_error:
+            raise HTTPException(500, "未配置 API Key，无法复核章节")
+        return None
+    workflow = db.get_chapter_workflow(cid, uid) or {}
+    prompt = {
+        "task": "检查当前章节与作品事实是否冲突。只报告值得作者处理的风险；不要为了凑数编造问题。",
+        "output": {
+            "summary": "2-4 句本章完成情况与下一步建议",
+            "alerts": [{
+                "category": "人物/时间线/设定/关系/伏笔/重复成长",
+                "severity": "critical|warning|notice",
+                "title": "简短问题标题",
+                "detail": "具体哪里可能冲突",
+                "evidence": "当前正文或既有设定中的简短事实依据",
+                "suggestion": "可执行的修复建议",
+            }],
+        },
+        "rules": [
+            "只返回 JSON 对象，不要 Markdown、不要解释。",
+            "没有风险时 alerts 返回空数组。",
+            "不把文风偏好当作连续性错误；不确定时使用 notice 并说明不确定性。",
+        ],
+        "chapter_workflow": workflow,
+        "story_context": _agent_bible(chapter["work_id"], uid, cid)[:28000],
+        "chapter": {"title": chapter["title"], "notes": chapter.get("notes") or "", "content": content[-18000:]},
+    }
+    try:
+        parsed = _parse_json_from_model(llm.chat([
+            {"role": "system", "content": "你是严谨的长篇小说连续性编辑。输出必须是可解析 JSON。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ], base_url=base_url, api_key=api_key, model=model))
+    except Exception as exc:
+        if raise_on_error:
+            raise HTTPException(502, "章节复核失败：" + _provider_error(exc))
+        return None
+    if not isinstance(parsed, dict):
+        if raise_on_error:
+            raise HTTPException(502, "章节复核没有返回有效 JSON")
+        return None
+    summary = parsed.get("summary") if isinstance(parsed.get("summary"), str) else ""
+    alerts = db.replace_chapter_consistency_alerts(cid, uid, parsed.get("alerts") or [])
+    workflow = db.update_chapter_workflow(cid, uid, status="review", summary=summary, checked=True)
+    return {
+        "workflow": workflow,
+        "alerts": alerts or [],
+        "character_state_proposals": _generate_character_state_proposals(
+            uid, cid, base_url=base_url, api_key=api_key, model=model,
+        ),
+        "plot_state_proposal": _generate_plot_state_proposal(
+            uid, cid, base_url=base_url, api_key=api_key, model=model,
+        ),
+    }
+
+
 def _compact_split(msgs, preserve):
     """计算可压缩前缀的起点索引：保留最近 preserve 条，且 recent 从一条 user
     消息开始（确保不切断 assistant(tool_calls)→tool 的工具对，避免悬空 tool_call_id）。
@@ -1118,8 +1559,8 @@ def _agent_system(uid, cid):
         "回退到历史版本、改章节标题/备注、新建章节、存版本、摘要、设定校验。"
         "原则：1) 要改某段文字前，先 read_chapter 读准确原文，再用 replace_text 或 edit_passage，"
         "old_text 必须与正文逐字一致；2) 每个写操作都会自动存版本，用户可一键撤销，所以放心改；"
-        "3) 不要替作者下不可逆的决定；4) 通过写作工具改动正文后，系统会生成待作者确认的人物状态提议，"
-        "未确认前不改变人物卡；5) 回答简洁，做完事说一句即可。"
+        "3) 不要替作者下不可逆的决定；4) 通过写作工具改动正文后，系统会生成待作者确认的人物和剧情状态提议，"
+        "未确认前不改变卡片；5) 回答简洁，做完事说一句即可。"
     ]
     if cid:
         c = db.get_chapter_meta(cid, uid)
@@ -1237,6 +1678,56 @@ def _agent_skill_catalog_system(uid, cid):
                    + "\n\n当用户明确提到某个 Skill，或请求与其 description 高度匹配时，先调用 activate_skill 加载完整规则；"
                      "不匹配时不要调用。网页导入到数据库的 Skill 包只保存文本资料，可在激活后用 "
                      "read_skill_resource 按需读取。",
+    }
+
+
+def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None):
+    """把下一回合真正拼装的上下文以可审阅结构返回，不暴露 API Key。"""
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    if cid and not chapter:
+        return None
+    system_messages = [_agent_system(uid, cid)]
+    catalog = _agent_skill_catalog_system(uid, cid)
+    if catalog:
+        system_messages.append(catalog)
+    selected = _agent_skills_system(uid, cid, skill_ids)
+    if selected:
+        system_messages.append(selected)
+    selection_message = _agent_selection_system(uid, cid, selection)
+    if selection_message:
+        system_messages.append(selection_message)
+    conversation = db.get_conversation(uid, cid) or {"summary": "", "messages": []}
+    summary = conversation.get("summary") or ""
+    if summary:
+        system_messages.append({"role": "system", "content": "[此前对话摘要]\n" + summary})
+    work_id = chapter["work_id"] if chapter else None
+    skills = db.get_agent_skills_for_turn(uid, work_id, skill_ids or []) if isinstance(skill_ids, list) else []
+    selected_text = selection.get("text") if isinstance(selection, dict) and isinstance(selection.get("text"), str) else ""
+    return {
+        "engine": "Pi Coding Agent" if config.PI_AGENT_ENABLED else "兼容 Agent 运行时",
+        "chapter": ({"id": chapter["id"], "title": chapter["title"], "ord": chapter.get("ord"),
+                     "work_id": chapter["work_id"]} if chapter else None),
+        "selection": {
+            "present": bool(selected_text.strip()), "text": selected_text[:8000],
+            "start": selection.get("start") if isinstance(selection, dict) else None,
+            "end": selection.get("end") if isinstance(selection, dict) else None,
+        },
+        "skills": [{"id": item["id"], "name": item["name"], "description": item.get("description") or "",
+                    "instruction": item.get("instruction") or ""} for item in skills],
+        "tools": [{"name": item["function"]["name"], "description": item["function"]["description"]}
+                  for item in AGENT_TOOLS],
+        "runtime": {
+            "pi_enabled": bool(config.PI_AGENT_ENABLED),
+            "native_capabilities": ["read", "grep", "find", "ls", "bash"] if config.PI_AGENT_ENABLED else [],
+            "cwd": config.PI_AGENT_WORKSPACE_DIR if config.PI_AGENT_ENABLED else None,
+            "skill_dirs": [config.PI_AGENT_SKILL_DIR] if config.PI_AGENT_SKILL_DIR else [],
+            "launcher_lifecycle": bool(skill_runtime.is_enabled()),
+            "agent_id": config.AGENT_SKILL_AGENT_ID,
+        },
+        "model": (db.get_settings(uid) or {}).get("llm_model") or config.LLM_MODEL,
+        "system_messages": [{"label": "系统上下文", "content": item["content"]}
+                            for item in system_messages if item.get("content")],
+        "conversation_messages": len(conversation.get("messages") or []),
     }
 
 
@@ -1907,6 +2398,20 @@ def _runtime_request_payload(uid, cid, history_text, selection):
     }
 
 
+def _apply_story_update_proposals(uid, state_request):
+    if not state_request:
+        return [], None
+    kwargs = {
+        "base_url": state_request["base_url"],
+        "api_key": state_request["api_key"],
+        "model": state_request["model"],
+    }
+    return (
+        _generate_character_state_proposals(uid, state_request["chapter_id"], **kwargs),
+        _generate_plot_state_proposal(uid, state_request["chapter_id"], **kwargs),
+    )
+
+
 def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None):
     """执行 Agent，并在启用本机运行时时先缓冲回答、等 after/recovery 确认。"""
     turn = None
@@ -1933,10 +2438,9 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     state_request = result.pop("_character_state_request", None)
     if not turn:
         if state_request:
-            result["character_state_proposals"] = _generate_character_state_proposals(
-                uid, state_request["chapter_id"], base_url=state_request["base_url"],
-                api_key=state_request["api_key"], model=state_request["model"],
-            )
+            character_proposals, plot_proposal = _apply_story_update_proposals(uid, state_request)
+            result["character_state_proposals"] = character_proposals
+            result["plot_state_proposal"] = plot_proposal
         return result
 
     pending = result.pop("_pending_conversation")
@@ -1951,10 +2455,9 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     skill_runtime.mark_conversation_saved(turn.turn_id, uid)
     result["skill_runtime"] = runtime_state
     if state_request:
-        result["character_state_proposals"] = _generate_character_state_proposals(
-            uid, state_request["chapter_id"], base_url=state_request["base_url"],
-            api_key=state_request["api_key"], model=state_request["model"],
-        )
+        character_proposals, plot_proposal = _apply_story_update_proposals(uid, state_request)
+        result["character_state_proposals"] = character_proposals
+        result["plot_state_proposal"] = plot_proposal
     return result
 
 
@@ -1967,6 +2470,16 @@ async def agent(request: Request):
     if not text:
         raise HTTPException(400, "没有对话内容")
     return _run_agent_turn(uid, body.get("chapter_id"), text, body.get("selection"), body.get("skill_ids"))
+
+
+@app.post("/api/agent/context")
+async def inspect_agent_context(request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    result = _agent_context_snapshot(uid, body.get("chapter_id"), body.get("selection"), body.get("skill_ids"))
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    return result
 
 
 @app.post("/api/agent/audio")
@@ -2005,8 +2518,14 @@ async def agent_audio(request: Request):
         ],
     }
     try:
-        return _run_agent_turn(uid, body.get("chapter_id"), "[voice] 语音指令",
-                               body.get("selection"), body.get("skill_ids"), model_turn=model_turn)
+        result = _run_agent_turn(uid, body.get("chapter_id"), "[voice] 语音指令",
+                                 body.get("selection"), body.get("skill_ids"), model_turn=model_turn)
+        settings = db.get_settings(uid) or {}
+        result["voice"] = {
+            "mode": "direct", "route": "/api/agent/audio → 当前 Agent 模型",
+            "model": settings.get("llm_model") or config.LLM_MODEL, "format": audio_format,
+        }
+        return result
     except HTTPException:
         raise
     except Exception as e:
