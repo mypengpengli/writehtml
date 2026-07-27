@@ -33,6 +33,19 @@ The inspiration-library tools (`save_inspiration`, `search_inspirations`,
 same bridge. Inspirations remain candidate creative material and never become
 story facts merely because Pi retrieved them.
 
+## Conversation Sessions
+
+Each chapter or work scope can own multiple durable conversations. The active
+session is passed to Pi only in standard mode. Ignore-history mode starts the
+current model turn without earlier chat messages but appends the completed turn
+to that durable session; temporary mode neither reads nor persists chat
+messages.
+
+Conversation compaction is based on the projected token cost of the complete
+request, not a fixed character count. By default the runtime uses a 200,000
+token window, triggers at 90 percent, reserves 8,192 tokens for output, and
+summarizes only older messages while preserving recent tool-call boundaries.
+
 ## Local Launcher Lifecycle
 
 The optional meta-memory launcher is separate from Pi's native Skills. It runs

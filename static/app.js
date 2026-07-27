@@ -28,6 +28,13 @@ let agentMsgs = [];
 let agentBusy = false;
 let agentUndone = new Set();
 let agentSelection = null;
+let agentSessions = [];
+let currentAgentSessionId = null;
+let agentConversationSummary = "";
+let agentConversationMode = "standard";
+let agentConversationLoading = false;
+let agentConversationRequest = 0;
+let agentSessionScopeKey = "";
 let agentSkills = [];
 let agentSkillsWorkId = undefined;
 let activeAgentSkillIds = new Set();
@@ -255,6 +262,8 @@ async function doRegister() {
 async function doLogout() {
   try { await api("/api/logout"); } catch (e) {}
   token = ""; localStorage.removeItem("token");
+  agentSessions = []; currentAgentSessionId = null; agentMsgs = [];
+  agentConversationSummary = ""; agentSessionScopeKey = ""; currentUsername = "";
   showLogin();
 }
 
@@ -265,6 +274,8 @@ async function init() {
   const me = await api("/api/me", { method: "GET" });
   if (currentUsername && currentUsername !== me.username) {
     agentSkills = []; agentSkillsWorkId = undefined; activeAgentSkillIds = new Set();
+    agentSessions = []; currentAgentSessionId = null; agentMsgs = [];
+    agentConversationSummary = ""; agentSessionScopeKey = "";
   }
   currentUsername = me.username || "";
   $("meName").textContent = me.username ? `${me.username} · 目录` : "目录";
@@ -323,15 +334,18 @@ async function selectWork(wid) {
 async function loadChapters() {
   if (!currentWorkId) {
     chapters = []; renderTree(); updateWC();
-    await loadAgentSkills();
+    await Promise.all([loadAgentSkills(), loadAgentSessions()]);
     return;
   }
   chapters = await api(`/api/works/${currentWorkId}/chapters`, { method: "GET" });
   if (!chapters.find(c => c.id === currentChapterId)) {
     currentChapterId = chapters.length ? chapters[chapters.length - 1].id : null;
   }
-  if (currentChapterId) await loadChapter();
-  else { $("content").value = ""; $("chapTitle").value = ""; $("notes").value = ""; }
+  if (currentChapterId) await Promise.all([loadChapter(), loadAgentSessions()]);
+  else {
+    $("content").value = ""; $("chapTitle").value = ""; $("notes").value = "";
+    await loadAgentSessions();
+  }
   renderTree(); updateWC();
   await loadAgentSkills();
 }
@@ -345,8 +359,8 @@ async function selectChapter(cid) {
   editingStoryMemoryId = null;
   clearAgentSelection();
   agentUndone.clear();
-  await loadConversation();  // 切章：从服务端拉取该章持久化对话（刷新/切回都不丢）
-  await loadChapter();
+  setAgentConversationMode("standard");
+  await Promise.all([loadAgentSessions(), loadChapter()]);
   renderTree();
   if (window.innerWidth <= 700) $("app").classList.remove("side-open");
 }
@@ -1349,6 +1363,80 @@ async function delSkill(skillId) {
 
 /* ---------- AI 助手（常驻侧栏，对话即操作，自动存版本可撤销） ---------- */
 
+function agentScopeKey() {
+  if (currentChapterId != null) return `chapter:${currentChapterId}`;
+  if (currentWorkId != null) return `work:${currentWorkId}`;
+  return "global";
+}
+function agentScopeParams() {
+  const params = new URLSearchParams();
+  if (currentChapterId != null) params.set("chapter_id", currentChapterId);
+  else if (currentWorkId != null) params.set("work_id", currentWorkId);
+  return params;
+}
+function agentScopeBody() {
+  return {
+    chapter_id: currentChapterId,
+    work_id: currentChapterId == null ? currentWorkId : null,
+  };
+}
+function agentScopeLabel() {
+  if (currentChapterId != null) {
+    const chapter = chapters.find(item => item.id === currentChapterId);
+    return chapter ? `第${chapter.ord || ""}章《${chapter.title || "无标题"}》` : "当前章节";
+  }
+  const work = works.find(item => item.id === currentWorkId);
+  return work ? `作品《${work.title}》` : "通用会话";
+}
+function setAgentConversationMode(mode) {
+  agentConversationMode = ["standard", "ignore_history", "temporary"].includes(mode) ? mode : "standard";
+  document.querySelectorAll("#agentConversationModes button").forEach(button => {
+    button.classList.toggle("active", button.dataset.mode === agentConversationMode);
+  });
+}
+function formatAgentSessionTime(value) {
+  if (!value) return "";
+  try { return new Date(value * 1000).toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }
+  catch (e) { return ""; }
+}
+function renderAgentSessionControls() {
+  const select = $("agentSessionSwitch");
+  const activeSessions = agentSessions.filter(item => !item.archived);
+  select.innerHTML = activeSessions.length
+    ? activeSessions.map(item => `<option value="${item.id}">${esc(item.title || "新会话")}</option>`).join("")
+    : '<option value="">新会话</option>';
+  select.value = currentAgentSessionId == null ? "" : String(currentAgentSessionId);
+  select.disabled = agentBusy || !activeSessions.length;
+  $("agentSummaryBar").classList.toggle("hidden", !agentConversationSummary);
+  $("agentSessionScope").textContent = agentScopeLabel();
+  const details = $("agentSummaryDetails");
+  details.classList.toggle("hidden", !agentConversationSummary);
+  $("agentSummaryText").textContent = agentConversationSummary || "";
+  renderAgentSessionList();
+}
+function renderAgentSessionList() {
+  const host = $("agentSessionList");
+  if (!host) return;
+  host.innerHTML = agentSessions.length ? agentSessions.map(item => {
+    const status = item.archived ? "已归档" : `${item.msg_count || 0} 条消息`;
+    const active = item.is_active && !item.archived;
+    return `<div class="agent-session-item ${item.archived ? "archived" : ""}">
+      <button class="agent-session-main" ${item.archived ? "disabled" : `onclick="switchAgentSession(${item.id})"`}>
+        <b>${esc(item.title || "新会话")}</b>
+        <small>${status}${item.updated_at ? ` · ${formatAgentSessionTime(item.updated_at)}` : ""}${item.has_summary ? " · 有摘要" : ""}</small>
+      </button>
+      ${active ? '<span class="agent-session-active">当前</span>' : ""}
+      <span class="agent-session-actions">
+        ${item.archived
+          ? `<button class="ic" onclick="restoreAgentSession(${item.id})" title="恢复会话">${svg("refresh")}</button>`
+          : `<button class="ic" onclick="renameAgentSession(${item.id})" title="重命名">${svg("pen")}</button>
+             <button class="ic" onclick="archiveAgentSession(${item.id})" title="归档">${svg("archive")}</button>`}
+        <button class="ic" onclick="deleteAgentSession(${item.id})" title="永久删除">${svg("trash")}</button>
+      </span>
+    </div>`;
+  }).join("") : '<div class="agent-session-empty">当前范围还没有会话</div>';
+}
+
 function toggleAISide() {
   const app = $("app");
   const opening = !app.classList.contains("ai-open");
@@ -1356,23 +1444,37 @@ function toggleAISide() {
   if (opening && workspaceNeedsExclusivePane() && app.classList.contains("story-open")) closeStoryDrawer();
   const open = app.classList.toggle("ai-open");
   localStorage.setItem("aiOpen", open ? "1" : "0");
-  if (open) setTimeout(() => { setAiTtsBtn(); renderAgent(); renderAgentSelection(); renderAgentSkills(); $("agentInput").focus(); }, 50);
+  if (open) setTimeout(() => {
+    setAiTtsBtn(); renderAgent(); renderAgentSelection(); renderAgentSkills(); renderAgentSessionControls();
+    if (agentSessionScopeKey !== agentScopeKey()) loadAgentSessions();
+    $("agentInput").focus();
+  }, 50);
   else if ("speechSynthesis" in window) speechSynthesis.cancel(); // 收起侧栏时停止朗读
 }
 function renderAgent() {
   const el = $("agentMsgs");
+  if (agentConversationLoading) {
+    el.innerHTML = '<div class="agent-chat-loading"><span class="spinner"></span><span>正在加载会话</span></div>';
+    return;
+  }
   if (!agentMsgs.length && !agentBusy) {
-    el.innerHTML = '<div class="empty">让 AI 帮你改稿、续写、回退版本… 每步操作自动存版本，可撤销。</div>';
+    el.innerHTML = '<div class="empty">当前会话还没有消息</div>';
     return;
   }
   let html = "";
+  let temporaryLabelShown = false;
   for (const m of agentMsgs) {
+    if (m.temporary && !temporaryLabelShown) {
+      html += '<div class="chat-temporary-label">临时一问 · 不保存</div>';
+      temporaryLabelShown = true;
+    }
+    const temporaryClass = m.temporary ? " temporary" : "";
     if (m.role === "user") {
       html += m.content === "[voice] 语音指令"
-        ? `<div class="cm user voice">${svg("mic")} 语音指令</div>`
-        : `<div class="cm user">${esc(m.content)}</div>`;
+        ? `<div class="cm user voice${temporaryClass}">${svg("mic")} 语音指令</div>`
+        : `<div class="cm user${temporaryClass}">${esc(m.content)}</div>`;
     } else if (m.role === "assistant") {
-      if (m.content) html += `<div class="cm assistant">${esc(m.content)}</div>`;
+      if (m.content) html += `<div class="cm assistant${temporaryClass}">${esc(m.content)}</div>`;
     } else if (m.role === "tool") {
       let r = {}; try { r = JSON.parse(m.content); } catch (e) {}
       if (r.error) {
@@ -1384,7 +1486,7 @@ function renderAgent() {
         const card = undone
           ? `<span class="done-tag">已撤销</span>`
           : (rid ? `<button class="undo-btn" onclick="undoAgentAction(${rid})">撤销</button>` : "");
-        html += `<div class="cm action${undone ? " done" : ""}"><div class="act-bar"><span class="act-txt">${svg("pen")} ${esc(sum)}</span>${card}</div></div>`;
+        html += `<div class="cm action${undone ? " done" : ""}${temporaryClass}"><div class="act-bar"><span class="act-txt">${svg("pen")} ${esc(sum)}</span>${card}</div></div>`;
       }
     }
   }
@@ -1392,12 +1494,30 @@ function renderAgent() {
   el.innerHTML = html;
   el.scrollTop = el.scrollHeight;
 }
-async function applyAgentResult(r, selection) {
+async function applyAgentResult(r, selection, baseMessages = null) {
   if (selection) clearAgentSelection();
-  agentMsgs = Array.isArray(r.messages) ? r.messages : agentMsgs;
-  if (r.compacted) showToast("已压缩早期对话，保留最近几轮", "ok");
+  const resultMessages = Array.isArray(r.messages) ? r.messages : [];
+  if (r.temporary) {
+    agentMsgs = (baseMessages || []).concat(resultMessages.map(message => ({ ...message, temporary: true })));
+  } else if (resultMessages.length) {
+    agentMsgs = resultMessages;
+  }
+  if (!r.temporary && r.session_id != null) {
+    currentAgentSessionId = +r.session_id;
+    agentConversationSummary = r.conversation_summary || "";
+    const session = agentSessions.find(item => item.id === currentAgentSessionId);
+    if (session) {
+      session.title = r.session_title || session.title;
+      session.msg_count = resultMessages.length;
+      session.is_active = true;
+      session.has_summary = !!agentConversationSummary;
+      session.updated_at = Date.now() / 1000;
+    }
+    await loadAgentSessions(false);
+  }
+  if (r.compacted) showToast("已按上下文预算压缩早期对话", "ok");
   let contentChanged = false, sidebarDirty = false;
-  for (const m of agentMsgs) {
+  for (const m of resultMessages) {
     if (m.role === "tool") {
       let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
       if (rr.changed) contentChanged = true;
@@ -1430,25 +1550,32 @@ async function sendAgent() {
   const el = $("agentInput");
   const text = el.value.trim();
   if (!text) return;
+  const conversationMode = agentConversationMode;
+  const baseMessages = agentMsgs.slice();
   el.value = "";
   // 先把正文框里未保存的手动编辑落库，避免 AI 基于旧正文操作、回显时覆盖手打内容
   if (dirty) await saveNow();
-  agentMsgs.push({ role: "user", content: text });
+  agentMsgs.push({ role: "user", content: text, temporary: conversationMode === "temporary" });
   agentBusy = true;
   busy($("sendBtn"), true, "发送");
   renderAgent();
   const selection = agentSelection;
-  const body = { text, chapter_id: currentChapterId };
+  const body = {
+    text, ...agentScopeBody(), session_id: currentAgentSessionId,
+    conversation_mode: conversationMode,
+  };
   if (selection) body.selection = selection;
   if (activeAgentSkillIds.size) body.skill_ids = [...activeAgentSkillIds];
   try {
     const r = await api("/api/agent", { body });
-    await applyAgentResult(r, selection);
+    await applyAgentResult(r, selection, baseMessages);
   } catch (e) {
     agentMsgs.push({ role: "assistant", content: "出错：" + e.message });
   } finally {
     agentBusy = false;
     busy($("sendBtn"), false, "发送");
+    setAgentConversationMode("standard");
+    renderAgentSessionControls();
     renderAgent();
     speakLatestAgentTurn();
     $("agentInput").focus(); // 发完聚焦输入框，方便连续对话
@@ -1464,18 +1591,152 @@ async function undoAgentAction(rid) {
   } catch (e) { showToast("撤销失败：" + e.message, "err"); }
 }
 async function clearAgent() {
-  try {
-    await api(`/api/agent/conversation${currentChapterId != null ? "?chapter_id=" + currentChapterId : ""}`, { method: "DELETE" });
-  } catch (e) { showToast("清空失败：" + e.message, "err"); return; }
-  agentMsgs = []; agentUndone.clear(); renderAgent();
+  if (currentAgentSessionId != null) await deleteAgentSession(currentAgentSessionId);
 }
-async function loadConversation() {
-  // 从服务端拉取当前 用户×章节 的持久化对话；刷新或切回都能恢复上下文
+async function loadAgentSessions(loadActive = true) {
+  const scope = agentScopeKey();
+  const requestId = ++agentConversationRequest;
+  if (loadActive) {
+    agentConversationLoading = true;
+    if ($("app").classList.contains("ai-open")) renderAgent();
+  }
   try {
-    const r = await api(`/api/agent/conversation${currentChapterId != null ? "?chapter_id=" + currentChapterId : ""}`, { method: "GET" });
-    agentMsgs = Array.isArray(r.messages) ? r.messages : [];
-  } catch (e) { agentMsgs = []; }
+    const params = agentScopeParams();
+    params.set("include_archived", "1");
+    const result = await api(`/api/agent/sessions?${params.toString()}`, { method: "GET" });
+    if (requestId !== agentConversationRequest || scope !== agentScopeKey()) return;
+    agentSessions = Array.isArray(result.sessions) ? result.sessions : [];
+    currentAgentSessionId = result.active_session_id == null ? null : +result.active_session_id;
+    agentSessionScopeKey = scope;
+    renderAgentSessionControls();
+    if (loadActive) {
+      await loadConversation(currentAgentSessionId);
+    } else {
+      agentConversationLoading = false;
+      if ($("app").classList.contains("ai-open")) renderAgent();
+    }
+  } catch (e) {
+    if (requestId !== agentConversationRequest) return;
+    if (loadActive) {
+      agentSessions = []; currentAgentSessionId = null; agentMsgs = [];
+      agentConversationSummary = ""; agentConversationLoading = false;
+    }
+    renderAgentSessionControls();
+    if ($("app").classList.contains("ai-open")) renderAgent();
+  }
+}
+function openAgentSessions() {
+  renderAgentSessionControls();
+  $("agentSessionOverlay").classList.remove("hidden");
+  loadAgentSessions(false);
+}
+function closeAgentSessions() { $("agentSessionOverlay").classList.add("hidden"); }
+async function newAgentSession() {
+  if (agentBusy) { showToast("请等当前回复完成", "err"); return; }
+  try {
+    const session = await api("/api/agent/sessions", { body: { ...agentScopeBody() } });
+    currentAgentSessionId = +session.id;
+    agentMsgs = []; agentConversationSummary = ""; agentUndone.clear();
+    setAgentConversationMode("standard");
+    await loadAgentSessions(false);
+    renderAgentSessionControls(); renderAgent();
+    closeAgentSessions();
+    $("agentInput").focus();
+  } catch (e) { showToast("新建会话失败：" + e.message, "err"); }
+}
+async function switchAgentSession(value) {
+  const sessionId = +value;
+  if (!sessionId) { await newAgentSession(); return; }
+  if (agentBusy) {
+    renderAgentSessionControls();
+    showToast("请等当前回复完成", "err");
+    return;
+  }
+  if (sessionId === currentAgentSessionId) { closeAgentSessions(); return; }
+  try {
+    await api(`/api/agent/sessions/${sessionId}/activate`, { body: {} });
+    currentAgentSessionId = sessionId;
+    agentUndone.clear();
+    setAgentConversationMode("standard");
+    await loadAgentSessions();
+    closeAgentSessions();
+  } catch (e) { showToast("切换会话失败：" + e.message, "err"); }
+}
+async function renameAgentSession(sessionId) {
+  const session = agentSessions.find(item => item.id === sessionId);
+  if (!session) return;
+  const title = await askCard({
+    title: "重命名会话", input: "会话名称", def: session.title || "新会话", okText: "保存",
+  });
+  if (title === false) return;
+  try {
+    const updated = await api(`/api/agent/sessions/${sessionId}`, { method: "PATCH", body: { title } });
+    session.title = updated.title;
+    renderAgentSessionControls();
+  } catch (e) { showToast("重命名失败：" + e.message, "err"); }
+}
+async function archiveAgentSession(sessionId) {
+  const session = agentSessions.find(item => item.id === sessionId);
+  if (!session) return;
+  const confirmed = await askCard({
+    title: "归档这个会话？", msg: "归档后不会参与当前对话，之后可以恢复。",
+    okText: "归档",
+  });
+  if (!confirmed) return;
+  try {
+    await api(`/api/agent/sessions/${sessionId}`, { method: "PATCH", body: { archived: true } });
+    await loadAgentSessions(sessionId === currentAgentSessionId);
+  } catch (e) { showToast("归档失败：" + e.message, "err"); }
+}
+async function restoreAgentSession(sessionId) {
+  try {
+    await api(`/api/agent/sessions/${sessionId}`, { method: "PATCH", body: { archived: false } });
+    currentAgentSessionId = sessionId;
+    await loadAgentSessions();
+    closeAgentSessions();
+  } catch (e) { showToast("恢复失败：" + e.message, "err"); }
+}
+async function deleteAgentSession(sessionId) {
+  const session = agentSessions.find(item => item.id === +sessionId);
+  const confirmed = await askCard({
+    title: "永久删除会话？",
+    msg: `“${session?.title || "当前会话"}”的聊天记录和压缩摘要都会删除，小说正文和人物资料不受影响。`,
+    okText: "永久删除", danger: true,
+  });
+  if (!confirmed) return;
+  try {
+    await api(`/api/agent/sessions/${sessionId}`, { method: "DELETE" });
+    const deletedCurrent = +sessionId === currentAgentSessionId;
+    if (deletedCurrent) {
+      agentMsgs = []; agentConversationSummary = ""; agentUndone.clear();
+    }
+    await loadAgentSessions(deletedCurrent);
+  } catch (e) { showToast("删除失败：" + e.message, "err"); }
+}
+async function loadConversation(sessionId = currentAgentSessionId) {
+  const scope = agentScopeKey();
+  const requestId = ++agentConversationRequest;
+  agentConversationLoading = true;
   if ($("app").classList.contains("ai-open")) renderAgent();
+  try {
+    const params = agentScopeParams();
+    if (sessionId != null) params.set("session_id", sessionId);
+    const r = await api(`/api/agent/conversation?${params.toString()}`, { method: "GET" });
+    if (requestId !== agentConversationRequest || scope !== agentScopeKey()) return;
+    agentMsgs = Array.isArray(r.messages) ? r.messages : [];
+    currentAgentSessionId = r.session_id == null ? null : +r.session_id;
+    agentConversationSummary = r.summary || "";
+    agentSessionScopeKey = scope;
+  } catch (e) {
+    if (requestId !== agentConversationRequest) return;
+    agentMsgs = []; currentAgentSessionId = null; agentConversationSummary = "";
+  } finally {
+    if (requestId === agentConversationRequest) {
+      agentConversationLoading = false;
+      renderAgentSessionControls();
+      if ($("app").classList.contains("ai-open")) renderAgent();
+    }
+  }
 }
 function openAdmin() { location.href = "admin.html"; }
 
@@ -1589,8 +1850,10 @@ async function transcribeAgentAudio(blob) {
 async function sendAgentAudio(blob) {
   if (agentBusy) return;
   const btn = $("agentMicBtn"), el = $("agentInput"), selection = agentSelection;
+  const conversationMode = agentConversationMode;
+  const baseMessages = agentMsgs.slice();
   if (dirty) await saveNow();
-  agentMsgs.push({ role: "user", content: "[voice] 语音指令" });
+  agentMsgs.push({ role: "user", content: "[voice] 语音指令", temporary: conversationMode === "temporary" });
   agentBusy = true;
   btn.classList.add("is-busy");
   if (!_agentPH) _agentPH = el.placeholder;
@@ -1608,7 +1871,8 @@ async function sendAgentAudio(blob) {
         ...(token ? { Authorization: "Bearer " + token } : {}),
       },
       body: JSON.stringify({
-        audio, format: "wav", chapter_id: currentChapterId, selection,
+        audio, format: "wav", selection, ...agentScopeBody(),
+        session_id: currentAgentSessionId, conversation_mode: conversationMode,
         ...(activeAgentSkillIds.size ? { skill_ids: [...activeAgentSkillIds] } : {}),
       }),
     });
@@ -1616,14 +1880,16 @@ async function sendAgentAudio(blob) {
     if (!res.ok) throw new Error(await responseError(res));
     const result = await res.json();
     setVoiceTrace("语音已发送", `${result.voice?.route || "当前 Agent 模型"} · ${result.voice?.model || ""}`, "ok");
-    await applyAgentResult(result, selection);
+    await applyAgentResult(result, selection, baseMessages);
   } catch (e) {
-    agentMsgs.push({ role: "assistant", content: "语音直发失败：" + e.message });
+    agentMsgs.push({ role: "assistant", content: "语音直发失败：" + e.message, temporary: conversationMode === "temporary" });
     setVoiceTrace("出错", "直发链路：" + e.message, "err");
     showToast("语音直发失败：" + e.message, "err");
   } finally {
     agentBusy = false;
     btn.classList.remove("is-busy");
+    setAgentConversationMode("standard");
+    renderAgentSessionControls();
     el.placeholder = _agentPH || "让 AI 帮你改稿、续写、回退版本…";
     renderAgent();
     speakLatestAgentTurn();
@@ -2679,13 +2945,21 @@ function contextTextBlock(title, text, empty = "无") {
 function renderAgentContext(data) {
   agentContext = data;
   const chapter = data.chapter ? `第${data.chapter.ord}章《${data.chapter.title || "无标题"}》` : "未选择章节";
-  const estimate = data.estimated_tokens ? ` · 约 ${data.estimated_tokens} tokens` : "";
+  const budget = data.context_budget || {};
+  const formatTokens = value => value >= 1000 ? `${Math.round(value / 1000)}K` : String(value || 0);
+  const estimate = data.estimated_tokens
+    ? ` · 约 ${formatTokens(data.estimated_tokens)} / ${formatTokens(budget.window_tokens)} tokens`
+    : "";
   $("contextMeta").textContent = `${data.engine} · ${chapter} · ${data.model || "未设置模型"}${estimate}`;
   $("contextSelection").innerHTML = contextTextBlock("选区", data.selection?.present ? data.selection.text : "本回合没有选区");
   const recalled = data.context_items || [];
-  $("contextRecall").innerHTML = `<div><b>本轮参考资料</b>${recalled.length ? recalled.map((item, index) =>
+  const conversation = data.conversation || {};
+  $("contextRecall").innerHTML = `<div><b>会话上下文</b>
+    <p>${conversation.use_history ? `${esc(conversation.title || "当前会话")} · ${conversation.message_count || 0} 条消息` : "本轮不读取旧聊天"}</p>
+    ${conversation.has_summary ? `<details><summary>已压缩的早期对话摘要</summary><pre>${esc(conversation.summary || "")}</pre></details>` : ""}
+    </div><div><b>本轮参考资料</b>${recalled.length ? recalled.map((item, index) =>
     `<details ${index < 3 ? "open" : ""}><summary>${esc(item.title || item.type || "上下文")} · ${esc(item.reason || "系统上下文")}</summary><pre>${esc(item.content || "")}</pre></details>`
-  ).join("") : '<p>暂无可用的已确认故事资料</p>'}</div>`;
+    ).join("") : '<p>暂无可用的已确认故事资料</p>'}</div>`;
   const skills = data.skills || [];
   $("contextSkills").innerHTML = `<div><b>本回合 Skills</b>${skills.length ? skills.map(item =>
     `<details><summary>${esc(item.name)}${item.description ? ` · ${esc(item.description)}` : ""}</summary><pre>${esc(item.instruction)}</pre></details>`
@@ -2710,7 +2984,9 @@ async function loadAgentContext() {
   busy(button, true);
   try {
     const data = await api("/api/agent/context", { body: {
-      chapter_id: currentChapterId, selection: agentSelection,
+      chapter_id: currentChapterId, work_id: currentChapterId == null ? currentWorkId : null,
+      session_id: currentAgentSessionId, use_history: agentConversationMode === "standard",
+      selection: agentSelection,
       skill_ids: activeAgentSkillIds.size ? [...activeAgentSkillIds] : [], text: $("agentInput")?.value || "",
     }});
     renderAgentContext(data);
@@ -2780,15 +3056,15 @@ function renderReader() {
 }
 async function readerPrev() {
   const i = chapters.findIndex(c => c.id === currentChapterId);
-  if (i > 0) { if (dirty) await saveNow(); currentChapterId = chapters[i - 1].id; await loadChapter(); renderReader(); renderTree(); }
+  if (i > 0) { if (dirty) await saveNow(); currentChapterId = chapters[i - 1].id; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
 }
 async function readerNext() {
   const i = chapters.findIndex(c => c.id === currentChapterId);
-  if (i >= 0 && i < chapters.length - 1) { if (dirty) await saveNow(); currentChapterId = chapters[i + 1].id; await loadChapter(); renderReader(); renderTree(); }
+  if (i >= 0 && i < chapters.length - 1) { if (dirty) await saveNow(); currentChapterId = chapters[i + 1].id; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
 }
 async function readerJumpTo() {
   const cid = +$("readerJump").value;
-  if (cid && cid !== currentChapterId) { if (dirty) await saveNow(); currentChapterId = cid; await loadChapter(); renderReader(); renderTree(); }
+  if (cid && cid !== currentChapterId) { if (dirty) await saveNow(); currentChapterId = cid; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
 }
 function readerFont(d) { readerFontPx = Math.min(32, Math.max(14, readerFontPx + d)); localStorage.setItem("rFont", readerFontPx); $("readView").style.fontSize = readerFontPx + "px"; }
 function readerLine() { readerLH = readerLH >= 2.6 ? 1.6 : +(readerLH + 0.3).toFixed(1); localStorage.setItem("rLH", readerLH); $("readView").style.lineHeight = readerLH; }

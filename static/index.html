@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ui-20260727-2">
+  <link rel="stylesheet" href="style.css?v=ui-20260727-3">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -153,7 +153,7 @@
           <button class="ic" data-ic="sparkles" onclick="openSkillPicker()" title="选择本轮 AI Skill"></button>
           <button class="ic" data-ic="eye" onclick="openStoryDrawer('context')" title="查看本回合上下文"></button>
           <button class="ic" id="aiTtsBtn" data-ic="mute" onclick="toggleAiTts()" title="自动朗读"></button>
-          <button class="ic" data-ic="trash" onclick="clearAgent()" title="清空对话"></button>
+          <button class="ic" data-ic="clock" onclick="openAgentSessions()" title="会话管理"></button>
           <button class="ic" data-ic="x" onclick="toggleAISide()" title="收起"></button>
         </span>
       </div>
@@ -162,6 +162,21 @@
         <select id="agentModelSwitch" class="model-switch" onchange="switchActiveModel(this.value)" aria-label="切换当前 AI 模型"></select>
         <button class="ic" data-ic="settings" onclick="openSettings()" title="管理常用模型 ID"></button>
       </div>
+      <div class="agent-session-row">
+        <select id="agentSessionSwitch" onchange="switchAgentSession(this.value)" aria-label="切换 AI 会话" title="切换当前章节的 AI 会话">
+          <option value="">新会话</option>
+        </select>
+        <button class="ic" data-ic="plus" onclick="newAgentSession()" title="新建会话"></button>
+        <button class="ic" data-ic="clock" onclick="openAgentSessions()" title="查看全部会话"></button>
+      </div>
+      <div id="agentConversationModes" class="agent-conversation-modes" role="group" aria-label="本次对话的历史模式">
+        <button class="active" data-mode="standard" onclick="setAgentConversationMode('standard')" title="使用当前会话的历史记录">继续</button>
+        <button data-mode="ignore_history" onclick="setAgentConversationMode('ignore_history')" title="本次不读取旧聊天，但会把结果保存在当前会话">无历史</button>
+        <button data-mode="temporary" onclick="setAgentConversationMode('temporary')" title="本次不读取旧聊天，也不保存问答">临时一问</button>
+      </div>
+      <button id="agentSummaryBar" class="agent-summary-bar hidden" onclick="openAgentSessions()" title="查看已压缩的早期对话摘要">
+        <span data-ic="archive"></span><span>早期对话已压缩</span><span data-ic="chevR"></span>
+      </button>
       <div id="agentMsgs" class="chat-msgs"></div>
       <div id="agentSelection" class="agent-selection hidden">
         <div class="agent-selection-head">
@@ -604,6 +619,27 @@
     </div>
   </div>
 
+  <!-- AI 会话管理 -->
+  <div id="agentSessionOverlay" class="overlay hidden" onclick="if(event.target===this)closeAgentSessions()">
+    <div class="overlay-card agent-session-card">
+      <div class="overlay-head">
+        <span>AI 会话</span>
+        <span class="overlay-head-actions">
+          <button class="ic" data-ic="plus" onclick="newAgentSession()" title="新建会话"></button>
+          <button class="ic" data-ic="x" onclick="closeAgentSessions()" title="关闭"></button>
+        </span>
+      </div>
+      <div class="agent-session-body">
+        <div id="agentSessionScope" class="agent-session-scope"></div>
+        <div id="agentSessionList" class="agent-session-list"></div>
+        <details id="agentSummaryDetails" class="agent-summary-details hidden">
+          <summary>已压缩的早期对话摘要</summary>
+          <div id="agentSummaryText"></div>
+        </details>
+      </div>
+    </div>
+  </div>
+
   <!-- 作品设定（人物/世界观/大纲，喂给 AI 当全文记忆） -->
   <div id="wnOverlay" class="overlay hidden">
     <div class="overlay-card">
@@ -653,6 +689,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=ui-20260727-2"></script>
+  <script src="app.js?v=ui-20260727-3"></script>
 </body>
 </html>

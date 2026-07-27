@@ -159,6 +159,30 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .agent-model-row label { flex: 0 0 auto; color: var(--muted); font-size: 12px; }
 .agent-model-row .model-switch { flex: 1; width: 100%; }
 .agent-model-row .ic { flex: 0 0 auto; min-width: 32px; min-height: 32px; padding: 6px; }
+.agent-session-row {
+  display: flex; align-items: center; gap: 6px; padding: 7px 10px 6px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.agent-session-row select { flex: 1; min-width: 0; height: 34px; font-size: 13px; font-weight: 600; }
+.agent-session-row .ic { flex: 0 0 auto; min-width: 34px; min-height: 34px; padding: 6px; }
+.agent-conversation-modes {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 0 10px 7px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.agent-conversation-modes button {
+  min-width: 0; border-radius: 0; border-right-width: 0; padding: 5px 4px;
+  color: var(--muted); background: var(--side-bg); font-size: 12px;
+}
+.agent-conversation-modes button:first-child { border-radius: var(--r-sm) 0 0 var(--r-sm); }
+.agent-conversation-modes button:last-child { border-radius: 0 var(--r-sm) var(--r-sm) 0; border-right-width: 1px; }
+.agent-conversation-modes button.active { color: var(--accent-text); background: var(--success-bg); border-color: var(--accent); font-weight: 600; }
+.agent-summary-bar {
+  display: flex; align-items: center; gap: 6px; width: 100%; min-height: 32px;
+  padding: 5px 11px; border: none; border-bottom: 1px solid var(--line); border-radius: 0;
+  color: var(--muted); background: var(--side-bg); font-size: 12px; text-align: left;
+}
+.agent-summary-bar span:nth-child(2) { flex: 1; }
+.agent-summary-bar svg { width: 14px; height: 14px; display: block; }
 @media (max-width: 1020px) { .model-switch-top { display: none; } }
 /* 内联 SVG 图标在非 .ic 容器里的尺寸/对齐 */
 [data-ic] svg { width: 18px; height: 18px; display: block; }
@@ -284,6 +308,7 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
   #app.ai-open .ai-side { transform: none; }
   #app.ai-open .ai-backdrop { display: block; position: fixed; inset: 0; z-index: 34; background: var(--scrim); }
   .ai-head { padding: calc(8px + env(safe-area-inset-top)) 10px 8px; }
+  .ai-head-tools .ic { min-width: 40px; min-height: 40px; padding: 7px; }
   .chat-input-row { padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); gap: 6px; }
   .chat-input-row textarea { min-width: 0; }
   #sendBtn { min-height: 44px; padding-inline: 12px; }
@@ -318,6 +343,12 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .chat-msgs .cm.user.voice svg { width: 15px; height: 15px; }
 .chat-msgs .cm.assistant { background: var(--panel); border: 1px solid var(--line); align-self: flex-start; box-shadow: var(--shadow-sm); } /* 左：AI */
 .chat-msgs .cm.err { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); align-self: flex-start; }
+.chat-msgs .cm.temporary { border-style: dashed; }
+.chat-temporary-label {
+  align-self: center; margin: 4px 0 9px; padding: 2px 7px; color: var(--muted);
+  border: 1px dashed var(--line); border-radius: var(--r-sm); font-size: 11px;
+}
+.agent-chat-loading { display: flex; align-items: center; justify-content: center; gap: 7px; min-height: 120px; color: var(--muted); font-size: 13px; }
 .chat-input-row { display: flex; gap: 6px; padding: 10px; border-top: 1px solid var(--line); align-items: flex-end; background: var(--panel); }
 .chat-input-row textarea { flex: 1; resize: none; font-family: inherit; font-size: 14px; }
 
@@ -364,6 +395,40 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 }
 .agent-skill-chip svg { width: 14px; height: 14px; display: block; }
 .agent-skill-chip svg:last-child { color: var(--muted); }
+.agent-session-card { max-width: 560px; max-height: min(82vh, 760px); }
+.agent-session-body { min-height: 220px; overflow-y: auto; padding: 0 14px 14px; }
+.agent-session-scope {
+  position: sticky; top: 0; z-index: 1; padding: 11px 0 8px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
+  color: var(--muted); font-size: 12px;
+}
+.agent-session-list { display: flex; flex-direction: column; }
+.agent-session-item {
+  display: flex; align-items: center; gap: 7px; min-width: 0; padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+.agent-session-item.archived { opacity: .62; }
+.agent-session-main {
+  display: flex; flex: 1; min-width: 0; flex-direction: column; align-items: flex-start;
+  gap: 2px; padding: 3px 5px; border: none; background: transparent; text-align: left;
+}
+.agent-session-main:hover { background: var(--side-bg); }
+.agent-session-main b { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.agent-session-main small { color: var(--muted); font-size: 11px; }
+.agent-session-active {
+  flex: 0 0 auto; padding: 1px 5px; border: 1px solid var(--accent);
+  border-radius: var(--r-sm); color: var(--accent-text); font-size: 11px;
+}
+.agent-session-actions { display: inline-flex; flex: 0 0 auto; gap: 2px; }
+.agent-session-actions .ic { min-width: 32px; min-height: 32px; padding: 6px; }
+.agent-session-empty { padding: 30px 10px; color: var(--muted); text-align: center; font-size: 13px; }
+.agent-summary-details { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.agent-summary-details summary { color: var(--accent-text); cursor: pointer; font-size: 13px; font-weight: 600; }
+.agent-summary-details > div {
+  margin-top: 8px; padding: 9px 10px; border-left: 3px solid var(--accent);
+  background: var(--side-bg); white-space: pre-wrap; word-break: break-word;
+  color: var(--ink); font-size: 13px; line-height: 1.55;
+}
 .set-form .set-row { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; margin-top: 10px; cursor: pointer; }
 .set-form .set-row input { width: auto; }
 .voice-mode-row { color: var(--ink) !important; font-weight: 600; }
@@ -395,6 +460,9 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 @media (max-width: 700px) {
   .skill-list, .skill-picker-list { max-height: 38vh; }
   .skill-row-actions .ic { min-width: 40px; min-height: 40px; }
+  .agent-session-card { width: 100%; max-width: none; max-height: 88vh; align-self: flex-end; border-radius: var(--r-lg) var(--r-lg) 0 0; }
+  .agent-session-body { padding: 0 12px calc(12px + env(safe-area-inset-bottom)); }
+  .agent-session-actions .ic { min-width: 40px; min-height: 40px; }
 }
 
 /* micbar 分隔条 */

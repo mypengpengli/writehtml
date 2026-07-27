@@ -60,7 +60,8 @@ PI_AGENT_NODE = os.getenv("PI_AGENT_NODE", "node")
 _pi_bridge = os.getenv("PI_AGENT_BRIDGE", os.path.join("pi_runtime", "bridge.mjs"))
 PI_AGENT_BRIDGE = _pi_bridge if os.path.isabs(_pi_bridge) else os.path.join(ROOT_DIR, _pi_bridge)
 PI_AGENT_TIMEOUT_SECONDS = float(os.getenv("PI_AGENT_TIMEOUT_SECONDS", "240"))
-PI_AGENT_MAX_HISTORY_MESSAGES = int(os.getenv("PI_AGENT_MAX_HISTORY_MESSAGES", "80"))
+# 0 means the token budget below, rather than an arbitrary message count, controls history.
+PI_AGENT_MAX_HISTORY_MESSAGES = int(os.getenv("PI_AGENT_MAX_HISTORY_MESSAGES", "0"))
 # Pi Coding Agent 的本机 Skill 目录。留空时沿用 AGENT_SKILL_DIR；它会按 Pi 的
 # Agent Skills 规范扫描目录中的 SKILL.md，并由 Pi 的 read/bash 工具按需使用。
 PI_AGENT_SKILL_DIR = os.getenv("PI_AGENT_SKILL_DIR", AGENT_SKILL_DIR)
@@ -83,9 +84,14 @@ SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
 ADMIN_USER = os.getenv("WRITEHTML_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("WRITEHTML_ADMIN_PASSWORD", "")
 
-# agent 对话上下文压缩：对话累计字符超过 AGENT_COMPACT_CHARS 时触发，
-# 保留最近 AGENT_PRESERVE_RECENT 条（切在 user 消息边界，不切断工具对），
-# 更早的轮次交给 LLM 压成不超过 AGENT_SUMMARY_MAX 字的摘要替代。
-AGENT_COMPACT_CHARS = int(os.getenv("AGENT_COMPACT_CHARS", "12000"))
-AGENT_PRESERVE_RECENT = int(os.getenv("AGENT_PRESERVE_RECENT", "8"))
-AGENT_SUMMARY_MAX = int(os.getenv("AGENT_SUMMARY_MAX", "300"))
+# Agent context is budgeted in tokens. Compression starts when the estimated complete
+# request (system/story context + tools + chat + reserved answer) reaches 90% of the
+# configured model window. The default matches the project's current 200K-class models.
+AGENT_CONTEXT_WINDOW_TOKENS = int(os.getenv("AGENT_CONTEXT_WINDOW_TOKENS", "200000"))
+AGENT_CONTEXT_TRIGGER_RATIO = float(os.getenv("AGENT_CONTEXT_TRIGGER_RATIO", "0.90"))
+AGENT_MAX_OUTPUT_TOKENS = int(os.getenv("AGENT_MAX_OUTPUT_TOKENS", "8192"))
+AGENT_PRESERVE_RECENT = int(os.getenv("AGENT_PRESERVE_RECENT", "24"))
+AGENT_SUMMARY_MAX = int(os.getenv("AGENT_SUMMARY_MAX", "2000"))
+# Deprecated emergency override. A positive value keeps the old character threshold,
+# mainly for controlled tests or unusually small compatibility models.
+AGENT_COMPACT_CHARS = int(os.getenv("AGENT_COMPACT_CHARS", "0"))

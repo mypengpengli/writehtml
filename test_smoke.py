@@ -13,6 +13,9 @@ os.environ["INSPIRATION_STORAGE_DIR"] = os.path.join(_TMP, "inspirations")
 os.environ["SIGNUP_CODE"] = "testcode"   # 开放凭码注册
 os.environ["LLM_API_KEY"] = ""           # 测试不调真 LLM；校验/摘要/聊天应走"未配置"500
 os.environ["WRITEHTML_ADMIN_PASSWORD"] = "admintest"  # 引导创建的 admin 用确定性密码
+os.environ["AGENT_CONTEXT_WINDOW_TOKENS"] = "200000"
+os.environ["AGENT_CONTEXT_TRIGGER_RATIO"] = "0.90"
+os.environ["AGENT_MAX_OUTPUT_TOKENS"] = "8192"
 
 from fastapi.testclient import TestClient
 import main, db, llm, config, context_builder, inspiration
@@ -770,6 +773,130 @@ config.AGENT_PRESERVE_RECENT = _orig_pr
 llm.agent_chat = _orig_ac
 # cid 此刻留有一条压缩后的对话，供后面删作品级联清理验证
 
+# 多会话：同一章节可建立独立会话；无历史仅影响本轮，临时一问不落库。
+session_cid = c.post(f"/api/works/{wid}/chapters", json={"title": "多会话测试"}, headers=H(tokA)).json()["id"]
+llm.agent_chat = lambda messages, tools, **kw: _msg("会话回复")
+first_turn = c.post("/api/agent", json={
+    "text": "第一会话专属内容", "chapter_id": session_cid,
+}, headers=H(tokA)).json()
+first_session_id = first_turn["session_id"]
+second_session = c.post("/api/agent/sessions", json={
+    "chapter_id": session_cid, "title": "润色会话",
+}, headers=H(tokA)).json()
+ok(second_session["id"] != first_session_id, "同一章节可新建第二条会话")
+second_turn = c.post("/api/agent", json={
+    "text": "第二会话专属内容", "chapter_id": session_cid, "session_id": second_session["id"],
+}, headers=H(tokA)).json()
+first_history = c.get(
+    f"/api/agent/conversation?chapter_id={session_cid}&session_id={first_session_id}",
+    headers=H(tokA),
+).json()
+second_history = c.get(
+    f"/api/agent/conversation?chapter_id={session_cid}&session_id={second_session['id']}",
+    headers=H(tokA),
+).json()
+ok("第二会话专属内容" not in json.dumps(first_history, ensure_ascii=False)
+   and "第一会话专属内容" not in json.dumps(second_history, ensure_ascii=False),
+   "同章多会话消息互相隔离")
+session_list = c.get(
+    f"/api/agent/sessions?chapter_id={session_cid}", headers=H(tokA)
+).json()
+ok(len(session_list["sessions"]) == 2 and session_list["active_session_id"] == second_session["id"],
+   "会话列表返回当前活动会话")
+ok(c.get(
+    f"/api/agent/conversation?chapter_id={cid}&session_id={second_session['id']}",
+    headers=H(tokA),
+).status_code == 404, "会话 ID 不能跨章节读取")
+ok(c.post("/api/agent", json={
+    "text": "不能写入别章会话", "chapter_id": cid, "session_id": second_session["id"],
+}, headers=H(tokA)).status_code == 404, "会话 ID 不能跨章节写入")
+
+_seen_ignore = {}
+def _capture_ignore(messages, tools, **kw):
+    _seen_ignore["messages"] = [dict(message) for message in messages]
+    return _msg("无历史回复")
+llm.agent_chat = _capture_ignore
+ignored = c.post("/api/agent", json={
+    "text": "只处理这次", "chapter_id": session_cid, "session_id": second_session["id"],
+    "conversation_mode": "ignore_history",
+}, headers=H(tokA)).json()
+ok("第二会话专属内容" not in json.dumps(_seen_ignore["messages"], ensure_ascii=False),
+   "无历史模式本轮不把旧聊天发给模型")
+ignored_history = c.get(
+    f"/api/agent/conversation?chapter_id={session_cid}&session_id={second_session['id']}",
+    headers=H(tokA),
+).json()
+ok("第二会话专属内容" in json.dumps(ignored_history, ensure_ascii=False)
+   and "只处理这次" in json.dumps(ignored_history, ensure_ascii=False),
+   "无历史模式仍把本轮结果保存到原会话")
+
+before_temporary = json.dumps(ignored_history["messages"], ensure_ascii=False)
+temporary = c.post("/api/agent", json={
+    "text": "不要保存这一问", "chapter_id": session_cid, "session_id": second_session["id"],
+    "conversation_mode": "temporary",
+}, headers=H(tokA)).json()
+after_temporary = c.get(
+    f"/api/agent/conversation?chapter_id={session_cid}&session_id={second_session['id']}",
+    headers=H(tokA),
+).json()
+ok(temporary["temporary"] is True and before_temporary == json.dumps(after_temporary["messages"], ensure_ascii=False),
+   "临时一问不读取也不保存会话历史")
+renamed = c.patch(f"/api/agent/sessions/{second_session['id']}", json={
+    "title": "重点润色",
+}, headers=H(tokA)).json()
+ok(renamed["title"] == "重点润色", "会话可重命名")
+archived = c.patch(f"/api/agent/sessions/{second_session['id']}", json={
+    "archived": True,
+}, headers=H(tokA)).json()
+ok(archived["archived"] is True, "会话可归档")
+restored = c.patch(f"/api/agent/sessions/{second_session['id']}", json={
+    "archived": False,
+}, headers=H(tokA)).json()
+ok(restored["is_active"] is True and not restored["archived"], "归档会话可恢复并激活")
+ok(c.delete(f"/api/agent/sessions/{first_session_id}", headers=H(tokA)).status_code == 200,
+   "会话可单独永久删除")
+ok(c.get(
+    f"/api/agent/conversation?chapter_id={session_cid}&session_id={first_session_id}",
+    headers=H(tokA),
+).status_code == 404, "已删除会话无法继续读取")
+llm.agent_chat = _orig_ac
+
+_budget = main._agent_context_budget()
+ok(_budget["window_tokens"] == 200000 and _budget["trigger_tokens"] == 180000,
+   "Agent 默认按 200K 窗口的 90% 计算压缩触发点")
+ok(_budget["input_budget_tokens"] == 180000 - config.AGENT_MAX_OUTPUT_TOKENS,
+   "压缩预算会先为模型回答预留 token")
+
+# 旧版每章单会话升级时必须完整保留消息、摘要和章节归属。
+_legacy = sqlite3.connect(":memory:")
+_legacy.row_factory = sqlite3.Row
+_legacy.executescript("""
+CREATE TABLE users(id INTEGER PRIMARY KEY);
+CREATE TABLE works(id INTEGER PRIMARY KEY, user_id INTEGER);
+CREATE TABLE chapters(id INTEGER PRIMARY KEY, work_id INTEGER);
+CREATE TABLE agent_conversations(
+  id INTEGER PRIMARY KEY, user_id INTEGER, chapter_id INTEGER, messages TEXT,
+  summary TEXT, msg_count INTEGER, created_at REAL, updated_at REAL
+);
+INSERT INTO users VALUES(1);
+INSERT INTO works VALUES(10,1);
+INSERT INTO chapters VALUES(20,10);
+""")
+_legacy_messages = [{"role": "user", "content": "旧会话问题"}, {"role": "assistant", "content": "旧回答"}]
+_legacy.execute(
+    "INSERT INTO agent_conversations VALUES(30,1,20,?,?,?,?,?)",
+    (json.dumps(_legacy_messages, ensure_ascii=False), "旧摘要", 2, 1, 2),
+)
+db._migration_agent_sessions(_legacy)
+_migrated = _legacy.execute(
+    "SELECT * FROM agent_sessions WHERE legacy_conversation_id=30"
+).fetchone()
+ok(_migrated["scope_key"] == "chapter:20" and _migrated["work_id"] == 10
+   and _migrated["summary"] == "旧摘要"
+   and json.loads(_migrated["messages"]) == _legacy_messages,
+   "旧版单会话可无损升级为多会话")
+_legacy.close()
+
 # 本机 meta-memory + launcher：每轮读 SKILL.md、生命周期使用同一 turn_id、回答先落盘再确认。
 _skill_root = os.path.join(_TMP, "local-skills")
 _meta_dir = os.path.join(_skill_root, "meta-memory")
@@ -884,6 +1011,8 @@ ok(c.get("/api/admin/conversations").status_code == 401, "未登录访问 admin 
 _lst = c.get("/api/admin/conversations", headers=H(tokAdm)).json()["conversations"]
 ok(any(x["user_id"] == uidA and x["chapter_id"] == cid for x in _lst), "admin 列出 alice 的对话")
 ok(all("bytes" in x for x in _lst) and any(x["bytes"] > 0 for x in _lst), "admin 对话列表含每条占用字节数")
+ok(all("title" in x and "is_active" in x and "archived_at" in x for x in _lst),
+   "admin 对话列表可区分多会话标题与状态")
 _usrs = c.get("/api/admin/users", headers=H(tokAdm)).json()["users"]
 ok(any(u["username"] == "alice" for u in _usrs) and any(u["is_admin"] == 1 for u in _usrs), "admin 列出用户(含管理员标记)")
 # 用户占用统计：作品/章节/对话数/对话字节数
@@ -998,7 +1127,7 @@ ok(c.delete(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)).sta
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260727-2" in _home.text and "app.js?v=ui-20260727-2" in _home.text,
+ok(_home.status_code == 200 and "style.css?v=ui-20260727-3" in _home.text and "app.js?v=ui-20260727-3" in _home.text,
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")

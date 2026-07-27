@@ -2129,6 +2129,107 @@ def _compact_split(msgs, preserve):
     return keep_from if keep_from < n else 0
 
 
+def _estimated_text_tokens(value):
+    """Conservative tokenizer-independent estimate for mixed Chinese/ASCII prompts."""
+    if value is None:
+        return 0
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    cjk = sum(
+        1 for char in value
+        if "\u3400" <= char <= "\u9fff"
+        or "\u3040" <= char <= "\u30ff"
+        or "\uac00" <= char <= "\ud7af"
+    )
+    other = len(value) - cjk
+    return max(1, int(cjk * 1.15 + (other + 2) / 3))
+
+
+def _estimated_message_tokens(message):
+    if not isinstance(message, dict):
+        return 0
+    return 8 + _estimated_text_tokens(message)
+
+
+def _agent_context_budget():
+    window = max(8192, int(config.AGENT_CONTEXT_WINDOW_TOKENS))
+    ratio = min(0.95, max(0.50, float(config.AGENT_CONTEXT_TRIGGER_RATIO)))
+    trigger = max(4096, int(window * ratio))
+    output_reserve = min(max(1024, int(config.AGENT_MAX_OUTPUT_TOKENS)), trigger // 2)
+    return {
+        "window_tokens": window,
+        "trigger_tokens": trigger,
+        "output_reserve_tokens": output_reserve,
+        "input_budget_tokens": trigger - output_reserve,
+    }
+
+
+def _agent_request_token_estimate(system_prompt, history, prompt):
+    tool_tokens = _estimated_text_tokens(_pi_tools())
+    return (
+        _estimated_text_tokens(system_prompt)
+        + sum(_estimated_message_tokens(message) for message in history)
+        + _estimated_text_tokens(prompt)
+        + tool_tokens
+        + 64
+    )
+
+
+def _compact_agent_history(messages, summary, *, system_prompt, prompt, base_url, api_key,
+                           model, summary_messages=None):
+    """Compact only when the projected full request reaches its token budget."""
+    messages = list(messages or [])
+    budget = _agent_context_budget()
+    estimated = _agent_request_token_estimate(system_prompt, messages, prompt)
+    char_override = max(0, int(getattr(config, "AGENT_COMPACT_CHARS", 0) or 0))
+    message_chars = sum(_pi_message_size(message) for message in messages)
+    needs_compaction = estimated > budget["input_budget_tokens"]
+    if char_override:
+        needs_compaction = needs_compaction or message_chars > char_override
+    if not needs_compaction or len(messages) < 3:
+        return messages, summary, False, {**budget, "estimated_input_tokens": estimated}
+
+    configured = max(2, int(config.AGENT_PRESERVE_RECENT))
+    preserve_candidates = []
+    preserve = min(configured, max(2, len(messages) - 1))
+    while preserve >= 2:
+        if preserve not in preserve_candidates:
+            preserve_candidates.append(preserve)
+        if preserve == 2:
+            break
+        preserve = max(2, preserve // 2)
+
+    keep_from = 0
+    for candidate in preserve_candidates:
+        split = _compact_split(messages, candidate)
+        if not split:
+            continue
+        keep_from = split
+        summary_growth_reserve = max(
+            0,
+            int(config.AGENT_SUMMARY_MAX * 1.15) - _estimated_text_tokens(summary),
+        )
+        remaining_estimate = _agent_request_token_estimate(
+            system_prompt, messages[split:], prompt
+        ) + summary_growth_reserve
+        if char_override or remaining_estimate <= budget["input_budget_tokens"]:
+            break
+    if not keep_from:
+        return messages, summary, False, {**budget, "estimated_input_tokens": estimated}
+
+    source = summary_messages(messages[:keep_from]) if summary_messages else messages[:keep_from]
+    new_summary = llm.summarize(
+        source, prev=summary, base_url=base_url, api_key=api_key, model=model
+    )
+    compacted = messages[keep_from:]
+    final_estimate = _agent_request_token_estimate(system_prompt, compacted, prompt)
+    return compacted, new_summary, True, {
+        **budget,
+        "estimated_input_tokens": final_estimate,
+        "compacted_messages": keep_from,
+    }
+
+
 def _agent_context_task(instruction, selection):
     if isinstance(selection, dict) and isinstance(selection.get("text"), str) and selection["text"].strip():
         return "rewrite_selection"
@@ -2280,13 +2381,24 @@ def _agent_skill_catalog_system(uid, cid):
     }
 
 
-def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instruction=""):
+def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instruction="",
+                            session_id=None, use_history=True, work_id=None):
     """把下一回合真正拼装的上下文以可审阅结构返回，不暴露 API Key。"""
     chapter = db.get_chapter_meta(cid, uid) if cid else None
     if cid and not chapter:
         return None
+    if not chapter and work_id is not None and not db.get_work(work_id, uid):
+        return None
+    work_id = chapter["work_id"] if chapter else work_id
+    scope = db.resolve_agent_scope(uid, cid, work_id)
+    if not scope:
+        return None
+    if isinstance(session_id, int) and not isinstance(session_id, bool):
+        session = db.get_agent_session(uid, session_id, include_messages=False)
+        if not session or session["archived"] or session["scope_key"] != scope["scope_key"]:
+            return None
     context = context_builder.build_context(
-        uid, "answer_story_question", chapter["work_id"] if chapter else None, cid,
+        uid, "answer_story_question", work_id, cid,
         instruction=instruction, selection=selection, skill_ids=skill_ids, token_budget=18000,
     ) if chapter else {"context_items": [], "estimated_tokens": 0, "recalled_memory_ids": []}
     system_messages = [_agent_system(uid, cid, instruction=instruction, selection=selection, skill_ids=skill_ids)]
@@ -2299,13 +2411,24 @@ def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instructio
     selection_message = _agent_selection_system(uid, cid, selection)
     if selection_message:
         system_messages.append(selection_message)
-    conversation = db.get_conversation(uid, cid) or {"summary": "", "messages": []}
+    conversation = (
+        db.get_conversation(
+            uid, cid,
+            session_id=session_id if isinstance(session_id, int) and not isinstance(session_id, bool) else None,
+            work_id=work_id,
+        )
+        if use_history else None
+    ) or {"summary": "", "messages": []}
     summary = conversation.get("summary") or ""
-    if summary:
+    if use_history and summary:
         system_messages.append({"role": "system", "content": "[此前对话摘要]\n" + summary})
-    work_id = chapter["work_id"] if chapter else None
     skills = db.get_agent_skills_for_turn(uid, work_id, skill_ids or []) if isinstance(skill_ids, list) else []
     selected_text = selection.get("text") if isinstance(selection, dict) and isinstance(selection.get("text"), str) else ""
+    system_prompt = "\n\n".join(item["content"] for item in system_messages if item.get("content"))
+    estimated_tokens = _agent_request_token_estimate(
+        system_prompt, conversation.get("messages") or [], instruction
+    )
+    budget = _agent_context_budget()
     return {
         "engine": "Pi Coding Agent" if config.PI_AGENT_ENABLED else "兼容 Agent 运行时",
         "chapter": ({"id": chapter["id"], "title": chapter["title"], "ord": chapter.get("ord"),
@@ -2329,11 +2452,25 @@ def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instructio
         },
         "model": (db.get_settings(uid) or {}).get("llm_model") or config.LLM_MODEL,
         "context_items": context.get("context_items") or [],
-        "estimated_tokens": context.get("estimated_tokens") or 0,
+        "estimated_tokens": estimated_tokens,
+        "story_context_tokens": context.get("estimated_tokens") or 0,
+        "context_budget": {
+            **budget,
+            "estimated_input_tokens": estimated_tokens,
+            "usage_ratio": round(estimated_tokens / max(1, budget["window_tokens"]), 4),
+        },
         "recalled_memory_ids": context.get("recalled_memory_ids") or [],
         "system_messages": [{"label": "系统上下文", "content": item["content"]}
                             for item in system_messages if item.get("content")],
         "conversation_messages": len(conversation.get("messages") or []),
+        "conversation": {
+            "session_id": conversation.get("id"),
+            "title": conversation.get("title") or "新会话",
+            "use_history": bool(use_history),
+            "message_count": len(conversation.get("messages") or []),
+            "has_summary": bool(summary),
+            "summary": summary,
+        },
     }
 
 
@@ -3027,7 +3164,8 @@ def _pi_tools():
 
 
 def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
-                  runtime_system=None, persist=True):
+                  runtime_system=None, persist=True, session_id=None, work_id=None,
+                  use_history=True, retain_history=True):
     """Run the writing agent through the official Pi Coding Agent process."""
     audio = None
     context_instruction = history_text
@@ -3059,12 +3197,37 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
         "base_url": base_url, "api_key": api_key, "model": model, "active_skill_ids": set(),
         "character_state_dirty": False, "turn_audio": audio,
     }
-    conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
+    conv = (
+        db.get_conversation(uid, cid, session_id=session_id, work_id=work_id)
+        if retain_history else None
+    ) or {"messages": [], "summary": ""}
     summary = conv["summary"] or ""
-    history = _legacy_messages_to_pi(conv["messages"], model)
+    stored_history = _legacy_messages_to_pi(conv["messages"], model)
+    history = list(stored_history) if use_history else []
     system_prompt = _pi_system_prompt(
-        uid, cid, selection, skill_ids, runtime_system, summary, cfg, context_instruction,
+        uid, cid, selection, skill_ids, runtime_system, summary if use_history else "",
+        cfg, context_instruction,
     )
+    pre_compacted = False
+    context_usage = {
+        **_agent_context_budget(),
+        "estimated_input_tokens": _agent_request_token_estimate(system_prompt, history, history_text),
+    }
+    if use_history and history:
+        try:
+            history, summary, pre_compacted, context_usage = _compact_agent_history(
+                history, summary, system_prompt=system_prompt, prompt=history_text,
+                base_url=base_url, api_key=api_key, model=model,
+                summary_messages=_pi_messages_for_frontend,
+            )
+            if pre_compacted:
+                stored_history = list(history)
+                system_prompt = _pi_system_prompt(
+                    uid, cid, selection, skill_ids, runtime_system, summary,
+                    cfg, context_instruction,
+                )
+        except Exception:
+            pass
 
     def execute_tool(name, args):
         fn = _AGENT_TOOLS.get(name)
@@ -3105,13 +3268,18 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
         "apiKey": api_key,
         "model": model,
         "audio": audio,
-        "sessionId": f"{config.AGENT_SKILL_AGENT_ID}:user-{uid}:chapter-{cid if cid is not None else 'global'}",
+        "sessionId": (
+            f"{config.AGENT_SKILL_AGENT_ID}:user-{uid}:session-"
+            f"{session_id if session_id is not None else 'temporary'}"
+        ),
+        "contextWindow": config.AGENT_CONTEXT_WINDOW_TOKENS,
+        "maxTokens": config.AGENT_MAX_OUTPUT_TOKENS,
         "cwd": config.PI_AGENT_WORKSPACE_DIR,
         "skillDirs": [config.PI_AGENT_SKILL_DIR] if config.PI_AGENT_SKILL_DIR else [],
     }
-    raw_messages = pi_agent.run_turn(request, execute_tool)
+    turn_messages = pi_agent.run_turn(request, execute_tool)
     reply = ""
-    for message in reversed(raw_messages):
+    for message in reversed(turn_messages):
         if isinstance(message, dict) and message.get("role") == "assistant":
             reply = _pi_text(message.get("content")).strip()
             if reply:
@@ -3119,14 +3287,21 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
     if not reply:
         reply = "已完成本次操作。"
 
-    compacted = False
-    keep_from = _compact_split(raw_messages, config.AGENT_PRESERVE_RECENT)
-    if keep_from > 0 and sum(_pi_message_size(message) for message in raw_messages) > config.AGENT_COMPACT_CHARS:
+    if use_history:
+        raw_messages = turn_messages
+    elif retain_history:
+        raw_messages = stored_history + turn_messages
+    else:
+        raw_messages = turn_messages
+    compacted = pre_compacted
+    if retain_history:
         try:
-            summary = llm.summarize(_pi_messages_for_frontend(raw_messages[:keep_from]), prev=summary,
-                                    base_url=base_url, api_key=api_key, model=model)
-            raw_messages = raw_messages[keep_from:]
-            compacted = True
+            raw_messages, summary, post_compacted, context_usage = _compact_agent_history(
+                raw_messages, summary, system_prompt=system_prompt, prompt="",
+                base_url=base_url, api_key=api_key, model=model,
+                summary_messages=_pi_messages_for_frontend,
+            )
+            compacted = compacted or post_compacted
         except Exception:
             pass
 
@@ -3136,20 +3311,39 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
         if cid and cfg.get("character_state_dirty") else None
     )
     if persist:
-        db.save_conversation(uid, cid, raw_messages, summary)
-        result = {"reply": reply, "messages": display_messages, "compacted": compacted}
+        saved = db.save_conversation(
+            uid, cid, raw_messages, summary, session_id=session_id, work_id=work_id,
+            title_hint=history_text, model=model,
+        ) if retain_history else None
+        if retain_history and not saved:
+            raise HTTPException(409, "当前会话已被删除或归档，本轮回答未保存")
+        result = {
+            "reply": reply, "messages": display_messages, "compacted": compacted,
+            "session_id": saved["id"] if saved else session_id,
+            "session_title": saved["title"] if saved else "临时一问",
+            "temporary": not retain_history, "context_usage": context_usage,
+            "conversation_summary": summary if retain_history else "",
+        }
         if state_request:
             result["_character_state_request"] = state_request
         return result
     return {
         "reply": reply, "messages": display_messages, "compacted": compacted,
-        "_pending_conversation": {"messages": raw_messages, "summary": summary},
+        "session_id": session_id, "temporary": not retain_history,
+        "context_usage": context_usage,
+        "conversation_summary": summary if retain_history else "",
+        "_pending_conversation": {
+            "messages": raw_messages, "summary": summary, "session_id": session_id,
+            "work_id": work_id, "retain_history": retain_history, "title_hint": history_text,
+            "model": model,
+        },
         "_character_state_request": state_request,
     }
 
 
 def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
-               runtime_system=None, persist=True):
+               runtime_system=None, persist=True, session_id=None, work_id=None,
+               use_history=True, retain_history=True):
     """执行一轮 agent。
 
     history_text 是持久化到 SQLite 的安全文本；model_turn 可在本轮替换成音频等
@@ -3177,31 +3371,58 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
     }
 
     # 加载持久化对话（服务端权威）。音频只进入本轮模型消息，不保存原始内容。
-    conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
-    msgs = list(conv["messages"])
+    conv = (
+        db.get_conversation(uid, cid, session_id=session_id, work_id=work_id)
+        if retain_history else None
+    ) or {"messages": [], "summary": ""}
+    stored_messages = list(conv["messages"])
     summary = conv["summary"] or ""
     stored_turn = {"role": "user", "content": history_text}
 
     # 发给模型的数组：系统提示 + 早期摘要(若有) + 当前对话
-    messages = [_agent_system(uid, cid, instruction=history_text, selection=selection, skill_ids=skill_ids)]
+    system_messages = [_agent_system(uid, cid, instruction=history_text, selection=selection, skill_ids=skill_ids)]
     if runtime_system:
-        messages.append(runtime_system)
+        system_messages.append(runtime_system)
     skill_catalog = _agent_skill_catalog_system(uid, cid)
     if skill_catalog:
-        messages.append(skill_catalog)
+        system_messages.append(skill_catalog)
     skill_msg = _agent_skills_system(uid, cid, skill_ids)
     if skill_msg:
-        messages.append(skill_msg)
+        system_messages.append(skill_msg)
         # 工具内会再次调用文本模型生成正文，必须带上同一组 Skill 规则。
         cfg["skill_instructions"] = skill_msg["content"]
         cfg["active_skill_ids"] = set(skill_id for skill_id in skill_ids if isinstance(skill_id, int) and not isinstance(skill_id, bool))
     selection_msg = _agent_selection_system(uid, cid, selection)
     if selection_msg:
-        messages.append(selection_msg)
-    if summary:
-        messages.append({"role": "user", "content": "[此前对话摘要]\n" + summary})
-    messages.extend(msgs)
+        system_messages.append(selection_msg)
+    model_history = list(stored_messages) if use_history else []
+    summary_message = (
+        [{"role": "user", "content": "[此前对话摘要]\n" + summary}]
+        if use_history and summary else []
+    )
+    system_for_budget = json.dumps(system_messages + summary_message, ensure_ascii=False)
+    pre_compacted = False
+    context_usage = {
+        **_agent_context_budget(),
+        "estimated_input_tokens": _agent_request_token_estimate(
+            system_for_budget, model_history, history_text
+        ),
+    }
+    if use_history and model_history:
+        try:
+            model_history, summary, pre_compacted, context_usage = _compact_agent_history(
+                model_history, summary, system_prompt=system_for_budget, prompt=history_text,
+                base_url=base_url, api_key=api_key, model=model,
+            )
+            if pre_compacted:
+                stored_messages = list(model_history)
+                summary_message = [{"role": "user", "content": "[此前对话摘要]\n" + summary}]
+                system_for_budget = json.dumps(system_messages + summary_message, ensure_ascii=False)
+        except Exception:
+            pass
+    messages = system_messages + summary_message + model_history
     messages.append(model_turn or stored_turn)
+    msgs = list(stored_messages) if retain_history else []
     msgs.append(stored_turn)
 
     reply = ""
@@ -3253,43 +3474,61 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
     else:
         reply = "操作较多，已暂停。已执行的动作见对话记录，可逐条撤销。"
 
-    # 超长压缩：把早期轮次交给 LLM 压成摘要，保留最近几轮（切在 user 边界，不切断工具对）
-    compacted = False
-    keep_from = _compact_split(msgs, config.AGENT_PRESERVE_RECENT)
-    if keep_from > 0:
-        total = sum(len(m.get("content") or "") for m in msgs)
-        if total > config.AGENT_COMPACT_CHARS:
-            try:
-                summary = llm.summarize(msgs[:keep_from], prev=summary,
-                                        base_url=base_url, api_key=api_key, model=model)
-                msgs = msgs[keep_from:]
-                compacted = True
-            except Exception:
-                # 摘要失败则保留原样，不阻断本轮
-                pass
+    compacted = pre_compacted
+    if retain_history:
+        try:
+            msgs, summary, post_compacted, context_usage = _compact_agent_history(
+                msgs, summary, system_prompt=system_for_budget, prompt="",
+                base_url=base_url, api_key=api_key, model=model,
+            )
+            compacted = compacted or post_compacted
+        except Exception:
+            pass
 
     state_request = (
         {"chapter_id": cid, "base_url": base_url, "api_key": api_key, "model": model}
         if cid and cfg.get("character_state_dirty") else None
     )
     if persist:
-        db.save_conversation(uid, cid, msgs, summary)
-        result = {"reply": reply, "messages": msgs, "compacted": compacted}
+        saved = db.save_conversation(
+            uid, cid, msgs, summary, session_id=session_id, work_id=work_id,
+            title_hint=history_text, model=model,
+        ) if retain_history else None
+        if retain_history and not saved:
+            raise HTTPException(409, "当前会话已被删除或归档，本轮回答未保存")
+        result = {
+            "reply": reply, "messages": msgs, "compacted": compacted,
+            "session_id": saved["id"] if saved else session_id,
+            "session_title": saved["title"] if saved else "临时一问",
+            "temporary": not retain_history, "context_usage": context_usage,
+            "conversation_summary": summary if retain_history else "",
+        }
         if state_request:
             result["_character_state_request"] = state_request
         return result
     return {
         "reply": reply, "messages": msgs, "compacted": compacted,
-        "_pending_conversation": {"messages": msgs, "summary": summary},
+        "session_id": session_id, "temporary": not retain_history,
+        "context_usage": context_usage,
+        "conversation_summary": summary if retain_history else "",
+        "_pending_conversation": {
+            "messages": msgs, "summary": summary, "session_id": session_id,
+            "work_id": work_id, "retain_history": retain_history, "title_hint": history_text,
+            "model": model,
+        },
         "_character_state_request": state_request,
     }
 
 
-def _runtime_request_payload(uid, cid, history_text, selection):
+def _runtime_request_payload(uid, cid, history_text, selection, session_id=None,
+                             work_id=None, retain_history=True):
     """写入本机 launcher 的请求文件；音频 Base64 永远不落盘。"""
     return {
         "user_id": uid,
         "chapter_id": cid,
+        "work_id": work_id,
+        "session_id": session_id,
+        "retain_history": bool(retain_history),
         "input": history_text,
         "selection": selection if isinstance(selection, dict) else None,
     }
@@ -3310,16 +3549,20 @@ def _apply_story_update_proposals(uid, state_request):
     )
 
 
-def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None):
+def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
+                    session_id=None, work_id=None, use_history=True, retain_history=True):
     """执行 Agent，并在启用本机运行时时先缓冲回答、等 after/recovery 确认。"""
     turn = None
     try:
-        turn = skill_runtime.start_turn(_runtime_request_payload(uid, cid, history_text, selection))
+        turn = skill_runtime.start_turn(_runtime_request_payload(
+            uid, cid, history_text, selection, session_id, work_id, retain_history
+        ))
         engine = _run_pi_agent if config.PI_AGENT_ENABLED else _run_legacy_agent
         result = engine(
             uid, cid, history_text, selection, skill_ids, model_turn=model_turn,
             runtime_system=turn.system_message if turn else None,
-            persist=turn is None,
+            persist=turn is None, session_id=session_id, work_id=work_id,
+            use_history=use_history, retain_history=retain_history,
         )
     except skill_runtime.SkillRuntimeError as e:
         raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
@@ -3346,19 +3589,81 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     try:
         runtime_state = turn.complete({
             "reply": result["reply"], "messages": result["messages"],
-            "compacted": result["compacted"], "chapter_id": cid, "pending_conversation": pending,
+            "compacted": result["compacted"], "chapter_id": cid, "work_id": work_id,
+            "session_id": session_id, "retain_history": retain_history,
+            "pending_conversation": pending,
         })
     except skill_runtime.SkillRuntimeError as e:
         raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
-    db.save_conversation(uid, cid, pending["messages"], pending["summary"])
-    skill_runtime.mark_conversation_saved(turn.turn_id, uid)
+    saved = None
+    if retain_history:
+        saved = db.save_conversation(
+            uid, cid, pending["messages"], pending["summary"],
+            session_id=session_id, work_id=work_id,
+            title_hint=pending.get("title_hint") or history_text,
+            model=pending.get("model"),
+        )
+        if not saved:
+            raise HTTPException(409, {
+                "message": "当前会话已被删除或归档，可使用恢复编号重试保存",
+                "turn_id": turn.turn_id,
+            })
+        skill_runtime.mark_conversation_saved(turn.turn_id, uid)
     result["skill_runtime"] = runtime_state
+    result["session_id"] = saved["id"] if saved else session_id
+    result["session_title"] = saved["title"] if saved else "临时一问"
+    result["temporary"] = not retain_history
+    result["conversation_summary"] = pending.get("summary") if retain_history else ""
     if state_request:
         character_proposals, plot_proposal, memory_proposals = _apply_story_update_proposals(uid, state_request)
         result["character_state_proposals"] = character_proposals
         result["plot_state_proposal"] = plot_proposal
         result["memory_proposals"] = memory_proposals
     return result
+
+
+def _optional_body_int(body, name):
+    value = body.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise HTTPException(400, f"{name} 无效")
+    return value
+
+
+def _prepare_agent_turn(uid, body, title_hint):
+    cid = _optional_body_int(body, "chapter_id")
+    work_id = _optional_body_int(body, "work_id")
+    scope = db.resolve_agent_scope(uid, cid, work_id)
+    if not scope:
+        raise HTTPException(404, "作品或章节不存在")
+    work_id = scope["work_id"]
+    mode = body.get("conversation_mode") or "standard"
+    if mode not in {"standard", "ignore_history", "temporary"}:
+        raise HTTPException(400, "会话上下文模式无效")
+    retain_history = mode != "temporary"
+    use_history = mode == "standard"
+    session_id = _optional_body_int(body, "session_id")
+    if not retain_history:
+        session_id = None
+    elif session_id is not None:
+        session = db.get_agent_session(uid, session_id, include_messages=False)
+        if (
+            not session or session["archived"]
+            or session["scope_key"] != scope["scope_key"]
+        ):
+            raise HTTPException(404, "会话不存在或不属于当前章节")
+        db.activate_agent_session(uid, session_id)
+    else:
+        session = db.get_conversation(uid, cid, work_id=work_id)
+        if not session:
+            session = db.create_agent_session(uid, cid, work_id, title_hint or "新会话")
+        session_id = session["id"]
+    return {
+        "chapter_id": cid, "work_id": work_id, "session_id": session_id,
+        "use_history": use_history, "retain_history": retain_history,
+        "conversation_mode": mode,
+    }
 
 
 @app.post("/api/agent")
@@ -3369,7 +3674,12 @@ async def agent(request: Request):
     text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "没有对话内容")
-    return _run_agent_turn(uid, body.get("chapter_id"), text, body.get("selection"), body.get("skill_ids"))
+    turn = _prepare_agent_turn(uid, body, text)
+    return _run_agent_turn(
+        uid, turn["chapter_id"], text, body.get("selection"), body.get("skill_ids"),
+        session_id=turn["session_id"], work_id=turn["work_id"],
+        use_history=turn["use_history"], retain_history=turn["retain_history"],
+    )
 
 
 @app.post("/api/agent/context")
@@ -3377,10 +3687,12 @@ async def inspect_agent_context(request: Request):
     uid = _auth(request)
     body = await request.json()
     result = _agent_context_snapshot(
-        uid, body.get("chapter_id"), body.get("selection"), body.get("skill_ids"), body.get("text", ""),
+        uid, body.get("chapter_id"), body.get("selection"), body.get("skill_ids"),
+        body.get("text", ""), body.get("session_id"), body.get("use_history", True),
+        body.get("work_id"),
     )
     if result is None:
-        raise HTTPException(404, "章节不存在")
+        raise HTTPException(404, "章节或会话不存在")
     return result
 
 
@@ -3420,8 +3732,13 @@ async def agent_audio(request: Request):
         ],
     }
     try:
-        result = _run_agent_turn(uid, body.get("chapter_id"), "[voice] 语音指令",
-                                 body.get("selection"), body.get("skill_ids"), model_turn=model_turn)
+        turn = _prepare_agent_turn(uid, body, "语音会话")
+        result = _run_agent_turn(
+            uid, turn["chapter_id"], "[voice] 语音指令",
+            body.get("selection"), body.get("skill_ids"), model_turn=model_turn,
+            session_id=turn["session_id"], work_id=turn["work_id"],
+            use_history=turn["use_history"], retain_history=turn["retain_history"],
+        )
         settings = db.get_settings(uid) or {}
         result["voice"] = {
             "mode": "direct", "route": "/api/agent/audio → 当前 Agent 模型",
@@ -3452,31 +3769,130 @@ async def recover_agent_runtime(turn_id: str, request: Request):
     chapter_id = answer.get("chapter_id")
     if chapter_id is not None and (not isinstance(chapter_id, int) or isinstance(chapter_id, bool)):
         raise HTTPException(409, "该回合的章节标识无效")
-    if not runtime_state.get("conversation_saved"):
-        db.save_conversation(uid, chapter_id, pending["messages"], pending.get("summary") or "")
+    retain_history = bool(answer.get("retain_history", pending.get("retain_history", True)))
+    session_id = answer.get("session_id", pending.get("session_id"))
+    work_id = answer.get("work_id", pending.get("work_id"))
+    saved = None
+    if retain_history and not runtime_state.get("conversation_saved"):
+        saved = db.save_conversation(
+            uid, chapter_id, pending["messages"], pending.get("summary") or "",
+            session_id=session_id, work_id=work_id,
+            title_hint=pending.get("title_hint"), model=pending.get("model"),
+        )
+        if not saved:
+            raise HTTPException(409, "该回合对应的会话已不存在")
         skill_runtime.mark_conversation_saved(turn_id, uid)
         runtime_state["conversation_saved"] = True
     return {
         "reply": answer.get("reply") or "", "messages": _pi_messages_for_frontend(pending["messages"]),
         "compacted": bool(answer.get("compacted")), "skill_runtime": runtime_state,
+        "session_id": saved["id"] if saved else session_id,
+        "session_title": saved["title"] if saved else ("临时一问" if not retain_history else "会话"),
+        "temporary": not retain_history,
+        "conversation_summary": pending.get("summary") if retain_history else "",
     }
+
+
+@app.get("/api/agent/sessions")
+async def get_agent_sessions(request: Request):
+    uid = _auth(request)
+    cid = _qparam_int(request, "chapter_id")
+    work_id = _qparam_int(request, "work_id")
+    include_archived = request.query_params.get("include_archived", "1") not in {"0", "false"}
+    sessions = db.list_agent_sessions(uid, cid, work_id, include_archived=include_archived)
+    if sessions is None:
+        raise HTTPException(404, "作品或章节不存在")
+    active = next((item["id"] for item in sessions if item["is_active"] and not item["archived"]), None)
+    return {"sessions": sessions, "active_session_id": active}
+
+
+@app.post("/api/agent/sessions")
+async def create_agent_session(request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    cid = _optional_body_int(body, "chapter_id")
+    work_id = _optional_body_int(body, "work_id")
+    title = body.get("title") or "新会话"
+    if not isinstance(title, str):
+        raise HTTPException(400, "会话标题无效")
+    session = db.create_agent_session(uid, cid, work_id, title)
+    if not session:
+        raise HTTPException(404, "作品或章节不存在")
+    session.pop("messages", None)
+    session.pop("summary", None)
+    return session
+
+
+@app.post("/api/agent/sessions/{session_id}/activate")
+async def activate_agent_session(session_id: int, request: Request):
+    uid = _auth(request)
+    session = db.activate_agent_session(uid, session_id)
+    if not session:
+        raise HTTPException(404, "会话不存在或已经归档")
+    return session
+
+
+@app.patch("/api/agent/sessions/{session_id}")
+async def update_agent_session(session_id: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    title = body.get("title") if "title" in body else None
+    archived = body.get("archived") if "archived" in body else None
+    if title is not None and not isinstance(title, str):
+        raise HTTPException(400, "会话标题无效")
+    if archived is not None and not isinstance(archived, bool):
+        raise HTTPException(400, "归档状态无效")
+    if title is None and archived is None:
+        raise HTTPException(400, "没有需要修改的内容")
+    session = db.update_agent_session(uid, session_id, title=title, archived=archived)
+    if session is False:
+        raise HTTPException(400, "会话标题不能为空")
+    if not session:
+        raise HTTPException(404, "会话不存在")
+    return session
+
+
+@app.delete("/api/agent/sessions/{session_id}")
+async def delete_agent_session(session_id: int, request: Request):
+    uid = _auth(request)
+    if not db.delete_agent_session(uid, session_id):
+        raise HTTPException(404, "会话不存在")
+    return {"ok": True}
 
 
 @app.get("/api/agent/conversation")
 async def get_agent_conversation(request: Request):
-    """取当前 用户×章节 的持久化对话（切章/刷新后恢复上下文用）。"""
+    """Load the selected or active durable session for the current scope."""
     uid = _auth(request)
     cid = _qparam_int(request, "chapter_id")
-    conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
-    return {"messages": _pi_messages_for_frontend(conv["messages"]), "summary": conv["summary"]}
+    work_id = _qparam_int(request, "work_id")
+    session_id = _qparam_int(request, "session_id")
+    scope = db.resolve_agent_scope(uid, cid, work_id)
+    if not scope:
+        return {"messages": [], "summary": "", "session_id": None, "title": "新会话"}
+    conv = db.get_conversation(
+        uid, cid, session_id=session_id, work_id=scope["work_id"]
+    ) or {"messages": [], "summary": ""}
+    if session_id is not None and conv.get("scope_key") != scope["scope_key"]:
+        raise HTTPException(404, "会话不存在或不属于当前章节")
+    return {
+        "messages": _pi_messages_for_frontend(conv["messages"]),
+        "summary": conv["summary"],
+        "session_id": conv.get("id"),
+        "title": conv.get("title") or "新会话",
+        "has_summary": bool(conv.get("summary")),
+        "msg_count": conv.get("msg_count") or len(conv.get("messages") or []),
+    }
 
 
 @app.delete("/api/agent/conversation")
 async def delete_agent_conversation(request: Request):
-    """清空当前 用户×章节 的持久化对话（前端「清空」按钮用）。"""
+    """Backward-compatible removal of the selected or active session."""
     uid = _auth(request)
     cid = _qparam_int(request, "chapter_id")
-    db.delete_conversation(uid, cid)
+    work_id = _qparam_int(request, "work_id")
+    session_id = _qparam_int(request, "session_id")
+    db.delete_conversation(uid, cid, session_id=session_id, work_id=work_id)
     return {"ok": True}
 
 

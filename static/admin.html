@@ -137,13 +137,17 @@
       // 按占用字节倒序，最大的在最上方便于清理
       const sorted = list.slice().sort((a, b) => (b.bytes || 0) - (a.bytes || 0));
       box.innerHTML = head + `<table class="adm-tbl"><thead><tr>
-        <th>用户</th><th>章节</th><th>占用</th><th class="hide-sm">消息数</th><th class="hide-sm">摘要</th><th class="hide-sm">更新时间</th><th>操作</th>
+        <th>用户</th><th>章节</th><th>会话</th><th>占用</th><th class="hide-sm">消息数</th><th class="hide-sm">摘要</th><th class="hide-sm">更新时间</th><th>操作</th>
       </tr></thead><tbody>` + sorted.map(c => {
         const chap = c.chapter_id == null ? '<span class="muted">（无章节）</span>'
           : (c.chapter_title ? esc(c.chapter_title) : '<span class="muted">（已删除）</span>');
+        const state = c.archived_at
+          ? '<span class="tag">归档</span>'
+          : (c.is_active ? '<span class="tag on">当前</span>' : "");
         return `<tr>
           <td>${esc(c.username || ("#" + c.user_id))}</td>
           <td>${chap}</td>
+          <td>${esc(c.title || "新会话")} ${state}</td>
           <td>${fmtBytes(c.bytes)}</td>
           <td class="hide-sm">${c.msg_count || 0}</td>
           <td class="hide-sm">${c.has_summary ? '<span class="tag on">有</span>' : '<span class="muted">无</span>'}</td>

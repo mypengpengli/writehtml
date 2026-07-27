@@ -443,11 +443,103 @@ def _migration_creative_inspirations(conn):
     )
 
 
+def _conversation_title_from_messages(messages, fallback="旧会话"):
+    """Build a readable session title without spending another model call."""
+    if not isinstance(messages, list):
+        return fallback
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            content = " ".join(parts)
+        if not isinstance(content, str):
+            continue
+        title = " ".join(content.replace("[voice] 语音指令", "语音会话").split()).strip()
+        if title:
+            return title[:32] + ("…" if len(title) > 32 else "")
+    return fallback
+
+
+def _migration_agent_sessions(conn):
+    """Upgrade one-conversation-per-chapter storage to durable multi-session storage."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            work_id INTEGER,
+            chapter_id INTEGER,
+            scope_key TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '新会话',
+            messages TEXT NOT NULL DEFAULT '[]',
+            summary TEXT NOT NULL DEFAULT '',
+            msg_count INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            archived_at REAL,
+            last_model TEXT DEFAULT '',
+            legacy_conversation_id INTEGER UNIQUE,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(work_id) REFERENCES works(id),
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_scope
+            ON agent_sessions(user_id, scope_key, archived_at, updated_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_active_scope
+            ON agent_sessions(user_id, scope_key) WHERE is_active=1;
+        """
+    )
+    rows = conn.execute(
+        "SELECT ac.*, c.work_id AS chapter_work_id "
+        "FROM agent_conversations ac "
+        "LEFT JOIN chapters c ON c.id=ac.chapter_id "
+        "ORDER BY ac.updated_at DESC, ac.id DESC"
+    ).fetchall()
+    active_scopes = set()
+    for row in rows:
+        chapter_id = row["chapter_id"]
+        work_id = row["chapter_work_id"]
+        scope_key = f"chapter:{chapter_id}" if chapter_id is not None else "global"
+        scope = (row["user_id"], scope_key)
+        is_active = 0 if scope in active_scopes else 1
+        active_scopes.add(scope)
+        try:
+            messages = json.loads(row["messages"] or "[]")
+        except Exception:
+            messages = []
+        if not isinstance(messages, list):
+            messages = []
+        created_at = row["created_at"] or row["updated_at"] or time.time()
+        updated_at = row["updated_at"] or created_at
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_sessions("
+            "user_id,work_id,chapter_id,scope_key,title,messages,summary,msg_count,is_active,"
+            "legacy_conversation_id,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row["user_id"], work_id, chapter_id, scope_key,
+                _conversation_title_from_messages(messages),
+                json.dumps(messages, ensure_ascii=False), row["summary"] or "",
+                row["msg_count"] or len(messages), is_active, row["id"], created_at, updated_at,
+            ),
+        )
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
     (3, "model_presets", _migration_model_presets),
     (4, "creative_inspiration_library", _migration_creative_inspirations),
+    (5, "agent_multi_session", _migration_agent_sessions),
 )
 
 
@@ -819,66 +911,278 @@ def is_admin(user_id):
         return bool(r and r["is_admin"])
 
 
-# ---------- agent 对话持久化（按 用户 × 章节 存一行） ----------
+# ---------- agent 多会话持久化 ----------
 
-def get_conversation(user_id, chapter_id):
-    with get_conn() as conn:
-        if chapter_id is None:
-            r = conn.execute(
-                "SELECT messages, summary FROM agent_conversations WHERE user_id=? AND chapter_id IS NULL",
-                (user_id,)).fetchone()
-        else:
-            r = conn.execute(
-                "SELECT messages, summary FROM agent_conversations WHERE user_id=? AND chapter_id=?",
-                (user_id, chapter_id)).fetchone()
-        if not r:
+def _agent_scope(conn, user_id, chapter_id=None, work_id=None):
+    if chapter_id is not None:
+        row = conn.execute(
+            "SELECT c.id,c.work_id FROM chapters c JOIN works w ON w.id=c.work_id "
+            "WHERE c.id=? AND w.user_id=?",
+            (chapter_id, user_id),
+        ).fetchone()
+        if not row:
             return None
-        try:
-            msgs = json.loads(r["messages"] or "[]")
-        except Exception:
-            msgs = []
-        if not isinstance(msgs, list):
-            msgs = []
-        return {"messages": msgs, "summary": r["summary"] or ""}
+        return {
+            "scope_key": f"chapter:{chapter_id}",
+            "work_id": row["work_id"],
+            "chapter_id": chapter_id,
+        }
+    if work_id is not None:
+        if not _work_owned(conn, work_id, user_id):
+            return None
+        return {"scope_key": f"work:{work_id}", "work_id": work_id, "chapter_id": None}
+    return {"scope_key": "global", "work_id": None, "chapter_id": None}
 
 
-def save_conversation(user_id, chapter_id, messages, summary):
-    """upsert 一条对话。chapter_id 为 None 时走应用层查重（SQLite NULL 不唯一）。"""
-    now = time.time()
-    msgs_json = json.dumps(messages, ensure_ascii=False)
-    cnt = len(messages)
+def resolve_agent_scope(user_id, chapter_id=None, work_id=None):
     with get_conn() as conn:
-        if chapter_id is None:
-            row = conn.execute(
-                "SELECT id FROM agent_conversations WHERE user_id=? AND chapter_id IS NULL",
-                (user_id,)).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT id FROM agent_conversations WHERE user_id=? AND chapter_id=?",
-                (user_id, chapter_id)).fetchone()
-        if row:
+        return _agent_scope(conn, user_id, chapter_id, work_id)
+
+
+def _agent_session_dict(row, include_messages=False):
+    if not row:
+        return None
+    result = dict(row)
+    result["is_active"] = bool(result.get("is_active"))
+    result["archived"] = result.get("archived_at") is not None
+    result["has_summary"] = bool(result.get("summary"))
+    result["summary_preview"] = (result.get("summary") or "")[:180]
+    if include_messages:
+        try:
+            messages = json.loads(result.get("messages") or "[]")
+        except Exception:
+            messages = []
+        result["messages"] = messages if isinstance(messages, list) else []
+    else:
+        result.pop("messages", None)
+        result.pop("summary", None)
+    return result
+
+
+def list_agent_sessions(user_id, chapter_id=None, work_id=None, include_archived=True):
+    with get_conn() as conn:
+        scope = _agent_scope(conn, user_id, chapter_id, work_id)
+        if not scope:
+            return None
+        sql = (
+            "SELECT id,user_id,work_id,chapter_id,scope_key,title,msg_count,is_active,"
+            "archived_at,last_model,summary,created_at,updated_at "
+            "FROM agent_sessions WHERE user_id=? AND scope_key=?"
+        )
+        params = [user_id, scope["scope_key"]]
+        if not include_archived:
+            sql += " AND archived_at IS NULL"
+        sql += " ORDER BY is_active DESC, archived_at IS NOT NULL, updated_at DESC, id DESC"
+        return [_agent_session_dict(row) for row in conn.execute(sql, params)]
+
+
+def get_agent_session(user_id, session_id, include_messages=True):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM agent_sessions WHERE id=? AND user_id=?",
+            (session_id, user_id),
+        ).fetchone()
+        return _agent_session_dict(row, include_messages=include_messages)
+
+
+def _activate_latest_session(conn, user_id, scope_key):
+    row = conn.execute(
+        "SELECT id FROM agent_sessions WHERE user_id=? AND scope_key=? AND archived_at IS NULL "
+        "ORDER BY updated_at DESC,id DESC LIMIT 1",
+        (user_id, scope_key),
+    ).fetchone()
+    if row:
+        conn.execute("UPDATE agent_sessions SET is_active=1 WHERE id=?", (row["id"],))
+        return row["id"]
+    return None
+
+
+def create_agent_session(user_id, chapter_id=None, work_id=None, title="新会话"):
+    now = time.time()
+    with get_conn() as conn:
+        scope = _agent_scope(conn, user_id, chapter_id, work_id)
+        if not scope:
+            return None
+        conn.execute(
+            "UPDATE agent_sessions SET is_active=0 WHERE user_id=? AND scope_key=? AND is_active=1",
+            (user_id, scope["scope_key"]),
+        )
+        clean_title = " ".join((title or "新会话").split())[:48] or "新会话"
+        cur = conn.execute(
+            "INSERT INTO agent_sessions("
+            "user_id,work_id,chapter_id,scope_key,title,messages,summary,msg_count,is_active,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,'[]','',0,1,?,?)",
+            (
+                user_id, scope["work_id"], scope["chapter_id"], scope["scope_key"],
+                clean_title, now, now,
+            ),
+        )
+        return get_agent_session_from_conn(conn, user_id, cur.lastrowid, include_messages=True)
+
+
+def get_agent_session_from_conn(conn, user_id, session_id, include_messages=True):
+    row = conn.execute(
+        "SELECT * FROM agent_sessions WHERE id=? AND user_id=?",
+        (session_id, user_id),
+    ).fetchone()
+    return _agent_session_dict(row, include_messages=include_messages)
+
+
+def activate_agent_session(user_id, session_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id,scope_key,archived_at FROM agent_sessions WHERE id=? AND user_id=?",
+            (session_id, user_id),
+        ).fetchone()
+        if not row or row["archived_at"] is not None:
+            return None
+        conn.execute(
+            "UPDATE agent_sessions SET is_active=0 WHERE user_id=? AND scope_key=? AND is_active=1",
+            (user_id, row["scope_key"]),
+        )
+        conn.execute(
+            "UPDATE agent_sessions SET is_active=1,updated_at=? WHERE id=?",
+            (time.time(), session_id),
+        )
+        return get_agent_session_from_conn(conn, user_id, session_id, include_messages=False)
+
+
+def update_agent_session(user_id, session_id, *, title=None, archived=None):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id,scope_key,is_active,archived_at FROM agent_sessions WHERE id=? AND user_id=?",
+            (session_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        updates, params = [], []
+        if title is not None:
+            clean_title = " ".join(str(title).split())[:48]
+            if not clean_title:
+                return False
+            updates.append("title=?")
+            params.append(clean_title)
+        if archived is not None:
+            updates.append("archived_at=?")
+            params.append(time.time() if archived else None)
+            if archived:
+                updates.append("is_active=0")
+        updates.append("updated_at=?")
+        params.append(time.time())
+        params.append(session_id)
+        conn.execute(f"UPDATE agent_sessions SET {','.join(updates)} WHERE id=?", params)
+        if archived and row["is_active"]:
+            _activate_latest_session(conn, user_id, row["scope_key"])
+        if archived is False:
             conn.execute(
-                "UPDATE agent_conversations SET messages=?, summary=?, msg_count=?, updated_at=? WHERE id=?",
-                (msgs_json, summary, cnt, now, row["id"]))
-        else:
-            conn.execute(
-                "INSERT INTO agent_conversations(user_id, chapter_id, messages, summary, msg_count, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (user_id, chapter_id, msgs_json, summary, cnt, now, now))
+                "UPDATE agent_sessions SET is_active=0 WHERE user_id=? AND scope_key=? AND id!=?",
+                (user_id, row["scope_key"], session_id),
+            )
+            conn.execute("UPDATE agent_sessions SET is_active=1 WHERE id=?", (session_id,))
+        return get_agent_session_from_conn(conn, user_id, session_id, include_messages=False)
+
+
+def delete_agent_session(user_id, session_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT scope_key,is_active FROM agent_sessions WHERE id=? AND user_id=?",
+            (session_id, user_id),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM agent_sessions WHERE id=? AND user_id=?", (session_id, user_id))
+        if row["is_active"]:
+            _activate_latest_session(conn, user_id, row["scope_key"])
         return True
 
 
-def delete_conversation(user_id, chapter_id):
+def get_conversation(user_id, chapter_id, session_id=None, work_id=None):
     with get_conn() as conn:
-        if chapter_id is None:
-            cur = conn.execute(
-                "DELETE FROM agent_conversations WHERE user_id=? AND chapter_id IS NULL",
-                (user_id,))
+        if session_id is not None:
+            scope = _agent_scope(conn, user_id, chapter_id, work_id)
+            if not scope:
+                return None
+            row = conn.execute(
+                "SELECT * FROM agent_sessions WHERE id=? AND user_id=? AND scope_key=?",
+                (session_id, user_id, scope["scope_key"]),
+            ).fetchone()
         else:
-            cur = conn.execute(
-                "DELETE FROM agent_conversations WHERE user_id=? AND chapter_id=?",
-                (user_id, chapter_id))
-        return cur.rowcount > 0
+            scope = _agent_scope(conn, user_id, chapter_id, work_id)
+            if not scope:
+                return None
+            row = conn.execute(
+                "SELECT * FROM agent_sessions WHERE user_id=? AND scope_key=? "
+                "AND is_active=1 AND archived_at IS NULL LIMIT 1",
+                (user_id, scope["scope_key"]),
+            ).fetchone()
+        return _agent_session_dict(row, include_messages=True)
+
+
+def save_conversation(user_id, chapter_id, messages, summary, session_id=None, work_id=None,
+                      title_hint=None, model=None):
+    """Save one durable session; callers may retain the legacy chapter-only contract."""
+    now = time.time()
+    with get_conn() as conn:
+        row = None
+        if session_id is not None:
+            scope = _agent_scope(conn, user_id, chapter_id, work_id)
+            if not scope:
+                return None
+            row = conn.execute(
+                "SELECT * FROM agent_sessions "
+                "WHERE id=? AND user_id=? AND scope_key=? AND archived_at IS NULL",
+                (session_id, user_id, scope["scope_key"]),
+            ).fetchone()
+            if not row:
+                return None
+        else:
+            scope = _agent_scope(conn, user_id, chapter_id, work_id)
+            if not scope:
+                return None
+            row = conn.execute(
+                "SELECT * FROM agent_sessions WHERE user_id=? AND scope_key=? "
+                "AND is_active=1 AND archived_at IS NULL LIMIT 1",
+                (user_id, scope["scope_key"]),
+            ).fetchone()
+            if not row:
+                conn.execute(
+                    "UPDATE agent_sessions SET is_active=0 WHERE user_id=? AND scope_key=?",
+                    (user_id, scope["scope_key"]),
+                )
+                cur = conn.execute(
+                    "INSERT INTO agent_sessions("
+                    "user_id,work_id,chapter_id,scope_key,title,messages,summary,msg_count,is_active,"
+                    "last_model,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,'[]','',0,1,?,?,?)",
+                    (
+                        user_id, scope["work_id"], scope["chapter_id"], scope["scope_key"],
+                        _conversation_title_from_messages(
+                            [{"role": "user", "content": title_hint or ""}], "新会话"
+                        ),
+                        model or "", now, now,
+                    ),
+                )
+                row = conn.execute("SELECT * FROM agent_sessions WHERE id=?", (cur.lastrowid,)).fetchone()
+        title = row["title"]
+        if title == "新会话" and title_hint:
+            title = _conversation_title_from_messages(
+                [{"role": "user", "content": title_hint}], title
+            )
+        conn.execute(
+            "UPDATE agent_sessions SET messages=?,summary=?,msg_count=?,title=?,last_model=?,updated_at=? "
+            "WHERE id=?",
+            (
+                json.dumps(messages, ensure_ascii=False), summary or "", len(messages), title,
+                model or row["last_model"] or "", now, row["id"],
+            ),
+        )
+        return get_agent_session_from_conn(conn, user_id, row["id"], include_messages=True)
+
+
+def delete_conversation(user_id, chapter_id, session_id=None, work_id=None):
+    """Legacy clear endpoint now removes only the resolved active session."""
+    conv = get_conversation(user_id, chapter_id, session_id=session_id, work_id=work_id)
+    return bool(conv and delete_agent_session(user_id, conv["id"]))
 
 
 # ---------- 后台管理（admin）查询 ----------
@@ -903,7 +1207,7 @@ def admin_user_stats():
         conv = {r["user_id"]: (r["n"], r["bytes"]) for r in conn.execute(
             "SELECT user_id, COUNT(*) AS n, "
             "COALESCE(SUM(LENGTH(messages)+LENGTH(summary)),0) AS bytes "
-            "FROM agent_conversations GROUP BY user_id")}
+            "FROM agent_sessions GROUP BY user_id")}
         for u in users:
             uid = u["id"]
             c = conv.get(uid, (0, 0))
@@ -927,6 +1231,7 @@ def admin_delete_user(user_id):
         for cid in cids:
             conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM agent_sessions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
@@ -954,6 +1259,7 @@ def admin_delete_user(user_id):
         conn.execute("DELETE FROM inspiration_assets WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM creative_inspirations WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM works WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM agent_sessions WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM agent_conversations WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM user_settings WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -964,27 +1270,36 @@ def list_conversations_admin():
     """列出所有用户的对话，带用户名/章节标题/占用字节数（便于 admin 辨识后删除）。"""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT ac.id, ac.user_id, u.username, ac.chapter_id, "
-            "c.title AS chapter_title, ac.msg_count, "
-            "CASE WHEN ac.summary!='' THEN 1 ELSE 0 END AS has_summary, "
-            "LENGTH(ac.messages)+LENGTH(ac.summary) AS bytes, "
-            "ac.created_at, ac.updated_at "
-            "FROM agent_conversations ac "
-            "LEFT JOIN users u ON u.id=ac.user_id "
-            "LEFT JOIN chapters c ON c.id=ac.chapter_id "
-            "ORDER BY ac.updated_at DESC")
+            "SELECT s.id, s.user_id, u.username, s.work_id, s.chapter_id, s.title, "
+            "c.title AS chapter_title, s.msg_count, s.is_active, s.archived_at, "
+            "CASE WHEN s.summary!='' THEN 1 ELSE 0 END AS has_summary, "
+            "LENGTH(s.messages)+LENGTH(s.summary) AS bytes, "
+            "s.created_at, s.updated_at "
+            "FROM agent_sessions s "
+            "LEFT JOIN users u ON u.id=s.user_id "
+            "LEFT JOIN chapters c ON c.id=s.chapter_id "
+            "ORDER BY s.updated_at DESC")
         return [dict(r) for r in rows]
 
 
 def admin_delete_conversation(conv_id):
     with get_conn() as conn:
-        cur = conn.execute("DELETE FROM agent_conversations WHERE id=?", (conv_id,))
-        return cur.rowcount > 0
+        row = conn.execute(
+            "SELECT user_id,scope_key,is_active FROM agent_sessions WHERE id=?",
+            (conv_id,),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM agent_sessions WHERE id=?", (conv_id,))
+        if row["is_active"]:
+            _activate_latest_session(conn, row["user_id"], row["scope_key"])
+        return True
 
 
 def admin_clear_user_conversations(user_id):
     with get_conn() as conn:
-        cur = conn.execute("DELETE FROM agent_conversations WHERE user_id=?", (user_id,))
+        cur = conn.execute("DELETE FROM agent_sessions WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM agent_conversations WHERE user_id=?", (user_id,))
         return cur.rowcount
 
 
@@ -1126,6 +1441,7 @@ def delete_work(wid, user_id):
         for cid in cids:
             conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
+            conn.execute("DELETE FROM agent_sessions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
             conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
@@ -1143,6 +1459,7 @@ def delete_work(wid, user_id):
         conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE work_id=?)", (wid,))
         conn.execute("DELETE FROM agent_skills WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM agent_sessions WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM works WHERE id=?", (wid,))
         return True
 
@@ -2952,6 +3269,7 @@ def purge_chapter(cid, user_id):
             return False
         conn.execute("DELETE FROM segments WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapter_revisions WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM agent_sessions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM agent_conversations WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM entity_state_versions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM entity_state_proposals WHERE chapter_id=?", (cid,))
