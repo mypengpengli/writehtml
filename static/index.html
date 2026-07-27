@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ui-20260727-1">
+  <link rel="stylesheet" href="style.css?v=ui-20260727-2">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -93,11 +93,14 @@
             <button data-ic="download" data-label="整本 TXT" onclick="exportChap('work-txt');closeMoreMenu()"></button>
             <button data-ic="download" data-label="整本 DOCX" onclick="exportChap('work-docx');closeMoreMenu()"></button>
             <div class="menu-sep"></div>
+            <div class="menu-label">创作资料</div>
+            <button data-ic="bulb" data-label="灵感库" onclick="openInspirationLibrary();closeMoreMenu()"></button>
+            <button data-ic="sparkles" data-label="AI Skills" onclick="openSkills();closeMoreMenu()"></button>
+            <div class="menu-sep"></div>
             <div class="menu-label">作品与账户</div>
             <button data-ic="trash" data-label="回收站" onclick="openTrash();closeMoreMenu()"></button>
             <button data-ic="users" data-label="人物/设定" onclick="openWiki();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI 工具" onclick="openAITools();closeMoreMenu()"></button>
-            <button data-ic="sparkles" data-label="AI Skills" onclick="openSkills();closeMoreMenu()"></button>
             <button id="adminBtn" class="hidden" data-ic="shield" data-label="后台管理" onclick="openAdmin();closeMoreMenu()"></button>
             <button data-ic="settings" data-label="大模型设置" onclick="openSettings();closeMoreMenu()"></button>
             <button data-ic="logout" data-label="退出" onclick="doLogout();closeMoreMenu()"></button>
@@ -172,9 +175,11 @@
       <div class="chat-input-row">
         <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
+        <button class="ic" id="agentInspirationBtn" data-ic="paperclip" onclick="chooseInspirationFileFromAgent()" title="保存图片、音乐或视频灵感"></button>
         <button class="ic" id="agentMicBtn" data-ic="mic" onclick="toggleAgentMic()" title="语音输入"></button>
         <button id="sendBtn" onclick="sendAgent()">发送</button>
       </div>
+      <input id="inspirationQuickFile" class="hidden" type="file" accept="image/*,audio/*,video/*" onchange="openInspirationCapture(this.files?.[0] || null)">
     </aside>
 
     <div class="story-backdrop" onclick="closeStoryDrawer()"></div>
@@ -313,6 +318,60 @@
         </section>
       </div>
     </aside>
+  </div>
+
+  <!-- 多模态创意灵感库：独立全屏工作区，不挤压编辑器常驻布局 -->
+  <div id="inspirationWorkspace" class="inspiration-workspace hidden" role="dialog" aria-modal="true" aria-label="多模态创意灵感库">
+    <header class="inspiration-head">
+      <div class="inspiration-brand">
+        <span data-ic="bulb"></span>
+        <div><b>灵感库</b><small id="inspirationCount">正在读取</small></div>
+      </div>
+      <div class="inspiration-search">
+        <span data-ic="search"></span>
+        <input id="inspirationSearch" placeholder="搜对白、梗、情绪、场景或音乐…" oninput="scheduleInspirationSearch()">
+      </div>
+      <div class="inspiration-head-actions">
+        <button id="inspirationNewBtn" data-ic="plus" data-label="记录灵感" onclick="showInspirationCapture()"></button>
+        <button class="ic" data-ic="paperclip" onclick="chooseInspirationFileFromAgent()" title="上传图片、音乐或视频"></button>
+        <button class="ic" data-ic="x" onclick="closeInspirationLibrary()" title="关闭灵感库"></button>
+      </div>
+    </header>
+    <div class="inspiration-filters">
+      <div class="inspiration-segments" role="group" aria-label="灵感范围">
+        <button class="active" data-inspiration-scope="all" onclick="setInspirationScope('all')">全部</button>
+        <button data-inspiration-scope="global" onclick="setInspirationScope('global')">通用</button>
+        <button data-inspiration-scope="work" onclick="setInspirationScope('work')">本作品</button>
+      </div>
+      <label>类型
+        <select id="inspirationTypeFilter" onchange="loadInspirations()">
+          <option value="">全部素材</option>
+          <option value="text">文字</option>
+          <option value="voice_note">语音</option>
+          <option value="image">图片</option>
+          <option value="meme">梗图</option>
+          <option value="music">音乐</option>
+          <option value="audio">音频</option>
+          <option value="video">视频</option>
+          <option value="link">链接</option>
+        </select>
+      </label>
+      <label>状态
+        <select id="inspirationStatusFilter" onchange="loadInspirations()">
+          <option value="active">可用</option>
+          <option value="inbox">待整理</option>
+          <option value="available">已整理</option>
+          <option value="archived">已归档</option>
+        </select>
+      </label>
+      <label class="inspiration-favorite-filter"><input id="inspirationFavoriteFilter" type="checkbox" onchange="loadInspirations()"> 只看收藏</label>
+    </div>
+    <div class="inspiration-body">
+      <section class="inspiration-list-pane" aria-label="灵感列表">
+        <div id="inspirationList" class="inspiration-list"></div>
+      </section>
+      <main id="inspirationDetail" class="inspiration-detail" aria-live="polite"></main>
+    </div>
   </div>
 
   <!-- AI 改稿先预览，作者确认后才写入正文 -->
@@ -594,6 +653,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=ui-20260727-1"></script>
+  <script src="app.js?v=ui-20260727-2"></script>
 </body>
 </html>

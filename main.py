@@ -6,18 +6,20 @@ import base64
 import io
 import re
 import zipfile
-from urllib.parse import quote
+import time
+from urllib.parse import quote, unquote
 
 import yaml
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-import config, context_builder, db, llm, pi_agent, skill_runtime
+import config, context_builder, db, inspiration, llm, pi_agent, skill_runtime
 
 app = FastAPI(title="写作")
 db.init_db()
+inspiration.start_worker()
 
 
 @app.middleware("http")
@@ -217,6 +219,191 @@ async def switch_active_model(request: Request):
     if result.get("unknown_model"):
         raise HTTPException(400, "请先在大模型设置中添加该模型 ID")
     return {"ok": True, **result}
+
+
+# ---------- 多模态创意灵感库 ----------
+
+_asset_tickets = {}
+
+
+def _inspiration_error(exc):
+    if isinstance(exc, inspiration.InspirationError):
+        raise HTTPException(400, str(exc))
+    raise exc
+
+
+@app.get("/api/inspirations")
+async def list_inspirations(request: Request):
+    uid = _auth(request)
+    try:
+        favorite_raw = request.query_params.get("favorite")
+        favorite = None if favorite_raw in (None, "") else favorite_raw.lower() in {"1", "true", "yes"}
+        return inspiration.list_inspirations(
+            uid,
+            work_id=_qparam_int(request, "work_id"),
+            scope=request.query_params.get("scope") or "all",
+            status=request.query_params.get("status") or "active",
+            source_type=request.query_params.get("source_type") or None,
+            query=request.query_params.get("query") or "",
+            favorite=favorite,
+            page=_qparam_int(request, "page") or 1,
+            page_size=_qparam_int(request, "page_size") or 40,
+        )
+    except (ValueError, inspiration.InspirationError) as exc:
+        _inspiration_error(inspiration.InspirationError(str(exc)))
+
+
+@app.post("/api/inspirations/search")
+async def search_inspirations(request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "灵感搜索条件无效")
+    try:
+        return {"items": inspiration.search_inspirations(
+            uid,
+            body.get("query") or "",
+            work_id=body.get("work_id"),
+            include_global=body.get("include_global", True) is not False,
+            source_types=body.get("source_types"),
+            categories=body.get("categories"),
+            include_used=body.get("include_used", True) is not False,
+            limit=body.get("limit") or 10,
+        )}
+    except inspiration.InspirationError as exc:
+        _inspiration_error(exc)
+
+
+@app.post("/api/inspirations")
+async def create_inspiration(request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "灵感数据无效")
+    try:
+        item = inspiration.create_inspiration(
+            uid, body, current_work_id=body.get("current_work_id"),
+            queue=body.get("analyze", True) is not False,
+        )
+        return {"ok": True, "inspiration": item}
+    except inspiration.InspirationError as exc:
+        _inspiration_error(exc)
+
+
+@app.get("/api/inspirations/{inspiration_id}")
+async def get_inspiration(inspiration_id: int, request: Request):
+    item = inspiration.get_inspiration(inspiration_id, _auth(request))
+    if not item:
+        raise HTTPException(404, "灵感不存在")
+    return {"inspiration": item}
+
+
+@app.put("/api/inspirations/{inspiration_id}")
+async def update_inspiration(inspiration_id: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "灵感数据无效")
+    try:
+        item = inspiration.update_inspiration(inspiration_id, uid, body)
+    except inspiration.InspirationError as exc:
+        _inspiration_error(exc)
+    if not item:
+        raise HTTPException(404, "灵感不存在")
+    return {"ok": True, "inspiration": item}
+
+
+@app.delete("/api/inspirations/{inspiration_id}")
+async def delete_inspiration(inspiration_id: int, request: Request):
+    if not inspiration.delete_inspiration(inspiration_id, _auth(request)):
+        raise HTTPException(404, "灵感不存在")
+    return {"ok": True}
+
+
+@app.post("/api/inspirations/{inspiration_id}/analyze")
+async def analyze_inspiration(inspiration_id: int, request: Request):
+    uid = _auth(request)
+    job_id = inspiration.queue_analysis(inspiration_id, uid)
+    if not job_id:
+        raise HTTPException(404, "灵感不存在")
+    return {"ok": True, "job_id": job_id}
+
+
+@app.post("/api/inspirations/{inspiration_id}/assets")
+async def upload_inspiration_asset(inspiration_id: int, request: Request):
+    uid = _auth(request)
+    filename = unquote(request.headers.get("X-File-Name") or "素材")
+    requested_type = (request.headers.get("X-Asset-Type") or "").strip()
+    description = unquote(request.headers.get("X-Asset-Description") or "")
+    try:
+        asset = await inspiration.add_asset_stream(
+            uid, inspiration_id, filename, request.headers.get("content-type") or "",
+            requested_type, request.stream(), description,
+        )
+        inspiration.queue_analysis(inspiration_id, uid)
+        return {"ok": True, "asset": asset}
+    except inspiration.InspirationError as exc:
+        _inspiration_error(exc)
+
+
+@app.post("/api/inspirations/{inspiration_id}/usages")
+async def add_inspiration_usage(inspiration_id: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "灵感使用记录无效")
+    try:
+        result = inspiration.add_usage(
+            inspiration_id, uid, body,
+            current_work_id=body.get("current_work_id"),
+            current_chapter_id=body.get("current_chapter_id"),
+        )
+    except inspiration.InspirationError as exc:
+        _inspiration_error(exc)
+    if not result:
+        raise HTTPException(404, "灵感不存在")
+    return result
+
+
+@app.get("/api/inspiration-assets/{asset_id}/access")
+async def get_inspiration_asset_access(asset_id: int, request: Request):
+    uid = _auth(request)
+    asset = inspiration.get_asset(asset_id, uid)
+    if not asset or not asset.get("storage_path"):
+        raise HTTPException(404, "素材不存在")
+    now = time.time()
+    for ticket, record in list(_asset_tickets.items()):
+        if record["expires_at"] <= now:
+            _asset_tickets.pop(ticket, None)
+    while len(_asset_tickets) >= 2048:
+        _asset_tickets.pop(next(iter(_asset_tickets)))
+    ticket = secrets.token_urlsafe(24)
+    _asset_tickets[ticket] = {
+        "user_id": uid, "asset_id": asset_id, "expires_at": now + 300,
+    }
+    return {
+        "url": f"/api/inspiration-assets/{asset_id}/content?ticket={quote(ticket)}",
+        "expires_at": now + 300,
+    }
+
+
+@app.get("/api/inspiration-assets/{asset_id}/content")
+async def get_inspiration_asset_content(asset_id: int, request: Request):
+    ticket = request.query_params.get("ticket") or ""
+    record = _asset_tickets.get(ticket)
+    if not record or record["asset_id"] != asset_id or record["expires_at"] <= time.time():
+        _asset_tickets.pop(ticket, None)
+        raise HTTPException(403, "素材访问链接已失效")
+    file_info = inspiration.asset_file(asset_id, record["user_id"])
+    if not file_info:
+        raise HTTPException(404, "素材文件不存在")
+    asset, path = file_info
+    filename = quote(asset.get("original_name") or path.name)
+    return FileResponse(
+        path,
+        media_type=asset.get("mime_type") or "application/octet-stream",
+        headers={"Content-Disposition": f"inline; filename*=UTF-8''{filename}"},
+    )
 
 
 # ---------- 作品 ----------
@@ -1459,6 +1646,60 @@ AGENT_TOOLS = [
         "description": "查看当前回合会参考哪些人物状态、剧情状态、故事记忆和 Skill，以及各自被召回的原因。",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "save_inspiration",
+        "description": "把作者明确要求记住的梗、对白、画面、音乐联想、现实事件或其他候选创意真实保存到灵感库。必须保留作者原意；成功返回 id 后才能说已保存。当前回合是语音时会同时保存原始录音。",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string", "description": "简短可检索标题"},
+            "raw_text": {"type": "string", "description": "作者原始想法或对语音内容的忠实整理"},
+            "user_impression": {"type": "string", "description": "作者认为它适合哪里、为什么有意思"},
+            "source_type": {"type": "string", "enum": ["text","voice_note","image","meme","audio","music","video","link","quote","real_event","mixed"]},
+            "category": {"type": "string", "description": "general/comedy/plot/dialogue/character/emotion/visual/music/sound/camera/editing/worldbuilding/action/romance/horror/suspense/production"},
+            "scope": {"type": "string", "enum": ["global","work"], "description": "通用灵感用 global；只属于当前作品用 work"},
+            "source_url": {"type": "string", "description": "可选的原始网页、音乐或视频链接"},
+            "reuse_mode": {"type": "string", "enum": ["one_off","adaptable","running_gag","reference_only"]},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "mood_tags": {"type": "array", "items": {"type": "string"}},
+            "usage_tags": {"type": "array", "items": {"type": "string"}}},
+            "required": ["raw_text"]}}},
+    {"type": "function", "function": {
+        "name": "search_inspirations",
+        "description": "按当前创作需求搜索作者以前真实保存的候选灵感。结果只是候选素材，不是已经发生的剧情；匹配度低时不要强行使用。",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "当前需要的情绪、桥段、人物、笑点、画面或制作方向"},
+            "source_types": {"type": "array", "items": {"type": "string"}},
+            "categories": {"type": "array", "items": {"type": "string"}},
+            "include_used": {"type": "boolean", "description": "是否仍包含已经实际使用的一次性灵感，默认否"},
+            "limit": {"type": "integer", "description": "最多返回条数，默认 6"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "get_inspiration",
+        "description": "读取一条灵感的完整原始描述、AI 整理、素材和历史使用位置。",
+        "parameters": {"type": "object", "properties": {
+            "inspiration_id": {"type": "integer"}}, "required": ["inspiration_id"]}}},
+    {"type": "function", "function": {
+        "name": "update_inspiration",
+        "description": "修正灵感标题、原始描述、作者联想、标签、范围或归档状态。不能把灵感写进故事事实。",
+        "parameters": {"type": "object", "properties": {
+            "inspiration_id": {"type": "integer"},
+            "title": {"type": "string"},
+            "raw_text": {"type": "string"},
+            "user_impression": {"type": "string"},
+            "scope": {"type": "string", "enum": ["global","work"]},
+            "library_status": {"type": "string", "enum": ["inbox","available","archived","rejected"]},
+            "favorite": {"type": "boolean"},
+            "tags": {"type": "array", "items": {"type": "string"}}},
+            "required": ["inspiration_id"]}}},
+    {"type": "function", "function": {
+        "name": "mark_inspiration_used",
+        "description": "仅在灵感已被实际采用、预留或写入正文后记录使用位置；只推荐或生成候选时不要标记为已使用。",
+        "parameters": {"type": "object", "properties": {
+            "inspiration_id": {"type": "integer"},
+            "usage_type": {"type": "string", "enum": ["recommended","reserved","adapted","inserted","referenced","combined","rejected"]},
+            "usage_status": {"type": "string", "enum": ["suggested","accepted","applied","rejected","cancelled"]},
+            "adaptation_summary": {"type": "string"},
+            "applied_excerpt": {"type": "string"}},
+            "required": ["inspiration_id","usage_type","usage_status"]}}},
+    {"type": "function", "function": {
         "name": "activate_skill",
         "description": "按当前用户已安装 Skill 目录中的 id，加载一个与本次任务匹配的 Skill 完整规则。仅在用户明确提到某 Skill，或任务与其说明高度匹配时调用。",
         "parameters": {"type": "object", "properties": {
@@ -1908,7 +2149,10 @@ def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
         "3) 不要替作者下不可逆的决定；4) 通过写作工具改动正文后，系统会生成待作者确认的人物和剧情状态提议，"
         "未确认前不改变卡片；5) 故事记忆也必须先提议再确认，不能把推测当事实；"
         "6) 当用户问历史事实或要求保持连续性时，优先调用 search_story_memory 或 get_memory_source 核对；"
-        "7) 回答简洁，做完事说一句即可。"
+        "7) 作者明确说“记一下、存起来、以后用”时调用 save_inspiration，工具成功前不得声称已保存；"
+        "灵感是未来候选，不是故事事实。需要增强桥段、情绪、画面、笑点或漫剧制作时，可按需调用 "
+        "search_inspirations，匹配度低就不要硬塞；实际采用后再调用 mark_inspiration_used；"
+        "8) 回答简洁，做完事说一句即可。"
     ]
     if cid:
         c = db.get_chapter_meta(cid, uid)
@@ -2456,6 +2700,132 @@ def _tool_get_context_preview(uid, cid, cfg, args):
     }
 
 
+def _tool_save_inspiration(uid, cid, cfg, args):
+    raw_text = (args.get("raw_text") or "").strip()
+    if not raw_text:
+        return _agent_err("要保存的灵感内容不能为空")
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    payload = dict(args)
+    payload["title_locked"] = False
+    if payload.get("scope") == "work":
+        if not chapter:
+            return _agent_err("当前没有可关联的作品，请保存为通用灵感")
+        payload["work_id"] = chapter["work_id"]
+    turn_audio = cfg.get("turn_audio")
+    if turn_audio:
+        payload["source_type"] = "voice_note"
+    item = None
+    try:
+        item = inspiration.create_inspiration(
+            uid, payload, current_work_id=chapter["work_id"] if chapter else None, queue=False,
+        )
+        if turn_audio:
+            data = base64.b64decode(turn_audio["data"], validate=True)
+            ext = turn_audio.get("format") or "wav"
+            mime = "audio/mpeg" if ext == "mp3" else "audio/wav"
+            inspiration.add_asset_bytes(
+                uid, item["id"], data, f"voice-{item['id']}.{ext}", mime, "voice_note",
+                description=raw_text,
+            )
+        inspiration.queue_analysis(item["id"], uid)
+        return {
+            "changed": False,
+            "inspiration": {
+                "id": item["id"], "title": item["title"], "scope": item["scope"],
+                "source_type": payload.get("source_type") or "text",
+                "analysis_status": "pending",
+            },
+            "summary": f"已保存灵感 #{item['id']}「{item['title']}」，AI 正在后台整理",
+        }
+    except Exception as exc:
+        if item:
+            inspiration.delete_inspiration(item["id"], uid)
+        return _agent_err(f"灵感保存失败：{exc}")
+
+
+def _tool_search_inspirations(uid, cid, cfg, args):
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    try:
+        items = inspiration.search_inspirations(
+            uid, args.get("query") or "",
+            work_id=chapter["work_id"] if chapter else None,
+            include_global=True,
+            source_types=args.get("source_types"),
+            categories=args.get("categories"),
+            include_used=args.get("include_used", False) is True,
+            limit=args.get("limit") or 6,
+        )
+    except inspiration.InspirationError as exc:
+        return _agent_err(str(exc))
+    results = [{
+        "id": item["id"],
+        "title": item["title"],
+        "raw_text": item.get("raw_text") or "",
+        "user_impression": item.get("user_impression") or "",
+        "core_mechanism": item.get("core_mechanism") or "",
+        "creative_summary": item.get("creative_summary") or "",
+        "suitable_context": item.get("suitable_context") or "",
+        "source_type": item["source_type"],
+        "category": item["primary_category"],
+        "scope": item["scope"],
+        "reuse_mode": item["reuse_mode"],
+        "use_count": item["use_count"],
+        "tags": item.get("tags") or [],
+        "mood_tags": item.get("mood_tags") or [],
+    } for item in items]
+    return {
+        "changed": False, "inspirations": results,
+        "summary": f"找到 {len(results)} 条候选灵感；它们不是已发生剧情",
+    }
+
+
+def _tool_get_inspiration(uid, cid, cfg, args):
+    inspiration_id = args.get("inspiration_id")
+    if not isinstance(inspiration_id, int) or isinstance(inspiration_id, bool):
+        return _agent_err("灵感 id 无效")
+    item = inspiration.get_inspiration(inspiration_id, uid)
+    if not item:
+        return _agent_err("灵感不存在")
+    return {"changed": False, "inspiration": item, "summary": f"已读取灵感 #{inspiration_id}"}
+
+
+def _tool_update_inspiration(uid, cid, cfg, args):
+    inspiration_id = args.get("inspiration_id")
+    if not isinstance(inspiration_id, int) or isinstance(inspiration_id, bool):
+        return _agent_err("灵感 id 无效")
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    payload = {key: value for key, value in args.items() if key != "inspiration_id"}
+    if payload.get("scope") == "work":
+        if not chapter:
+            return _agent_err("当前没有可关联的作品")
+        payload["work_id"] = chapter["work_id"]
+    try:
+        item = inspiration.update_inspiration(inspiration_id, uid, payload)
+    except inspiration.InspirationError as exc:
+        return _agent_err(str(exc))
+    if not item:
+        return _agent_err("灵感不存在")
+    return {"changed": False, "inspiration": item, "summary": f"已更新灵感 #{inspiration_id}"}
+
+
+def _tool_mark_inspiration_used(uid, cid, cfg, args):
+    inspiration_id = args.get("inspiration_id")
+    if not isinstance(inspiration_id, int) or isinstance(inspiration_id, bool):
+        return _agent_err("灵感 id 无效")
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    try:
+        result = inspiration.add_usage(
+            inspiration_id, uid, args,
+            current_work_id=chapter["work_id"] if chapter else None,
+            current_chapter_id=cid if chapter else None,
+        )
+    except inspiration.InspirationError as exc:
+        return _agent_err(str(exc))
+    if not result:
+        return _agent_err("灵感不存在")
+    return {**result, "changed": False, "summary": f"已记录灵感 #{inspiration_id} 的实际使用位置"}
+
+
 _AGENT_TOOLS = {
     "read_chapter": _tool_read_chapter, "list_chapters": _tool_list_chapters,
     "activate_skill": _tool_activate_skill, "read_skill_resource": _tool_read_skill_resource,
@@ -2470,6 +2840,9 @@ _AGENT_TOOLS = {
     "analyze_chapter_memory": _tool_analyze_chapter_memory,
     "accept_memory_proposal": _tool_accept_memory_proposal, "reject_memory_proposal": _tool_reject_memory_proposal,
     "mark_chapter_memory_stale": _tool_mark_chapter_memory_stale, "get_context_preview": _tool_get_context_preview,
+    "save_inspiration": _tool_save_inspiration, "search_inspirations": _tool_search_inspirations,
+    "get_inspiration": _tool_get_inspiration, "update_inspiration": _tool_update_inspiration,
+    "mark_inspiration_used": _tool_mark_inspiration_used,
 }
 
 
@@ -2684,7 +3057,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
         raise HTTPException(500, "未配置 API Key，请在设置里填写 base_url / key / 模型")
     cfg = {
         "base_url": base_url, "api_key": api_key, "model": model, "active_skill_ids": set(),
-        "character_state_dirty": False,
+        "character_state_dirty": False, "turn_audio": audio,
     }
     conv = db.get_conversation(uid, cid) or {"messages": [], "summary": ""}
     summary = conv["summary"] or ""
@@ -2788,9 +3161,19 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
     model = st.get("llm_model") or config.LLM_MODEL
     if not api_key:
         raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
+    turn_audio = None
+    if isinstance(model_turn, dict) and isinstance(model_turn.get("content"), list):
+        for part in model_turn["content"]:
+            if not isinstance(part, dict) or part.get("type") != "input_audio":
+                continue
+            raw_audio = part.get("input_audio") or {}
+            data, format_ = raw_audio.get("data"), raw_audio.get("format")
+            if isinstance(data, str) and isinstance(format_, str):
+                turn_audio = {"data": data, "format": format_}
+                break
     cfg = {
         "base_url": base_url, "api_key": api_key, "model": model, "active_skill_ids": set(),
-        "character_state_dirty": False,
+        "character_state_dirty": False, "turn_audio": turn_audio,
     }
 
     # 加载持久化对话（服务端权威）。音频只进入本轮模型消息，不保存原始内容。
@@ -3140,6 +3523,7 @@ async def admin_delete_user(request: Request, target_uid: int):
         raise HTTPException(400, "不能删除管理员账号")
     if not db.admin_delete_user(target_uid):
         raise HTTPException(404, "用户不存在")
+    inspiration.delete_user_files(target_uid)
     return {"ok": True}
 
 

@@ -28,6 +28,11 @@ SQLite contracts intact while Pi remains free to use its native capabilities.
 application database; their private rule text is added for the current turn
 and is not persisted in chat history.
 
+The inspiration-library tools (`save_inspiration`, `search_inspirations`,
+`get_inspiration`, `update_inspiration`, and `mark_inspiration_used`) use the
+same bridge. Inspirations remain candidate creative material and never become
+story facts merely because Pi retrieved them.
+
 ## Local Launcher Lifecycle
 
 The optional meta-memory launcher is separate from Pi's native Skills. It runs
@@ -41,8 +46,9 @@ launcher lifecycle.
 Pi's public model contract represents text and images. For the existing
 direct-voice feature, the bridge provides an OpenAI-compatible `input_audio`
 adapter while retaining the same Pi Coding Agent session, native tools, and
-loaded resources. The raw audio payload is removed before the transcript is
-returned or stored.
+loaded resources. The raw audio payload is never stored in conversation
+history. It is copied to private inspiration storage only when Pi actually
+calls `save_inspiration` during that voice turn.
 
 ## Verification
 

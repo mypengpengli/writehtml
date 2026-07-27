@@ -51,6 +51,14 @@ let pendingEditReview = null;
 let pendingRevisionRestore = null;
 let pendingWorkRevisionRestore = null;
 let voiceTraceState = null;
+// 多模态创意灵感库
+let inspirationItems = [];
+let currentInspiration = null;
+let inspirationScope = "all";
+let inspirationSearchTimer = null;
+let pendingInspirationFile = null;
+let inspirationPreviewUrl = null;
+let inspirationPendingPolls = 0;
 
 /* ---------- 图标（内联 SVG，Lucide 风格 24×24 描边） ---------- */
 const _W = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
@@ -97,6 +105,13 @@ const ICONS = {
   branch:   `<svg ${_W}><line x1="6" y1="3" x2="6" y2="15"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M6 6a12 12 0 0 0 12 0"/></svg>`,
   alert:    `<svg ${_W}><path d="M10.3 3.8 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
   check:    `<svg ${_W}><polyline points="20 6 9 17 4 12"/></svg>`,
+  bulb:     `<svg ${_W}><path d="M9 18h6"/><path d="M10 22h4"/><path d="M8.4 14.5A7 7 0 1 1 15.6 14.5C14.6 15.2 14 16.4 14 18h-4c0-1.6-.6-2.8-1.6-3.5z"/></svg>`,
+  paperclip:`<svg ${_W}><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7l-9.6 9.6a2 2 0 0 1-2.8-2.8l8.9-8.9"/></svg>`,
+  star:     `<svg ${_W}><polygon points="12 2 15.1 8.3 22 9.3 17 14.1 18.2 21 12 17.7 5.8 21 7 14.1 2 9.3 8.9 8.3 12 2"/></svg>`,
+  archive:  `<svg ${_W}><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v12h14V8"/><path d="M10 12h4"/></svg>`,
+  image:    `<svg ${_W}><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>`,
+  music:    `<svg ${_W}><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>`,
+  film:     `<svg ${_W}><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 4v16M17 4v16M2 9h5M17 9h5M2 15h5M17 15h5"/></svg>`,
 };
 function svg(n) { return ICONS[n] || ""; }
 // 把图标注入 [data-ic] 元素；data-label 存在则图标后跟文字（移动端更易用）
@@ -147,7 +162,13 @@ function closeAsk(ok) {
   $("askOverlay").classList.add("hidden");
   const fn = _askResolve; _askResolve = null; fn(r);
 }
-document.addEventListener("keydown", e => { if (e.key === "Escape" && _askResolve) closeAsk(false); });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && _askResolve) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    closeAsk(false);
+  }
+});
 // 忙碌态：el 加 .is-busy（CSS 变灰+禁点）；带文字的按钮顺带塞个转圈
 function busy(el, on, text) {
   if (!el) return;
@@ -203,6 +224,7 @@ function appendText(t) {
 /* ---------- 登录 / 注册 ---------- */
 
 function showLogin() {
+  if (!$("inspirationWorkspace")?.classList.contains("hidden")) closeInspirationLibrary();
   $("app").classList.add("hidden");
   $("reader")?.classList.add("hidden");
   $("login").classList.remove("hidden");
@@ -2780,6 +2802,535 @@ function readerToggleTTS() {
   speechSynthesis.speak(u); ttsPlaying = true; setReaderTts(true);
 }
 
+/* ---------- 多模态创意灵感库 ---------- */
+
+const inspirationTypeLabels = {
+  text: "文字", voice_note: "语音", image: "图片", meme: "梗图", audio: "音频",
+  music: "音乐", video: "视频", link: "链接", quote: "对白", real_event: "现实事件", mixed: "混合",
+};
+const inspirationCategoryLabels = {
+  general: "一般", comedy: "搞笑", plot: "剧情", dialogue: "对白", character: "人物",
+  emotion: "情绪", visual: "画面", music: "音乐", sound: "音效", camera: "运镜",
+  editing: "剪辑", worldbuilding: "世界观", action: "动作", romance: "感情",
+  horror: "恐怖", suspense: "悬疑", production: "制作参考",
+};
+const inspirationStatusLabels = {
+  inbox: "待整理", available: "可用", archived: "已归档", rejected: "已拒绝",
+};
+const inspirationAnalysisLabels = {
+  pending: "整理中", completed: "已整理", failed: "整理失败",
+};
+
+function inspirationIcon(type) {
+  if (type === "image" || type === "meme") return "image";
+  if (type === "music" || type === "audio" || type === "voice_note") return "music";
+  if (type === "video") return "film";
+  return "bulb";
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function formatInspirationTime(value) {
+  if (!value) return "";
+  const date = new Date(Number(value) * 1000);
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", {
+    month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+async function openInspirationLibrary() {
+  $("inspirationWorkspace").classList.remove("hidden");
+  document.body.classList.add("inspiration-open");
+  syncInspirationScopeControls();
+  currentInspiration = null;
+  $("inspirationDetail").innerHTML = `
+    <div class="inspiration-empty-detail">
+      ${svg("bulb")}<b>未选择灵感</b>
+      <span>从列表选择一条，或新建记录。</span>
+    </div>`;
+  await loadInspirations();
+}
+
+function syncInspirationScopeControls() {
+  if (!currentWorkId && inspirationScope === "work") inspirationScope = "all";
+  document.querySelectorAll("[data-inspiration-scope]").forEach(button => {
+    button.classList.toggle("active", button.dataset.inspirationScope === inspirationScope);
+    if (button.dataset.inspirationScope === "work") button.disabled = !currentWorkId;
+  });
+}
+
+function closeInspirationLibrary() {
+  $("inspirationWorkspace").classList.add("hidden");
+  $("inspirationWorkspace").classList.remove("detail-open");
+  document.body.classList.remove("inspiration-open");
+  pendingInspirationFile = null;
+  if (inspirationPreviewUrl) URL.revokeObjectURL(inspirationPreviewUrl);
+  inspirationPreviewUrl = null;
+  const input = $("inspirationQuickFile");
+  if (input) input.value = "";
+}
+
+function chooseInspirationFileFromAgent() {
+  $("inspirationQuickFile").click();
+}
+
+async function openInspirationCapture(file) {
+  pendingInspirationFile = file || null;
+  const input = $("inspirationQuickFile");
+  if (input) input.value = "";
+  if ($("inspirationWorkspace").classList.contains("hidden")) await openInspirationLibrary();
+  showInspirationCapture();
+}
+
+function showInspirationCapture(item = null) {
+  currentInspiration = item;
+  $("inspirationWorkspace").classList.add("detail-open");
+  if (inspirationPreviewUrl) URL.revokeObjectURL(inspirationPreviewUrl);
+  inspirationPreviewUrl = pendingInspirationFile ? URL.createObjectURL(pendingInspirationFile) : null;
+  const file = pendingInspirationFile;
+  const inferredType = file?.type?.startsWith("image/") ? "image"
+    : file?.type?.startsWith("audio/") ? "music"
+    : file?.type?.startsWith("video/") ? "video" : (item?.source_type || "text");
+  const scope = item?.scope || (currentWorkId ? "work" : "global");
+  const categories = Object.entries(inspirationCategoryLabels).map(([value, label]) =>
+    `<option value="${value}" ${(item?.primary_category || "general") === value ? "selected" : ""}>${label}</option>`
+  ).join("");
+  const sourceTypes = Object.entries(inspirationTypeLabels).map(([value, label]) =>
+    `<option value="${value}" ${inferredType === value ? "selected" : ""}>${label}</option>`
+  ).join("");
+  const mediaPreview = inspirationPreviewUrl && file?.type?.startsWith("image/")
+    ? `<div class="inspiration-capture-preview"><img src="${esc(inspirationPreviewUrl)}" alt="待保存图片预览"></div>`
+    : inspirationPreviewUrl && file?.type?.startsWith("audio/")
+      ? `<div class="inspiration-capture-preview audio"><audio controls preload="metadata" src="${esc(inspirationPreviewUrl)}"></audio></div>`
+      : inspirationPreviewUrl && file?.type?.startsWith("video/")
+        ? `<div class="inspiration-capture-preview"><video controls preload="metadata" src="${esc(inspirationPreviewUrl)}"></video></div>`
+        : "";
+  const filePreview = file ? `
+    <div class="inspiration-file-ready">
+      <span class="inspiration-file-icon">${svg(inspirationIcon(inferredType))}</span>
+      <span><b>${esc(file.name)}</b><small>${formatBytes(file.size)} · 原始文件会完整保存</small></span>
+      <button class="ic" data-ic="x" onclick="clearPendingInspirationFile()" title="移除素材"></button>
+    </div>${mediaPreview}` : "";
+  $("inspirationDetail").innerHTML = `
+    <div class="inspiration-detail-head">
+      <button class="ic inspiration-mobile-back" data-ic="chevL" onclick="closeInspirationDetail()" title="返回列表"></button>
+      <div><span class="detail-eyebrow">${item ? "编辑灵感" : "快速记录"}</span><h2>${item ? esc(item.title) : "新灵感"}</h2></div>
+      <button class="ic" data-ic="x" onclick="${item ? `selectInspiration(${item.id})` : "closeInspirationDetail()"}" title="取消"></button>
+    </div>
+    <form class="inspiration-capture" onsubmit="event.preventDefault();saveInspirationCapture()">
+      ${filePreview}
+      <div class="inspiration-form-row">
+        <label>范围
+          <select id="inspirationFormScope">
+            <option value="global" ${scope === "global" ? "selected" : ""}>所有作品通用</option>
+            <option value="work" ${scope === "work" ? "selected" : ""} ${currentWorkId ? "" : "disabled"}>当前作品</option>
+          </select>
+        </label>
+        <label>素材类型<select id="inspirationFormType">${sourceTypes}</select></label>
+        <label>主要分类<select id="inspirationFormCategory">${categories}</select></label>
+      </div>
+      <label>标题 <span>可以留空，让 AI 整理</span>
+        <input id="inspirationFormTitle" maxlength="160" value="${esc(item?.title || "")}" placeholder="例如：一本正经地掩饰破防">
+      </label>
+      <label>原始想法 <span>这里永远保留，不会被 AI 摘要覆盖</span>
+        <textarea id="inspirationFormRaw" rows="5" maxlength="30000" placeholder="刚想到的梗、对白、场景、现实事件……">${esc(item?.raw_text || "")}</textarea>
+      </label>
+      <label>我的联想 <span>它为什么有意思，适合用在哪里</span>
+        <textarea id="inspirationFormImpression" rows="3" maxlength="12000" placeholder="例如：适合反派嘴硬时，先拍脸再切到捏碎的杯子">${esc(item?.user_impression || "")}</textarea>
+      </label>
+      <label>原始链接
+        <input id="inspirationFormUrl" maxlength="4000" value="${esc(item?.assets?.find(a => a.source_url)?.source_url || "")}" placeholder="网页、音乐或视频链接（可选）">
+      </label>
+      <div class="inspiration-form-row compact">
+        <label>复用方式
+          <select id="inspirationFormReuse">
+            <option value="adaptable" ${(item?.reuse_mode || "adaptable") === "adaptable" ? "selected" : ""}>可改编复用</option>
+            <option value="one_off" ${item?.reuse_mode === "one_off" ? "selected" : ""}>一次性桥段</option>
+            <option value="running_gag" ${item?.reuse_mode === "running_gag" ? "selected" : ""}>反复梗</option>
+            <option value="reference_only" ${item?.reuse_mode === "reference_only" ? "selected" : ""}>只作参考</option>
+          </select>
+        </label>
+        <label class="grow">标签
+          <input id="inspirationFormTags" value="${esc((item?.tags || []).join("，"))}" placeholder="搞笑，反转，雨夜">
+        </label>
+      </div>
+      <div class="inspiration-save-bar">
+        <span id="inspirationFormMsg" class="msg"></span>
+        <button type="submit" id="inspirationSaveBtn">${item ? "保存修改" : "保存灵感"}</button>
+      </div>
+    </form>`;
+  applyIcons();
+  setTimeout(() => $("inspirationFormRaw")?.focus(), 30);
+}
+
+function clearPendingInspirationFile() {
+  pendingInspirationFile = null;
+  showInspirationCapture(currentInspiration);
+}
+
+async function uploadInspirationFile(inspirationId, file, description) {
+  const type = file.type.startsWith("image/") ? "image"
+    : file.type.startsWith("audio/") ? "music"
+    : file.type.startsWith("video/") ? "video" : "";
+  const res = await fetch(`/api/inspirations/${inspirationId}/assets`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + token,
+      "Content-Type": file.type || "application/octet-stream",
+      "X-File-Name": encodeURIComponent(file.name),
+      "X-Asset-Type": type,
+      "X-Asset-Description": encodeURIComponent((description || "").slice(0, 3000)),
+    },
+    body: file,
+  });
+  if (res.status === 401) { showLogin(); throw new Error("未登录"); }
+  if (!res.ok) throw new Error(await responseError(res));
+  return res.json();
+}
+
+async function saveInspirationCapture() {
+  if ($("inspirationSaveBtn")?.classList.contains("is-busy")) return;
+  const raw = $("inspirationFormRaw").value.trim();
+  const impression = $("inspirationFormImpression").value.trim();
+  const sourceUrl = $("inspirationFormUrl").value.trim();
+  if (!raw && !impression && !sourceUrl && !pendingInspirationFile) {
+    $("inspirationFormMsg").textContent = "请写一句想法，或选择一个素材";
+    return;
+  }
+  const scope = $("inspirationFormScope").value;
+  if (scope === "work" && !currentWorkId) {
+    $("inspirationFormMsg").textContent = "当前没有可关联的作品";
+    return;
+  }
+  const button = $("inspirationSaveBtn");
+  const wasEditing = Boolean(currentInspiration);
+  busy(button, true, currentInspiration ? "保存中" : "正在保存");
+  $("inspirationFormMsg").textContent = "";
+  const body = {
+    title: $("inspirationFormTitle").value.trim(),
+    title_locked: Boolean($("inspirationFormTitle").value.trim()),
+    raw_text: raw,
+    user_impression: impression,
+    source_url: sourceUrl,
+    source_type: $("inspirationFormType").value,
+    primary_category: $("inspirationFormCategory").value,
+    scope,
+    work_id: scope === "work" ? currentWorkId : null,
+    reuse_mode: $("inspirationFormReuse").value,
+    tags: $("inspirationFormTags").value,
+    analyze: !pendingInspirationFile,
+  };
+  let createdInThisAttempt = false;
+  try {
+    let item;
+    if (wasEditing) {
+      item = (await api(`/api/inspirations/${currentInspiration.id}`, { method: "PUT", body })).inspiration;
+    } else {
+      item = (await api("/api/inspirations", { body })).inspiration;
+      currentInspiration = item;
+      createdInThisAttempt = true;
+    }
+    if (pendingInspirationFile) {
+      await uploadInspirationFile(item.id, pendingInspirationFile, impression || raw);
+      pendingInspirationFile = null;
+      if (inspirationPreviewUrl) URL.revokeObjectURL(inspirationPreviewUrl);
+      inspirationPreviewUrl = null;
+    } else if (wasEditing) {
+      await api(`/api/inspirations/${item.id}/analyze`, { body: {} });
+    }
+    showToast("灵感已保存，AI 正在整理", "ok");
+    await loadInspirations(item.id);
+    await selectInspiration(item.id);
+  } catch (e) {
+    if (createdInThisAttempt && pendingInspirationFile) {
+      $("inspirationFormMsg").textContent = `文字已保存，素材上传失败：${e.message}。可直接再次保存重试。`;
+      try { await api(`/api/inspirations/${currentInspiration.id}/analyze`, { body: {} }); } catch (_) {}
+      await loadInspirations(currentInspiration?.id);
+    } else {
+      $("inspirationFormMsg").textContent = e.message;
+    }
+  } finally {
+    busy(button, false, currentInspiration ? "保存修改" : "保存灵感");
+  }
+}
+
+function setInspirationScope(scope) {
+  if (scope === "work" && !currentWorkId) {
+    showToast("当前没有作品，只能查看通用灵感", "err");
+    return;
+  }
+  inspirationScope = scope;
+  syncInspirationScopeControls();
+  loadInspirations();
+}
+
+function scheduleInspirationSearch() {
+  clearTimeout(inspirationSearchTimer);
+  inspirationSearchTimer = setTimeout(loadInspirations, 260);
+}
+
+async function loadInspirations(selectId = null) {
+  const host = $("inspirationList");
+  if (!host || $("inspirationWorkspace").classList.contains("hidden")) return;
+  host.innerHTML = `<div class="inspiration-loading"><span class="spinner"></span> 正在读取灵感</div>`;
+  const params = new URLSearchParams({
+    scope: inspirationScope,
+    status: $("inspirationStatusFilter").value,
+    query: $("inspirationSearch").value.trim(),
+    page_size: "80",
+  });
+  if (currentWorkId) params.set("work_id", currentWorkId);
+  const type = $("inspirationTypeFilter").value;
+  if (type) params.set("source_type", type);
+  if ($("inspirationFavoriteFilter").checked) params.set("favorite", "1");
+  try {
+    const result = await api(`/api/inspirations?${params}`, { method: "GET" });
+    inspirationItems = result.items || [];
+    $("inspirationCount").textContent = result.total
+      ? `${result.total} 条 · 原始素材与作者联想永久保留`
+      : "还没有符合条件的灵感";
+    renderInspirationList();
+    if (selectId && inspirationItems.some(item => item.id === selectId)) {
+      document.querySelector(`[data-inspiration-id="${selectId}"]`)?.classList.add("active");
+    }
+  } catch (e) {
+    host.innerHTML = `<div class="inspiration-empty"><b>读取失败</b><span>${esc(e.message)}</span></div>`;
+  }
+}
+
+function renderInspirationList() {
+  const host = $("inspirationList");
+  if (!inspirationItems.length) {
+    host.innerHTML = `
+      <div class="inspiration-empty">
+        ${svg("bulb")}<b>当前范围内没有灵感</b>
+        <span>可以新建记录或上传素材。</span>
+        <button onclick="showInspirationCapture()">${svg("plus")} 记录第一条</button>
+      </div>`;
+    return;
+  }
+  host.innerHTML = inspirationItems.map(item => `
+    <button class="inspiration-row ${currentInspiration?.id === item.id ? "active" : ""}"
+            data-inspiration-id="${item.id}" onclick="selectInspiration(${item.id})">
+      <span class="inspiration-row-icon">${svg(inspirationIcon(item.source_type))}</span>
+      <span class="inspiration-row-copy">
+        <span class="inspiration-row-title">${item.favorite ? svg("star") : ""}<b>${esc(item.title || "未命名灵感")}</b></span>
+        <span class="inspiration-row-text">${esc(item.creative_summary || item.user_impression || item.raw_text || "原始素材已保存")}</span>
+        <span class="inspiration-row-meta">
+          ${esc(inspirationTypeLabels[item.source_type] || "灵感")}
+          · ${item.scope === "work" ? esc(item.work_title || "本作品") : "通用"}
+          · ${esc(inspirationAnalysisLabels[item.analysis_status] || inspirationStatusLabels[item.library_status] || "")}
+          ${item.use_count ? ` · 已用 ${item.use_count} 次` : ""}
+        </span>
+      </span>
+      <span class="inspiration-row-time">${formatInspirationTime(item.updated_at)}</span>
+    </button>`).join("");
+}
+
+function closeInspirationDetail() {
+  $("inspirationWorkspace").classList.remove("detail-open");
+}
+
+async function selectInspiration(id, fromPoll = false) {
+  if (!fromPoll) inspirationPendingPolls = 0;
+  $("inspirationWorkspace").classList.add("detail-open");
+  $("inspirationDetail").innerHTML = `<div class="inspiration-loading"><span class="spinner"></span> 正在读取详情</div>`;
+  try {
+    currentInspiration = (await api(`/api/inspirations/${id}`, { method: "GET" })).inspiration;
+    renderInspirationList();
+    renderInspirationDetail(currentInspiration);
+    if (currentInspiration.analysis_status === "pending" && inspirationPendingPolls < 20) {
+      inspirationPendingPolls += 1;
+      setTimeout(async () => {
+        if (!$("inspirationWorkspace").classList.contains("hidden") && currentInspiration?.id === id) {
+          await selectInspiration(id, true);
+          await loadInspirations(id);
+        }
+      }, 2600);
+    }
+  } catch (e) {
+    $("inspirationDetail").innerHTML = `<div class="inspiration-empty"><b>读取失败</b><span>${esc(e.message)}</span></div>`;
+  }
+}
+
+function inspirationTags(item) {
+  return [...(item.tags || []), ...(item.mood_tags || []), ...(item.usage_tags || [])]
+    .filter((value, index, all) => value && all.indexOf(value) === index);
+}
+
+function detailTextBlock(label, value) {
+  return value ? `<section class="inspiration-detail-section"><h3>${label}</h3><p>${esc(value)}</p></section>` : "";
+}
+
+function renderInspirationDetail(item) {
+  const tags = inspirationTags(item);
+  const assets = item.assets || [];
+  const usage = item.usages || [];
+  const analysisNote = item.analysis_status === "failed"
+    ? (item.analysis_error || "可稍后重试")
+    : item.analysis_status === "pending"
+      ? "原始内容已经安全保存，整理不会影响它"
+      : ["audio", "music", "voice_note", "video"].includes(item.source_type)
+        ? "当前依据作者描述、文件名和链接整理，原始素材保持不变"
+        : "AI 分析是辅助信息，可以随时编辑";
+  $("inspirationDetail").innerHTML = `
+    <div class="inspiration-detail-head">
+      <button class="ic inspiration-mobile-back" data-ic="chevL" onclick="closeInspirationDetail()" title="返回列表"></button>
+      <div>
+        <span class="detail-eyebrow">${esc(inspirationTypeLabels[item.source_type] || "灵感")} · ${item.scope === "work" ? esc(item.work_title || "本作品") : "所有作品通用"}</span>
+        <h2>${esc(item.title || "未命名灵感")}</h2>
+      </div>
+      <div class="inspiration-detail-actions">
+        <button class="ic ${item.favorite ? "active" : ""}" data-ic="star" onclick="toggleInspirationFavorite()" title="${item.favorite ? "取消收藏" : "收藏"}"></button>
+        <button class="ic" data-ic="pen" onclick="editCurrentInspiration()" title="编辑"></button>
+        <button class="ic" data-ic="more" onclick="toggleInspirationActions(event)" title="更多"></button>
+        <div id="inspirationActions" class="inspiration-action-menu hidden">
+          <button onclick="reanalyzeCurrentInspiration()">${svg("sparkles")} AI 重新整理</button>
+          <button onclick="archiveCurrentInspiration()">${svg("archive")} ${item.library_status === "archived" ? "恢复为可用" : "归档"}</button>
+          <button class="danger-link" onclick="deleteCurrentInspiration()">${svg("trash")} 删除灵感</button>
+        </div>
+      </div>
+    </div>
+    <div class="inspiration-detail-scroll">
+      <div class="inspiration-status-strip ${item.analysis_status}">
+        <span>${item.analysis_status === "pending" ? '<span class="spinner"></span>' : svg(item.analysis_status === "completed" ? "check" : "alert")}</span>
+        <div><b>${esc(inspirationAnalysisLabels[item.analysis_status] || "已保存")}</b>
+        <small>${esc(analysisNote)}</small></div>
+      </div>
+      ${assets.length ? `<section class="inspiration-detail-section"><h3>原始素材</h3><div id="inspirationAssets" class="inspiration-assets">
+        ${assets.map(asset => `<div id="inspirationAsset-${asset.id}" class="inspiration-asset"><span class="spinner"></span> 正在准备 ${esc(asset.original_name || "素材")}</div>`).join("")}
+      </div></section>` : ""}
+      ${detailTextBlock("作者原话", item.raw_text)}
+      ${detailTextBlock("我的联想", item.user_impression)}
+      ${item.creative_summary || item.core_mechanism || item.suitable_context ? `
+        <section class="inspiration-analysis-grid">
+          ${item.creative_summary ? `<div><h3>AI 整理</h3><p>${esc(item.creative_summary)}</p></div>` : ""}
+          ${item.core_mechanism ? `<div><h3>核心机制</h3><p>${esc(item.core_mechanism)}</p></div>` : ""}
+          ${item.suitable_context ? `<div><h3>适用场景</h3><p>${esc(item.suitable_context)}</p></div>` : ""}
+          ${item.adaptation_notes ? `<div><h3>写作改编</h3><p>${esc(item.adaptation_notes)}</p></div>` : ""}
+          ${item.production_notes ? `<div><h3>漫剧与制作</h3><p>${esc(item.production_notes)}</p></div>` : ""}
+        </section>` : ""}
+      ${tags.length ? `<section class="inspiration-detail-section"><h3>标签</h3><div class="inspiration-tags">${tags.map(tag => `<span>${esc(tag)}</span>`).join("")}</div></section>` : ""}
+      <section class="inspiration-use-section">
+        <div class="inspiration-section-head"><div><h3>使用记录</h3><small>${usage.length ? `已记录 ${usage.length} 次` : "实际采用后再记录，推荐不算使用"}</small></div>
+          ${currentChapterId ? `<button onclick="markCurrentInspirationUsed()">${svg("check")} 标记用于本章</button>` : ""}
+        </div>
+        <div class="inspiration-usage-list">
+          ${usage.length ? usage.map(record => `
+            <div><b>${record.chapter_ord ? `第${record.chapter_ord}章 ` : ""}${esc(record.chapter_title || record.work_title || "其他创作")}</b>
+            <span>${esc(record.adaptation_summary || record.usage_type || "已使用")}</span>
+            <small>${formatInspirationTime(record.created_at)}</small></div>`).join("") : '<div class="inspiration-muted">尚未使用</div>'}
+        </div>
+      </section>
+    </div>`;
+  applyIcons();
+  hydrateInspirationAssets(assets);
+}
+
+async function hydrateInspirationAssets(assets) {
+  for (const asset of assets) {
+    const host = $(`inspirationAsset-${asset.id}`);
+    if (!host) continue;
+    if (asset.source_url) {
+      host.innerHTML = `<a href="${esc(asset.source_url)}" target="_blank" rel="noopener noreferrer">${svg("paperclip")}<span><b>${esc(asset.original_name || "打开原始链接")}</b><small>${esc(asset.source_url)}</small></span></a>`;
+      continue;
+    }
+    if (!asset.file_size) {
+      host.innerHTML = `<span>${svg(inspirationIcon(asset.asset_type))}</span><span><b>${esc(asset.original_name || "素材")}</b><small>原始文件不可用</small></span>`;
+      continue;
+    }
+    try {
+      const access = await api(`/api/inspiration-assets/${asset.id}/access`, { method: "GET" });
+      const caption = `<div class="inspiration-asset-caption"><b>${esc(asset.original_name || "素材")}</b><small>${formatBytes(asset.file_size)} · ${esc(asset.copyright_status === "unknown" ? "仅作创作参考" : asset.copyright_status)}</small></div>`;
+      if ((asset.mime_type || "").startsWith("image/")) {
+        host.innerHTML = `<img src="${esc(access.url)}" alt="${esc(asset.original_name || "灵感图片")}">${caption}`;
+      } else if ((asset.mime_type || "").startsWith("audio/")) {
+        host.innerHTML = `${caption}<audio controls preload="metadata" src="${esc(access.url)}"></audio>`;
+      } else if ((asset.mime_type || "").startsWith("video/")) {
+        host.innerHTML = `<video controls preload="metadata" src="${esc(access.url)}"></video>${caption}`;
+      }
+    } catch (e) {
+      host.innerHTML = `<span>${svg("alert")}</span><span><b>${esc(asset.original_name || "素材")}</b><small>${esc(e.message)}</small></span>`;
+    }
+  }
+}
+
+function editCurrentInspiration() {
+  pendingInspirationFile = null;
+  if (currentInspiration) showInspirationCapture(currentInspiration);
+}
+
+function toggleInspirationActions(e) {
+  e?.stopPropagation();
+  $("inspirationActions")?.classList.toggle("hidden");
+}
+
+async function toggleInspirationFavorite() {
+  if (!currentInspiration) return;
+  const result = await api(`/api/inspirations/${currentInspiration.id}`, {
+    method: "PUT", body: { favorite: !currentInspiration.favorite },
+  });
+  currentInspiration = result.inspiration;
+  renderInspirationDetail(currentInspiration);
+  await loadInspirations(currentInspiration.id);
+}
+
+async function reanalyzeCurrentInspiration() {
+  if (!currentInspiration) return;
+  await api(`/api/inspirations/${currentInspiration.id}/analyze`, { body: {} });
+  showToast("已加入 AI 整理队列", "ok");
+  await selectInspiration(currentInspiration.id);
+}
+
+async function archiveCurrentInspiration() {
+  if (!currentInspiration) return;
+  const next = currentInspiration.library_status === "archived" ? "available" : "archived";
+  await api(`/api/inspirations/${currentInspiration.id}`, { method: "PUT", body: { library_status: next } });
+  showToast(next === "archived" ? "已归档" : "已恢复", "ok");
+  currentInspiration = null;
+  closeInspirationDetail();
+  await loadInspirations();
+}
+
+async function deleteCurrentInspiration() {
+  if (!currentInspiration) return;
+  const confirmed = await askCard({
+    title: "删除灵感", msg: `将删除「${currentInspiration.title}」及其私有上传文件，无法从回收站恢复。`,
+    okText: "确认删除", danger: true,
+  });
+  if (!confirmed) return;
+  await api(`/api/inspirations/${currentInspiration.id}`, { method: "DELETE" });
+  currentInspiration = null;
+  closeInspirationDetail();
+  $("inspirationDetail").innerHTML = `<div class="inspiration-empty-detail">${svg("bulb")}<b>灵感已删除</b><span>可以继续选择其他内容。</span></div>`;
+  await loadInspirations();
+}
+
+async function markCurrentInspirationUsed() {
+  if (!currentInspiration || !currentChapterId) return;
+  const summary = await askCard({
+    title: "记录使用方式", input: "例如：改成宗门比武中的身份误会", okText: "记录",
+  });
+  if (summary === false) return;
+  await api(`/api/inspirations/${currentInspiration.id}/usages`, {
+    body: {
+      current_work_id: currentWorkId,
+      current_chapter_id: currentChapterId,
+      usage_type: "inserted",
+      usage_status: "applied",
+      adaptation_summary: summary || "已用于当前章节",
+    },
+  });
+  showToast("已记录使用位置", "ok");
+  await selectInspiration(currentInspiration.id);
+  await loadInspirations(currentInspiration.id);
+}
+
 /* ---------- 布局 ---------- */
 
 function toggleSidebar() { $("app").classList.toggle("side-open"); }
@@ -2837,8 +3388,24 @@ function typewriterCenter() {
 /* ---------- 全局事件 ---------- */
 
 document.addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); saveNow(); }
-  if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); toggleFind(); }
+  const inspirationOpen = !$("inspirationWorkspace")?.classList.contains("hidden");
+  if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+    e.preventDefault();
+    if (inspirationOpen && $("inspirationSaveBtn")) saveInspirationCapture();
+    else saveNow();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+    e.preventDefault();
+    if (inspirationOpen) {
+      $("inspirationSearch")?.focus();
+      $("inspirationSearch")?.select();
+    } else toggleFind();
+  }
+  if (e.key === "Escape" && !$("inspirationWorkspace")?.classList.contains("hidden")) {
+    const actions = $("inspirationActions");
+    if (actions && !actions.classList.contains("hidden")) actions.classList.add("hidden");
+    else closeInspirationLibrary();
+  }
 });
 $("content").addEventListener("input", onContentInput);
 $("content").addEventListener("keyup", () => { typewriterCenter(); updateSelectionTools(); });
@@ -2852,6 +3419,11 @@ plotStateFields.map(([, , id]) => id).concat(["plotStateSummary", "plotStateEvid
 document.addEventListener("click", (e) => {
   const m = $("moreMenu");
   if (m && !m.classList.contains("hidden") && !e.target.closest(".menu-wrap")) m.classList.add("hidden");
+  const inspirationActions = $("inspirationActions");
+  if (inspirationActions && !inspirationActions.classList.contains("hidden")
+      && !e.target.closest(".inspiration-detail-actions")) {
+    inspirationActions.classList.add("hidden");
+  }
 });
 
 /* ---------- 启动 ---------- */

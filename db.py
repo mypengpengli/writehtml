@@ -246,10 +246,208 @@ def _migration_model_presets(conn):
         )
 
 
+def _migration_creative_inspirations(conn):
+    """Durable, source-preserving inspiration library kept separate from story facts."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS creative_inspirations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            work_id INTEGER,
+            title TEXT NOT NULL,
+            title_locked INTEGER NOT NULL DEFAULT 0,
+            raw_text TEXT DEFAULT '',
+            user_impression TEXT DEFAULT '',
+            source_type TEXT NOT NULL DEFAULT 'text',
+            primary_category TEXT NOT NULL DEFAULT 'general',
+            library_status TEXT NOT NULL DEFAULT 'inbox',
+            reuse_mode TEXT NOT NULL DEFAULT 'adaptable',
+            use_policy TEXT NOT NULL DEFAULT 'generate_candidate',
+            core_mechanism TEXT DEFAULT '',
+            creative_summary TEXT DEFAULT '',
+            suitable_context TEXT DEFAULT '',
+            adaptation_notes TEXT DEFAULT '',
+            production_notes TEXT DEFAULT '',
+            constraints_text TEXT DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            mood_tags_json TEXT NOT NULL DEFAULT '[]',
+            usage_tags_json TEXT NOT NULL DEFAULT '[]',
+            search_keywords_json TEXT NOT NULL DEFAULT '[]',
+            search_tags TEXT NOT NULL DEFAULT '',
+            importance INTEGER NOT NULL DEFAULT 3,
+            favorite INTEGER NOT NULL DEFAULT 0,
+            analysis_status TEXT NOT NULL DEFAULT 'pending',
+            analysis_error TEXT DEFAULT '',
+            current_analysis_id INTEGER,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS inspiration_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inspiration_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            asset_type TEXT NOT NULL,
+            original_name TEXT DEFAULT '',
+            mime_type TEXT DEFAULT '',
+            storage_path TEXT DEFAULT '',
+            source_url TEXT DEFAULT '',
+            file_size INTEGER NOT NULL DEFAULT 0,
+            content_hash TEXT DEFAULT '',
+            duration_ms INTEGER,
+            width INTEGER,
+            height INTEGER,
+            transcript TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            copyright_status TEXT NOT NULL DEFAULT 'unknown',
+            reference_only INTEGER NOT NULL DEFAULT 1,
+            processing_status TEXT NOT NULL DEFAULT 'uploaded',
+            processing_error TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(inspiration_id) REFERENCES creative_inspirations(id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS inspiration_analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inspiration_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            analysis_type TEXT NOT NULL DEFAULT 'general',
+            model TEXT DEFAULT '',
+            prompt_version TEXT DEFAULT '',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            result_text TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'completed',
+            error TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            FOREIGN KEY(inspiration_id) REFERENCES creative_inspirations(id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS inspiration_usages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inspiration_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            work_id INTEGER,
+            chapter_id INTEGER,
+            usage_target_type TEXT NOT NULL DEFAULT 'chapter',
+            usage_target_id TEXT DEFAULT '',
+            usage_type TEXT NOT NULL DEFAULT 'referenced',
+            usage_status TEXT NOT NULL DEFAULT 'applied',
+            adaptation_summary TEXT DEFAULT '',
+            generated_candidate TEXT DEFAULT '',
+            applied_excerpt TEXT DEFAULT '',
+            user_feedback TEXT DEFAULT '',
+            score INTEGER,
+            context_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(inspiration_id) REFERENCES creative_inspirations(id),
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(work_id) REFERENCES works(id),
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS inspiration_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inspiration_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            job_type TEXT NOT NULL DEFAULT 'analyze',
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            progress INTEGER NOT NULL DEFAULT 0,
+            error TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            started_at REAL,
+            finished_at REAL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(inspiration_id) REFERENCES creative_inspirations(id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS inspiration_fts USING fts5(
+            title,
+            raw_text,
+            user_impression,
+            core_mechanism,
+            creative_summary,
+            suitable_context,
+            search_tags,
+            content='creative_inspirations',
+            content_rowid='id',
+            tokenize='trigram'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS creative_inspirations_ai
+        AFTER INSERT ON creative_inspirations BEGIN
+            INSERT INTO inspiration_fts(
+                rowid, title, raw_text, user_impression, core_mechanism,
+                creative_summary, suitable_context, search_tags
+            ) VALUES (
+                new.id, new.title, new.raw_text, new.user_impression, new.core_mechanism,
+                new.creative_summary, new.suitable_context, new.search_tags
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS creative_inspirations_ad
+        AFTER DELETE ON creative_inspirations BEGIN
+            INSERT INTO inspiration_fts(
+                inspiration_fts, rowid, title, raw_text, user_impression,
+                core_mechanism, creative_summary, suitable_context, search_tags
+            ) VALUES (
+                'delete', old.id, old.title, old.raw_text, old.user_impression,
+                old.core_mechanism, old.creative_summary, old.suitable_context, old.search_tags
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS creative_inspirations_au
+        AFTER UPDATE ON creative_inspirations BEGIN
+            INSERT INTO inspiration_fts(
+                inspiration_fts, rowid, title, raw_text, user_impression,
+                core_mechanism, creative_summary, suitable_context, search_tags
+            ) VALUES (
+                'delete', old.id, old.title, old.raw_text, old.user_impression,
+                old.core_mechanism, old.creative_summary, old.suitable_context, old.search_tags
+            );
+            INSERT INTO inspiration_fts(
+                rowid, title, raw_text, user_impression, core_mechanism,
+                creative_summary, suitable_context, search_tags
+            ) VALUES (
+                new.id, new.title, new.raw_text, new.user_impression, new.core_mechanism,
+                new.creative_summary, new.suitable_context, new.search_tags
+            );
+        END;
+
+        CREATE INDEX IF NOT EXISTS idx_inspirations_user_status
+            ON creative_inspirations(user_id, library_status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_inspirations_work
+            ON creative_inspirations(work_id, library_status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_inspirations_type
+            ON creative_inspirations(user_id, source_type, primary_category);
+        CREATE INDEX IF NOT EXISTS idx_inspiration_assets_parent
+            ON inspiration_assets(inspiration_id, id);
+        CREATE INDEX IF NOT EXISTS idx_inspiration_assets_hash
+            ON inspiration_assets(user_id, content_hash);
+        CREATE INDEX IF NOT EXISTS idx_inspiration_analyses_parent
+            ON inspiration_analyses(inspiration_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_inspiration_usages_parent
+            ON inspiration_usages(inspiration_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_inspiration_usages_chapter
+            ON inspiration_usages(chapter_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_inspiration_jobs_status
+            ON inspiration_jobs(status, updated_at, id);
+        """
+    )
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
     (3, "model_presets", _migration_model_presets),
+    (4, "creative_inspiration_library", _migration_creative_inspirations),
 )
 
 
@@ -749,6 +947,12 @@ def admin_delete_user(user_id):
         conn.execute("DELETE FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skills WHERE user_id=?", (user_id,))
+        # 灵感与故事事实分离，但仍属于用户账号。物理素材目录由 API 层随后清理。
+        conn.execute("DELETE FROM inspiration_jobs WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM inspiration_usages WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM inspiration_analyses WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM inspiration_assets WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM creative_inspirations WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM works WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM agent_conversations WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM user_settings WHERE user_id=?", (user_id,))
@@ -900,6 +1104,22 @@ def delete_work(wid, user_id):
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
             return False
+        # 删除作品不应顺带销毁作者收集的原始创意资产。解除章节引用并归档，
+        # 作者仍可在灵感库的“已归档”中查看或重新设为通用。
+        conn.execute(
+            "UPDATE inspiration_usages SET chapter_id=NULL WHERE chapter_id IN "
+            "(SELECT id FROM chapters WHERE work_id=?) AND user_id=?",
+            (wid, user_id),
+        )
+        conn.execute(
+            "UPDATE inspiration_usages SET work_id=NULL WHERE work_id=? AND user_id=?",
+            (wid, user_id),
+        )
+        conn.execute(
+            "UPDATE creative_inspirations SET work_id=NULL,library_status='archived',updated_at=? "
+            "WHERE work_id=? AND user_id=?",
+            (time.time(), wid, user_id),
+        )
         cids = [r["id"] for r in conn.execute(
             "SELECT id FROM chapters WHERE work_id=?", (wid,)
         )]

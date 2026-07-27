@@ -1,18 +1,21 @@
 """冒烟测试：多用户隔离 + P1 新功能。转写模式不调 LLM，无需 key。"""
 import os, shutil, uuid, sqlite3, time, json, types, base64, io, zipfile, sys
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 
 # 用项目内临时目录放 db（系统 %TEMP% 上杀软偶发瞬时锁会让 sqlite 报只读）
 _TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".smoke_tmp", uuid.uuid4().hex[:10])
 os.makedirs(_TMP, exist_ok=True)
 os.environ["DB_PATH"] = os.path.join(_TMP, "test.db")
 os.environ["PI_AGENT_ENABLED"] = "false"  # The broad legacy smoke suite stubs llm.agent_chat.
+os.environ["INSPIRATION_WORKER_ENABLED"] = "false"  # 灵感分析另测队列，不调用真实模型。
+os.environ["INSPIRATION_STORAGE_DIR"] = os.path.join(_TMP, "inspirations")
 os.environ["SIGNUP_CODE"] = "testcode"   # 开放凭码注册
 os.environ["LLM_API_KEY"] = ""           # 测试不调真 LLM；校验/摘要/聊天应走"未配置"500
 os.environ["WRITEHTML_ADMIN_PASSWORD"] = "admintest"  # 引导创建的 admin 用确定性密码
 
 from fastapi.testclient import TestClient
-import main, db, llm, config, context_builder
+import main, db, llm, config, context_builder, inspiration
 
 db.init_db()
 c = TestClient(main.app)
@@ -277,6 +280,149 @@ dig = db.get_entity_digest(wid, uidA)
 ok(dig.startswith("作品实体") and "[人物] 林晚" in dig and "女主角，冷静" in dig and "基础设定：冷静" in dig,
    "实体 digest 含摘要与基础设定")
 ok(db.get_entity_digest(wid, uidA + 9999) == "", "他人作品 digest 为空(隔离)")
+
+# 多模态创意灵感库：原始内容、范围、检索、附件、使用记录和 Agent 工具。
+ok(c.post("/api/inspirations", json={
+    "raw_text": "危险链接", "source_url": "javascript:alert(1)", "analyze": False,
+}, headers=H(tokA)).status_code == 400, "灵感库拒绝非 http/https 原始链接")
+_global_inspiration = c.post("/api/inspirations", json={
+    "raw_text": "雨夜里两个人都在一本正经地掩饰破防，最后用一句冷笑话反转。",
+    "user_impression": "适合压抑剧情后的情绪释放。",
+    "source_type": "text", "primary_category": "comedy", "scope": "global",
+    "tags": ["雨夜", "反转"], "analyze": False,
+}, headers=H(tokA)).json()["inspiration"]
+_work_inspiration = c.post("/api/inspirations", json={
+    "title": "旧电台钟声", "raw_text": "每次秘密将被揭开前，远处旧电台响十三下钟。",
+    "source_type": "audio", "primary_category": "suspense", "scope": "work",
+    "work_id": wid, "source_url": "https://example.com/reference-audio", "analyze": False,
+}, headers=H(tokA)).json()["inspiration"]
+ok(_global_inspiration["scope"] == "global" and _work_inspiration["work_id"] == wid,
+   "灵感支持通用与当前作品两种范围")
+_inspiration_list = c.get(
+    f"/api/inspirations?work_id={wid}&scope=all&status=active", headers=H(tokA)
+).json()
+ok(_inspiration_list["total"] == 2, "灵感列表合并通用与当前作品")
+ok(c.get(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokB)).status_code == 404,
+   "灵感详情按用户隔离")
+ok(c.get(f"/api/inspirations?work_id={wid}", headers=H(tokB)).status_code == 400,
+   "他人作品不能作为灵感检索范围")
+_work_inspiration = c.put(f"/api/inspirations/{_work_inspiration['id']}", json={
+    "title": "旧电台的十三声钟", "tags": ["悬疑", "声音伏笔"],
+    "source_url": "https://example.com/updated-audio",
+}, headers=H(tokA)).json()["inspiration"]
+ok(_work_inspiration["title"] == "旧电台的十三声钟"
+   and _work_inspiration["assets"][0]["source_url"].endswith("updated-audio"),
+   "灵感标题、标签和原始链接可编辑")
+_search = c.post("/api/inspirations/search", json={
+    "query": "雨夜反转", "work_id": wid, "include_global": True,
+}, headers=H(tokA)).json()["items"]
+ok(any(item["id"] == _global_inspiration["id"] for item in _search), "中文灵感可全文检索")
+ok(any(item["id"] == _global_inspiration["id"] for item in c.post(
+    "/api/inspirations/search",
+    json={"query": "雨", "work_id": wid, "include_global": True},
+    headers=H(tokA),
+).json()["items"]), "单个中文关键词也可检索灵感")
+
+_png = b"\x89PNG\r\n\x1a\n" + b"writehtml-inspiration-image"
+_upload = c.post(
+    f"/api/inspirations/{_work_inspiration['id']}/assets",
+    content=_png,
+    headers={
+        **H(tokA), "Content-Type": "image/png", "X-File-Name": "scene.png",
+        "X-Asset-Type": "image", "X-Asset-Description": quote("雨夜旧电台构图"),
+    },
+)
+ok(_upload.status_code == 200 and _upload.json()["asset"]["file_size"] == len(_png),
+   "图片原始文件可持久保存")
+_asset_id = _upload.json()["asset"]["id"]
+_generic_upload = c.post(
+    f"/api/inspirations/{_global_inspiration['id']}/assets", content=_png,
+    headers={**H(tokA), "Content-Type": "application/octet-stream", "X-File-Name": "mobile-picker.png"},
+)
+ok(_generic_upload.status_code == 200
+   and _generic_upload.json()["asset"]["mime_type"] == "image/png",
+   "手机文件选择器未提供 MIME 时可按扩展名与文件签名安全识别")
+_storage_limit = config.INSPIRATION_USER_STORAGE_LIMIT_BYTES
+config.INSPIRATION_USER_STORAGE_LIMIT_BYTES = inspiration._user_storage_bytes(uidA) + 1
+_quota_upload = c.post(
+    f"/api/inspirations/{_global_inspiration['id']}/assets",
+    content=b"\x89PNG\r\n\x1a\nquota-overflow",
+    headers={**H(tokA), "Content-Type": "image/png", "X-File-Name": "quota.png"},
+)
+config.INSPIRATION_USER_STORAGE_LIMIT_BYTES = _storage_limit
+ok(_quota_upload.status_code == 400 and "空间已满" in _quota_upload.text,
+   "单个用户的灵感原始素材受总量配额保护")
+_stale_temp = os.path.join(config.INSPIRATION_STORAGE_DIR, "temp", "orphan.upload")
+with open(_stale_temp, "wb") as _temp_file:
+    _temp_file.write(b"partial")
+os.utime(_stale_temp, (time.time() - 90000, time.time() - 90000))
+ok(inspiration.cleanup_stale_temp_files() == 1 and not os.path.exists(_stale_temp),
+   "服务可清理中断上传遗留的临时文件")
+ok(c.get(f"/api/inspiration-assets/{_asset_id}/access", headers=H(tokB)).status_code == 404,
+   "他人不能获取灵感素材访问票据")
+_asset_access = c.get(f"/api/inspiration-assets/{_asset_id}/access", headers=H(tokA)).json()
+ok(c.get(_asset_access["url"]).content == _png, "短期票据可读取原始素材")
+_orig_inspiration_chat = llm.chat
+llm.chat = lambda *args, **kwargs: json.dumps({
+    "title": "AI 不应覆盖锁定标题", "primary_category": "suspense",
+    "core_mechanism": "声音伏笔与延迟揭示", "creative_summary": "十三声钟预告秘密将被揭开。",
+    "suitable_context": "章节结尾或真相揭露前", "adaptation_notes": "控制出现频率。",
+    "production_notes": "先给环境静音，再突出钟声。",
+    "tags": ["钟声", "伏笔"], "mood_tags": ["不安"], "usage_tags": ["章节结尾"],
+    "search_keywords": ["旧电台", "十三声钟"],
+}, ensure_ascii=False)
+ok(inspiration.run_next_analysis_job(), "后台任务可执行灵感 AI 整理")
+llm.chat = _orig_inspiration_chat
+_analyzed_inspiration = c.get(
+    f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)
+).json()["inspiration"]
+ok(_analyzed_inspiration["analysis_status"] == "completed"
+   and _analyzed_inspiration["title"] == "旧电台的十三声钟"
+   and _analyzed_inspiration["raw_text"] == _work_inspiration["raw_text"]
+   and _analyzed_inspiration["creative_summary"] == "十三声钟预告秘密将被揭开。",
+   "AI 整理保留锁定标题、作者原话和原始素材")
+_usage = c.post(f"/api/inspirations/{_work_inspiration['id']}/usages", json={
+    "current_work_id": wid, "current_chapter_id": cid,
+    "usage_type": "inserted", "usage_status": "applied",
+    "adaptation_summary": "作为第一章结尾的声音伏笔",
+}, headers=H(tokA))
+ok(_usage.status_code == 200
+   and c.get(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)).json()["inspiration"]["use_count"] == 1,
+   "实际采用灵感可记录到具体章节")
+ok(c.post(f"/api/inspirations/{_work_inspiration['id']}/usages", json={
+    "usage_type": "invented", "usage_status": "applied",
+}, headers=H(tokA)).status_code == 400, "灵感使用记录拒绝未知状态")
+_one_off = c.post("/api/inspirations", json={
+    "raw_text": "一次性的红伞身份反转", "scope": "global",
+    "reuse_mode": "one_off", "analyze": False,
+}, headers=H(tokA)).json()["inspiration"]
+c.post(f"/api/inspirations/{_one_off['id']}/usages", json={
+    "usage_type": "inserted", "usage_status": "applied",
+}, headers=H(tokA))
+_default_candidates = main._tool_search_inspirations(
+    uidA, cid, {}, {"query": "红伞身份反转"},
+)["inspirations"]
+_all_candidates = main._tool_search_inspirations(
+    uidA, cid, {}, {"query": "红伞身份反转", "include_used": True},
+)["inspirations"]
+ok(not any(item["id"] == _one_off["id"] for item in _default_candidates)
+   and any(item["id"] == _one_off["id"] for item in _all_candidates),
+   "Agent 默认不重复推荐已采用的一次性灵感")
+c.delete(f"/api/inspirations/{_one_off['id']}", headers=H(tokA))
+
+_wav = b"RIFF" + (16).to_bytes(4, "little") + b"WAVEfmt " + b"\x00" * 8
+_voice_saved = main._tool_save_inspiration(uidA, cid, {
+    "turn_audio": {"data": base64.b64encode(_wav).decode("ascii"), "format": "wav"},
+}, {
+    "raw_text": "记下：钟声之后所有人都暂时说真话。", "scope": "work",
+    "source_type": "voice_note", "category": "plot",
+})
+_voice_item = inspiration.get_inspiration(_voice_saved["inspiration"]["id"], uidA)
+ok("error" not in _voice_saved and any(asset["asset_type"] == "voice_note" for asset in _voice_item["assets"]),
+   "Agent 明确保存语音灵感时同时保留原始录音")
+_voice_path = inspiration.asset_file(_voice_item["assets"][0]["id"], uidA)[1]
+ok(c.delete(f"/api/inspirations/{_voice_item['id']}", headers=H(tokA)).status_code == 200
+   and not _voice_path.exists(), "删除灵感会清理不再引用的私有素材")
 
 # 动态人物卡：基础设定不覆盖；状态按章节时点读取；AI 提议必须人工确认后才生效。
 state_c1 = c.post(f"/api/works/{wid}/chapters", json={"title": "人物状态一"}, headers=H(tokA)).json()["id"]
@@ -756,8 +902,16 @@ uidB = db.verify_user("bob", "pw1234")["id"]
 _put_conv(tokB, None)
 ok(c.delete(f"/api/admin/users/{uidB}/conversations", headers=H(tokAdm)).json()["deleted"] >= 1, "admin 清空指定用户对话")
 ok(db.get_conversation(uidB, None) is None, "admin 清空后该用户对话为空")
-# admin 删除用户账号 + 级联（carol 此前已不再使用）
+# admin 删除用户账号 + 级联（包括灵感原始文件）
 uidC = db.verify_user("carol", "pw1234")["id"]
+_carol_inspiration = c.post("/api/inspirations", json={
+    "raw_text": "Carol 的临时图片灵感", "scope": "global", "analyze": False,
+}, headers=H(tokC)).json()["inspiration"]
+_carol_upload = c.post(
+    f"/api/inspirations/{_carol_inspiration['id']}/assets", content=_png,
+    headers={**H(tokC), "Content-Type": "image/png", "X-File-Name": "carol.png", "X-Asset-Type": "image"},
+).json()["asset"]
+_carol_asset_path = inspiration.asset_file(_carol_upload["id"], uidC)[1]
 ok(c.delete(f"/api/admin/users/{uidC}", headers=H(tokAdm)).status_code == 200, "admin 删除用户 carol")
 ok(db.verify_user("carol", "pw1234") is None, "删用户后 carol 账号已不存在")
 with db.get_conn() as _conn:
@@ -765,6 +919,11 @@ with db.get_conn() as _conn:
     _cchap = _conn.execute("SELECT COUNT(*) FROM chapters WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (uidC,)).fetchone()[0]
 ok(_cworks == 0 and _cchap == 0, "删用户级联清空其作品/章节")
 ok(db.get_conversation(uidC, ccid) is None, "删用户级联清空其对话")
+with db.get_conn() as _conn:
+    _cinspirations = _conn.execute(
+        "SELECT COUNT(*) FROM creative_inspirations WHERE user_id=?", (uidC,)
+    ).fetchone()[0]
+ok(_cinspirations == 0 and not _carol_asset_path.exists(), "删用户级联清空灵感记录与原始文件")
 _usrs2 = c.get("/api/admin/users", headers=H(tokAdm)).json()["users"]
 ok(not any(u["username"] == "carol" for u in _usrs2), "删用户后用户列表不再含 carol")
 # 防误删：不能删自己 / 不能删管理员 / 删不存在用户 404
@@ -825,10 +984,21 @@ with db.get_conn() as conn:
 ok(_nmem == 0, "删作品级联清空故事记忆")
 # 同样应级联清掉该作品各章节的 agent 对话（cid 上留有一条压缩后的对话）
 ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
+_archived_inspiration = c.get(
+    f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)
+).json()["inspiration"]
+ok(_archived_inspiration["work_id"] is None
+   and _archived_inspiration["library_status"] == "archived"
+   and _archived_inspiration["usages"][0]["work_id"] is None
+   and _archived_inspiration["usages"][0]["chapter_id"] is None
+   and any(asset["id"] == _asset_id for asset in _archived_inspiration["assets"]),
+   "删除作品会归档灵感并保留原始素材，同时解除失效章节引用")
+ok(c.delete(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)).status_code == 200,
+   "归档后的作品灵感仍可由作者主动删除")
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260727-1" in _home.text and "app.js?v=ui-20260727-1" in _home.text,
+ok(_home.status_code == 200 and "style.css?v=ui-20260727-2" in _home.text and "app.js?v=ui-20260727-2" in _home.text,
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")

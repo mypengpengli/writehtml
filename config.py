@@ -18,6 +18,24 @@ ASR_MODEL = os.getenv("ASR_MODEL", "whisper-1")
 # SQLite 路径（Docker 里挂到数据卷）
 DB_PATH = os.getenv("DB_PATH", "writehtml.db")
 
+# 灵感原始素材与数据库放在同一持久卷中。Docker 默认落到 /data/inspirations，
+# 本地开发则落到数据库旁边，升级容器不会丢图片、录音或音乐。
+INSPIRATION_STORAGE_DIR = os.getenv(
+    "INSPIRATION_STORAGE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "inspirations"),
+)
+INSPIRATION_IMAGE_MAX_BYTES = int(os.getenv("INSPIRATION_IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
+INSPIRATION_AUDIO_MAX_BYTES = int(os.getenv("INSPIRATION_AUDIO_MAX_BYTES", str(100 * 1024 * 1024)))
+INSPIRATION_VIDEO_MAX_BYTES = int(os.getenv("INSPIRATION_VIDEO_MAX_BYTES", str(300 * 1024 * 1024)))
+INSPIRATION_USER_STORAGE_LIMIT_BYTES = int(os.getenv(
+    "INSPIRATION_USER_STORAGE_LIMIT_BYTES", str(5 * 1024 * 1024 * 1024)
+))
+INSPIRATION_WORKER_ENABLED = os.getenv("INSPIRATION_WORKER_ENABLED", "true").lower() not in {
+    "0", "false", "no",
+}
+INSPIRATION_WORKER_POLL_SECONDS = float(os.getenv("INSPIRATION_WORKER_POLL_SECONDS", "1.5"))
+INSPIRATION_TEMP_RETENTION_HOURS = int(os.getenv("INSPIRATION_TEMP_RETENTION_HOURS", "24"))
+
 # 本机 Skill / launcher 运行时（可选）。
 # 仅服务管理员配置；网页上传的 SKILL.md 不会获得执行服务器命令的权限。
 # AGENT_SKILL_DIR 下的 meta-memory/SKILL.md 会在启用 launcher 生命周期时每回合重新读取。
