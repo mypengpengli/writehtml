@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ui-20260724-7">
+  <link rel="stylesheet" href="style.css?v=ui-20260727-1">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -69,6 +69,7 @@
         <input id="chapTitle" class="title-input" placeholder="章节标题">
         <span id="wc" class="wc">0 字</span>
         <span id="saveStat" class="save-stat"></span>
+        <select id="modelQuickSwitch" class="model-switch model-switch-top" onchange="switchActiveModel(this.value)" aria-label="切换当前 AI 模型" title="切换当前 AI 模型"></select>
         <button class="ic top-workbench" id="storyToggleBtn" data-ic="panel" onclick="toggleStoryDrawer()" title="写作工作台"></button>
         <button class="ic top-ai" id="aiToggleBtn" data-ic="bot" data-label="AI 助手" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
         <div class="menu-wrap">
@@ -152,6 +153,11 @@
           <button class="ic" data-ic="trash" onclick="clearAgent()" title="清空对话"></button>
           <button class="ic" data-ic="x" onclick="toggleAISide()" title="收起"></button>
         </span>
+      </div>
+      <div class="agent-model-row">
+        <label for="agentModelSwitch">模型</label>
+        <select id="agentModelSwitch" class="model-switch" onchange="switchActiveModel(this.value)" aria-label="切换当前 AI 模型"></select>
+        <button class="ic" data-ic="settings" onclick="openSettings()" title="管理常用模型 ID"></button>
       </div>
       <div id="agentMsgs" class="chat-msgs"></div>
       <div id="agentSelection" class="agent-selection hidden">
@@ -513,8 +519,12 @@
         <input id="setBaseUrl" placeholder="https://api.deepseek.com/v1">
         <label>API Key</label>
         <input id="setApiKey" type="password" placeholder="sk-…（已设置则显示 ****，留空=不改）">
-        <label>模型 ID</label>
-        <input id="setModel" placeholder="deepseek-chat">
+        <label>当前模型 ID</label>
+        <input id="setModel" list="modelIdOptions" placeholder="deepseek-chat">
+        <label>常用模型 ID</label>
+        <textarea id="setModels" rows="4" placeholder="每行一个模型 ID，例如：&#10;deepseek-chat&#10;qwen-plus"></textarea>
+        <p class="set-hint">保存后可在编辑器顶栏或 AI 助手中快速切换；所有常用模型共用上方 Base URL 和 API Key。</p>
+        <datalist id="modelIdOptions"></datalist>
         <label class="set-row voice-mode-row"><input id="setVoiceDirect" type="checkbox" onchange="updateVoiceSettingHint()"> 直接发送语音给 AI（不转写）</label>
         <p id="voiceModeHint" class="set-hint voice-mode-hint"></p>
         <div id="asrSettings">
@@ -584,6 +594,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=ui-20260724-7"></script>
+  <script src="app.js?v=ui-20260727-1"></script>
 </body>
 </html>

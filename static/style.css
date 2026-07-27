@@ -153,6 +153,13 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .ic svg { width: 18px; height: 18px; display: block; }
 .top-ai { color: var(--accent-text); font-weight: 600; }
 .top-workbench { color: var(--accent-text); }
+.model-switch { min-width: 0; height: 36px; padding: 6px 28px 6px 8px; font-size: 13px; }
+.model-switch-top { flex: 0 1 176px; max-width: 176px; }
+.agent-model-row { display: flex; align-items: center; gap: 7px; padding: 7px 10px; border-bottom: 1px solid var(--line); background: var(--side-bg); }
+.agent-model-row label { flex: 0 0 auto; color: var(--muted); font-size: 12px; }
+.agent-model-row .model-switch { flex: 1; width: 100%; }
+.agent-model-row .ic { flex: 0 0 auto; min-width: 32px; min-height: 32px; padding: 6px; }
+@media (max-width: 1020px) { .model-switch-top { display: none; } }
 /* 内联 SVG 图标在非 .ic 容器里的尺寸/对齐 */
 [data-ic] svg { width: 18px; height: 18px; display: block; }
 .ai-head [data-ic], #login h1[data-ic] { display: inline-flex; align-items: center; gap: 6px; }

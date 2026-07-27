@@ -53,6 +53,34 @@ STORY_MEMORY_TYPE_LABELS = {
     "location_change": "地点变化", "ability_change": "能力变化",
     "world_rule": "世界规则", "promise": "承诺/任务", "secret": "重要秘密",
 }
+MAX_LLM_MODELS = 20
+MAX_LLM_MODEL_ID_LENGTH = 160
+
+
+def _normalize_llm_models(models, active_model=""):
+    """Keep a small ordered, de-duplicated list of user-selectable model IDs."""
+    if isinstance(models, str):
+        models = models.splitlines()
+    if not isinstance(models, (list, tuple)):
+        models = []
+    result = []
+    for value in list(models) + [active_model]:
+        if not isinstance(value, str):
+            continue
+        model = value.strip()[:MAX_LLM_MODEL_ID_LENGTH]
+        if model and model not in result:
+            result.append(model)
+        if len(result) >= MAX_LLM_MODELS:
+            break
+    return result
+
+
+def _decode_llm_models(raw, active_model=""):
+    try:
+        models = json.loads(raw or "[]")
+    except Exception:
+        models = []
+    return _normalize_llm_models(models, active_model)
 
 
 def normalize_character_state(state, base=None):
@@ -206,9 +234,22 @@ def _migration_story_memory_and_provenance(conn):
         )
 
 
+def _migration_model_presets(conn):
+    """Persist selectable model IDs without changing the existing active-model contract."""
+    _add_col(conn, "user_settings", "llm_models_json", "TEXT DEFAULT '[]'")
+    rows = conn.execute("SELECT user_id, llm_model, llm_models_json FROM user_settings").fetchall()
+    for row in rows:
+        models = _decode_llm_models(row["llm_models_json"], row["llm_model"])
+        conn.execute(
+            "UPDATE user_settings SET llm_models_json=? WHERE user_id=?",
+            (json.dumps(models, ensure_ascii=False), row["user_id"]),
+        )
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
+    (3, "model_presets", _migration_model_presets),
 )
 
 
@@ -749,37 +790,75 @@ def get_settings(user_id):
     """返回该用户的 LLM 设置；没存过返回 None（调用方用 .env 兜底）。"""
     with get_conn() as conn:
         r = conn.execute(
-            "SELECT llm_base_url, llm_api_key, llm_model, asr_base_url, asr_api_key, asr_model "
+            "SELECT llm_base_url, llm_api_key, llm_model, llm_models_json, asr_base_url, asr_api_key, asr_model "
             "FROM user_settings WHERE user_id=?",
             (user_id,),
         ).fetchone()
-        return dict(r) if r else None
+        if not r:
+            return None
+        settings = dict(r)
+        settings["llm_models"] = _decode_llm_models(
+            settings.pop("llm_models_json", "[]"), settings.get("llm_model") or "",
+        )
+        return settings
 
 
 def save_settings(user_id, base_url, api_key, model, asr_model=None,
-                  asr_base_url=None, asr_api_key=None):
+                  asr_base_url=None, asr_api_key=None, models=None):
     """保存设置。api_key 为空或为掩码占位时保留旧值，避免清空已填的 key。"""
     now = time.time()
     with get_conn() as conn:
         old = conn.execute(
-            "SELECT llm_api_key, asr_api_key FROM user_settings WHERE user_id=?", (user_id,)
+            "SELECT llm_api_key, asr_api_key, llm_model, llm_models_json FROM user_settings WHERE user_id=?", (user_id,)
         ).fetchone()
         if not api_key or api_key.startswith("****"):
             api_key = old["llm_api_key"] if old else ""
         if not asr_api_key or asr_api_key.startswith("****"):
             asr_api_key = old["asr_api_key"] if old else ""
+        model = (model or "").strip()[:MAX_LLM_MODEL_ID_LENGTH]
+        old_models = _decode_llm_models(old["llm_models_json"], old["llm_model"] or "") if old else []
+        model_list = _normalize_llm_models(old_models if models is None else models, model)
+        if not model and model_list:
+            model = model_list[0]
         conn.execute(
             "INSERT INTO user_settings(user_id, llm_base_url, llm_api_key, llm_model, "
-            "asr_base_url, asr_api_key, asr_model, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?) "
+            "llm_models_json, asr_base_url, asr_api_key, asr_model, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "llm_base_url=excluded.llm_base_url, llm_api_key=excluded.llm_api_key, "
-            "llm_model=excluded.llm_model, asr_base_url=excluded.asr_base_url, "
+            "llm_model=excluded.llm_model, llm_models_json=excluded.llm_models_json, asr_base_url=excluded.asr_base_url, "
             "asr_api_key=excluded.asr_api_key, asr_model=excluded.asr_model, updated_at=excluded.updated_at",
-            (user_id, base_url, api_key, model, asr_base_url or "", asr_api_key,
-             asr_model, now),
+            (user_id, base_url, api_key, model, json.dumps(model_list, ensure_ascii=False),
+             asr_base_url or "", asr_api_key, asr_model, now),
         )
-        return True
+        return {"model": model, "models": model_list}
+
+
+def set_active_llm_model(user_id, model, fallback_models=None):
+    """Switch only the active model while preserving API credentials and other settings."""
+    model = (model or "").strip()[:MAX_LLM_MODEL_ID_LENGTH]
+    if not model:
+        return {"invalid_model": True}
+    now = time.time()
+    with get_conn() as conn:
+        old = conn.execute(
+            "SELECT llm_model, llm_models_json FROM user_settings WHERE user_id=?", (user_id,)
+        ).fetchone()
+        old_models = _decode_llm_models(old["llm_models_json"], old["llm_model"] or "") if old else []
+        model_list = _normalize_llm_models(old_models + list(fallback_models or []))
+        if model not in model_list:
+            return {"unknown_model": True, "models": model_list}
+        if old:
+            conn.execute(
+                "UPDATE user_settings SET llm_model=?, llm_models_json=?, updated_at=? WHERE user_id=?",
+                (model, json.dumps(model_list, ensure_ascii=False), now, user_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO user_settings(user_id, llm_model, llm_models_json, updated_at) VALUES(?,?,?,?)",
+                (user_id, model, json.dumps(model_list, ensure_ascii=False), now),
+            )
+        return {"model": model, "models": model_list}
 
 
 # ---------- 归属校验 ----------

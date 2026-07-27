@@ -248,6 +248,7 @@ async function init() {
   $("meName").textContent = me.username ? `${me.username} · 目录` : "目录";
   if (me.is_admin) $("adminBtn").classList.remove("hidden");
   await loadWorks();
+  await loadModelSelectors();
 }
 
 async function loadWorks() {
@@ -966,11 +967,66 @@ async function exportChap(fmt) {
 
 /* ---------- 大模型设置 ---------- */
 
+let activeModelId = "";
+let availableModelIds = [];
+
+function normalizeModelIds(models, active = "") {
+  const result = [];
+  for (const value of [...(Array.isArray(models) ? models : []), active]) {
+    const id = typeof value === "string" ? value.trim() : "";
+    if (id && !result.includes(id)) result.push(id);
+  }
+  return result;
+}
+function renderModelSelectors(settings = {}) {
+  activeModelId = (settings.model || activeModelId || "").trim();
+  availableModelIds = normalizeModelIds(settings.models, activeModelId);
+  if (!activeModelId && availableModelIds.length) activeModelId = availableModelIds[0];
+  const options = availableModelIds.map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
+  ["modelQuickSwitch", "agentModelSwitch"].forEach(id => {
+    const select = $(id);
+    if (!select) return;
+    select.innerHTML = options || '<option value="">未设置模型</option>';
+    select.value = activeModelId;
+    select.disabled = availableModelIds.length < 2;
+    select.title = activeModelId ? `当前模型：${activeModelId}` : "未设置模型";
+  });
+  const datalist = $("modelIdOptions");
+  if (datalist) datalist.innerHTML = options;
+}
+async function loadModelSelectors() {
+  try {
+    renderModelSelectors(await api("/api/settings", { method: "GET" }));
+  } catch (e) {
+    // The editor remains usable when settings are temporarily unavailable.
+  }
+}
+async function switchActiveModel(model) {
+  model = (model || "").trim();
+  if (!model || model === activeModelId) return;
+  const previous = activeModelId;
+  ["modelQuickSwitch", "agentModelSwitch"].forEach(id => { if ($(id)) $(id).disabled = true; });
+  try {
+    const result = await api("/api/settings/active-model", { body: { model } });
+    renderModelSelectors(result);
+    if (!$("setOverlay").classList.contains("hidden")) {
+      $("setModel").value = result.model || model;
+      $("setModels").value = (result.models || []).join("\n");
+    }
+    showToast(`已切换模型：${result.model || model}`, "ok");
+  } catch (e) {
+    renderModelSelectors({ model: previous, models: availableModelIds });
+    showToast(e.message || "切换模型失败", "err");
+  }
+}
+
 async function openSettings() {
   try {
     const s = await api("/api/settings", { method: "GET" });
     $("setBaseUrl").value = s.base_url || "";
     $("setModel").value = s.model || "";
+    $("setModels").value = normalizeModelIds(s.models, s.model).join("\n");
+    renderModelSelectors(s);
     $("setAsrBaseUrl").value = s.asr_base_url || "";
     $("setAsrModel").value = s.asr_model || "whisper-1";
     // key 不回传明文：已填则用掩码占位提示，留空表示不改
@@ -998,6 +1054,7 @@ function updateVoiceSettingHint() {
 async function saveSettings() {
   const base_url = $("setBaseUrl").value.trim();
   const model = $("setModel").value.trim();
+  const models = $("setModels").value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
   const asr_base_url = $("setAsrBaseUrl").value.trim();
   const asr_model = $("setAsrModel").value.trim();
   let api_key = $("setApiKey").value.trim();
@@ -1011,7 +1068,10 @@ async function saveSettings() {
   localStorage.setItem("voiceAsrAutoSend", voiceAsrAutoSend ? "1" : "0");
   setAgentMic(false);
   try {
-    await api("/api/settings", { body: { base_url, api_key, model, asr_base_url, asr_api_key, asr_model } });
+    const result = await api("/api/settings", { body: { base_url, api_key, model, models, asr_base_url, asr_api_key, asr_model } });
+    renderModelSelectors(result);
+    $("setModel").value = result.model || model;
+    $("setModels").value = (result.models || models).join("\n");
     $("setMsg").textContent = "已保存";
     setTimeout(closeSettings, 600);
   } catch (e) { $("setMsg").textContent = e.message; }

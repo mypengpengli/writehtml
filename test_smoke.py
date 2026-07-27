@@ -91,16 +91,25 @@ ok(len(chap["segments"]) == 1, "段落历史 1 条")
 # 每用户大模型设置
 c.post("/api/settings", json={
     "base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a",
+    "models": ["m-a", "m-polish", "m-fast"],
     "asr_base_url": "https://asr.test/v1", "asr_api_key": "sk-asr-secret", "asr_model": "whisper-test",
 }, headers=H(tokA))
 s = c.get("/api/settings", headers=H(tokA)).json()
 ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a" and s["asr_model"] == "whisper-test"
    and s["asr_base_url"] == "https://asr.test/v1", "设置读回文字/转写配置")
+ok(s["models"] == ["m-a", "m-polish", "m-fast"], "常用模型 ID 列表读回")
 ok(s["has_key"] is True and "secret" not in s["api_key_masked"] and s["api_key_masked"].startswith("****"), "key 掩码不泄露明文")
 ok(s["asr_has_key"] is True and "secret" not in s["asr_api_key_masked"], "转写 key 掩码不泄露明文")
+_model_switch = c.post("/api/settings/active-model", json={"model": "m-polish"}, headers=H(tokA)).json()
+ok(_model_switch["model"] == "m-polish" and c.get("/api/settings", headers=H(tokA)).json()["model"] == "m-polish",
+   "可快速切换当前模型")
+ok(c.post("/api/settings/active-model", json={"model": "m-unknown"}, headers=H(tokA)).status_code == 400,
+   "未配置模型不能直接切换")
 # 空 key 提交应保留旧 key
 c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "", "model": "m-a2"}, headers=H(tokA))
-ok(c.get("/api/settings", headers=H(tokA)).json()["has_key"] is True, "空 key 不清空已存 key")
+_alice_settings = c.get("/api/settings", headers=H(tokA)).json()
+ok(_alice_settings["has_key"] is True and _alice_settings["model"] == "m-a2" and "m-polish" in _alice_settings["models"],
+   "空 key 不清空已存 key，模型列表保持")
 
 # AI Skills：通用/作品专用 CRUD、作用域和用户隔离
 ok(c.post("/api/agent/skills", json={"name": "", "instruction": "规则"}, headers=H(tokA)).status_code == 400, "Skill 空名称 400")
@@ -819,7 +828,7 @@ ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260724-7" in _home.text and "app.js?v=ui-20260724-7" in _home.text,
+ok(_home.status_code == 200 and "style.css?v=ui-20260727-1" in _home.text and "app.js?v=ui-20260727-1" in _home.text,
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")

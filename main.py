@@ -77,6 +77,31 @@ def _asr_config(settings):
     }
 
 
+def _model_options(settings):
+    """Expose a user-friendly ordered list while retaining .env as a safe fallback."""
+    settings = settings or {}
+    active = (settings.get("llm_model") or config.LLM_MODEL or "").strip()
+    options = []
+    for value in list(settings.get("llm_models") or []) + [active]:
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if value and value not in options:
+            options.append(value)
+    return active, options
+
+
+def _model_options_payload(body):
+    values = body.get("models") if isinstance(body, dict) else None
+    if values is None:
+        return None
+    if not isinstance(values, list) or len(values) > db.MAX_LLM_MODELS:
+        raise HTTPException(400, "常用模型列表格式无效")
+    if any(not isinstance(value, str) for value in values):
+        raise HTTPException(400, "模型 ID 必须是文字")
+    return values
+
+
 def _provider_error(exc, limit=260):
     """保留可诊断的信息，但不把供应商的整段 JSON 直接塞进手机 toast。"""
     text = " ".join(str(exc).split())
@@ -146,11 +171,13 @@ async def get_settings(request: Request):
     asr_key = s.get("asr_api_key") or config.ASR_API_KEY
     # 明文 key 不回传，只给掩码提示是否已填
     masked = ("****" + key[-4:]) if key else ""
+    model, models = _model_options(s)
     return {
         "base_url": s.get("llm_base_url") or config.LLM_BASE_URL,
         "api_key_masked": masked,
         "has_key": bool(key),
-        "model": s.get("llm_model") or config.LLM_MODEL,
+        "model": model,
+        "models": models,
         "asr_base_url": s.get("asr_base_url") or config.ASR_BASE_URL,
         "asr_api_key_masked": _mask_key(asr_key),
         "asr_has_key": bool(asr_key),
@@ -162,7 +189,7 @@ async def get_settings(request: Request):
 async def save_settings(request: Request):
     uid = _auth(request)
     body = await request.json()
-    db.save_settings(
+    result = db.save_settings(
         uid,
         (body.get("base_url") or "").strip(),
         (body.get("api_key") or "").strip(),
@@ -170,8 +197,26 @@ async def save_settings(request: Request):
         (body.get("asr_model") or "").strip(),
         (body.get("asr_base_url") or "").strip(),
         (body.get("asr_api_key") or "").strip(),
+        _model_options_payload(body),
     )
-    return {"ok": True}
+    return {"ok": True, **result}
+
+
+@app.post("/api/settings/active-model")
+async def switch_active_model(request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    model = body.get("model") if isinstance(body, dict) else ""
+    if not isinstance(model, str):
+        raise HTTPException(400, "模型 ID 无效")
+    settings = db.get_settings(uid) or {}
+    _, models = _model_options(settings)
+    result = db.set_active_llm_model(uid, model, models)
+    if result.get("invalid_model"):
+        raise HTTPException(400, "模型 ID 不能为空")
+    if result.get("unknown_model"):
+        raise HTTPException(400, "请先在大模型设置中添加该模型 ID")
+    return {"ok": True, **result}
 
 
 # ---------- 作品 ----------
