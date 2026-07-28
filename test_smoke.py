@@ -1190,7 +1190,7 @@ ok(c.delete(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)).sta
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260728-1" in _home.text and "app.js?v=ui-20260728-1" in _home.text,
+ok(_home.status_code == 200 and "style.css?v=ui-20260728-2" in _home.text and "app.js?v=ui-20260728-2" in _home.text,
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")
