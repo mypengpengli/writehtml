@@ -350,6 +350,10 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .chat-msgs .cm.user.voice { display: inline-flex; align-items: center; gap: 5px; color: var(--accent-text); }
 .chat-msgs .cm.user.voice svg { width: 15px; height: 15px; }
 .chat-msgs .cm.assistant { background: var(--panel); border: 1px solid var(--line); align-self: flex-start; box-shadow: var(--shadow-sm); } /* 左：AI */
+.chat-msgs .cm.assistant.streaming { min-width: 44px; }
+.stream-caret { display: inline-block; width: 2px; height: 1em; margin-left: 2px; background: var(--accent); vertical-align: -2px; animation: stream-blink .8s steps(2, start) infinite; }
+.agent-stream-status { display: inline-flex; align-items: center; gap: 7px; align-self: flex-start; margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+@keyframes stream-blink { 50% { opacity: 0; } }
 .chat-msgs .cm.err { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); align-self: flex-start; }
 .chat-msgs .cm.temporary { border-style: dashed; }
 .chat-temporary-label {

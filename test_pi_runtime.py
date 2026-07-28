@@ -27,6 +27,20 @@ def ok(condition, message):
         raise SystemExit(1)
 
 
+def post_stream_events(client, path, payload, token):
+    events = []
+    with client.stream(
+        "POST", path, json=payload,
+        headers={"Authorization": "Bearer " + token},
+    ) as response:
+        status = response.status_code
+        headers = dict(response.headers)
+        for line in response.iter_lines():
+            if line:
+                events.append(json.loads(line))
+    return status, headers, events
+
+
 def sse_chunk(delta, finish_reason=None, response_id="pi-test"):
     return {
         "id": response_id,
@@ -130,6 +144,18 @@ try:
         headers={"Authorization": "Bearer " + token},
     ).json()
     ok(any(message.get("role") == "tool" for message in fetched["messages"]), "history endpoint remains UI compatible")
+    stream_chapter = db.create_chapter(work["id"], uid, "Streaming Pi chapter")
+    stream_status, stream_headers, stream_events = post_stream_events(
+        client, "/api/agent/stream",
+        {"text": "Stream a Pi reply", "chapter_id": stream_chapter["id"]}, token,
+    )
+    stream_result = next((event.get("data") for event in stream_events if event.get("type") == "result"), None)
+    ok(stream_status == 200 and stream_headers.get("x-accel-buffering") == "no",
+       "Pi streaming endpoint disables reverse-proxy buffering")
+    ok(any(event.get("type") == "assistant_delta" for event in stream_events),
+       "Pi text delta reaches the HTTP stream")
+    ok(stream_result and stream_result["reply"] == "Pi completed the Skill turn.",
+       "Pi stream ends with the authoritative complete result")
     voice = client.post(
         "/api/agent/audio", json={
             "audio": base64.b64encode(b"fake-pi-audio").decode(), "format": "wav", "chapter_id": chapter["id"],
@@ -141,6 +167,20 @@ try:
     stored_after_voice = db.get_conversation(uid, chapter["id"])
     serialized = json.dumps(stored_after_voice["messages"], ensure_ascii=False)
     ok("ZmFrZS1waS1hdWRpbw==" not in serialized, "raw audio Base64 is never persisted")
+    audio_stream_chapter = db.create_chapter(work["id"], uid, "Streaming audio chapter")
+    audio_status, _, audio_events = post_stream_events(
+        client, "/api/agent/audio/stream", {
+            "audio": base64.b64encode(b"stream-pi-audio").decode(),
+            "format": "wav", "chapter_id": audio_stream_chapter["id"],
+        }, token,
+    )
+    audio_result = next((event.get("data") for event in audio_events if event.get("type") == "result"), None)
+    ok(audio_status == 200 and any(
+        event.get("type") == "assistant_delta" and "Pi received raw audio" in event.get("delta", "")
+        for event in audio_events
+    ), "Pi direct audio reply is streamed")
+    ok(audio_result and audio_result.get("voice", {}).get("mode") == "direct",
+       "Pi audio stream keeps direct-voice diagnostics")
     plain_chapter = db.create_chapter(work["id"], uid, "Plain Pi chapter")
     plain = client.post(
         "/api/agent", json={"text": "Plain Pi reply", "chapter_id": plain_chapter["id"]},
@@ -225,6 +265,19 @@ try:
         runtime_stored = db.get_conversation(uid, runtime_chapter["id"])
         ok("PI_LOCAL_SKILL_MARKER" not in json.dumps(runtime_stored["messages"], ensure_ascii=False),
            "local Skill text is not persisted by Pi")
+        buffered_chapter = db.create_chapter(work["id"], uid, "Buffered stream chapter")
+        buffered_status, _, buffered_events = post_stream_events(
+            client, "/api/agent/stream",
+            {"text": "Use buffered local runtime", "chapter_id": buffered_chapter["id"]}, token,
+        )
+        ok(buffered_status == 200 and not any(
+            event.get("type") == "assistant_delta" for event in buffered_events
+        ), "launcher 回合不会提前流出未确认回答")
+        ok(any(
+            event.get("type") == "status" and event.get("stage") == "confirming"
+            for event in buffered_events
+        ) and any(event.get("type") == "result" for event in buffered_events),
+           "launcher 确认后才返回流式回合的最终结果")
     finally:
         main.config.AGENT_SKILL_DIR = old_runtime["dir"]
         main.config.AGENT_SKILL_LAUNCHER = old_runtime["launcher"]

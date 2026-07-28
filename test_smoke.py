@@ -628,6 +628,9 @@ def _make_agent(stub):
         return stub[min(i, len(stub) - 1)]
     return fake
 
+def _stream_events(response):
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
 def _put_conv(tok, chapter_id, text="hi"):
     """用假 agent_chat 给某 用户×章节 落一条对话（无工具调用），便于后续测试。"""
     _saved = llm.agent_chat
@@ -637,11 +640,72 @@ def _put_conv(tok, chapter_id, text="hi"):
     finally:
         llm.agent_chat = _saved
 
+# 兼容 OpenAI 流必须同时正确拼接文字和分片 function call。
+_orig_get_client = llm._get_client
+_compat_deltas = []
+_compat_chunks = [
+    types.SimpleNamespace(choices=[types.SimpleNamespace(delta=types.SimpleNamespace(
+        content="先", tool_calls=[],
+    ))]),
+    types.SimpleNamespace(choices=[types.SimpleNamespace(delta=types.SimpleNamespace(
+        content=None, tool_calls=[types.SimpleNamespace(
+            index=0, id="call-stream", type="function",
+            function=types.SimpleNamespace(name="read_", arguments='{"chapter_'),
+        )],
+    ))]),
+    types.SimpleNamespace(choices=[types.SimpleNamespace(delta=types.SimpleNamespace(
+        content="看", tool_calls=[types.SimpleNamespace(
+            index=0, id=None, type=None,
+            function=types.SimpleNamespace(name="chapter", arguments='id":1}'),
+        )],
+    ))]),
+]
+_fake_completions = types.SimpleNamespace(create=lambda **kw: iter(_compat_chunks))
+llm._get_client = lambda *args: types.SimpleNamespace(
+    chat=types.SimpleNamespace(completions=_fake_completions)
+)
+_compat_message = llm.agent_chat_stream(
+    [{"role": "user", "content": "test"}], [], base_url="https://stream.test/v1",
+    api_key="test", model="test", on_text_delta=_compat_deltas.append,
+)
+llm._get_client = _orig_get_client
+ok(_compat_message.content == "先看" and "".join(_compat_deltas) == "先看",
+   "兼容模型流式文字分片可重组")
+ok(_compat_message.tool_calls[0].function.name == "read_chapter"
+   and json.loads(_compat_message.tool_calls[0].function.arguments)["chapter_id"] == 1,
+   "兼容模型流式工具调用分片可重组")
+
 # 入参校验 / 鉴权（carol 无 key，不触达 LLM）
 ok(c.post("/api/agent", json={"text": "hi", "chapter_id": ccid}, headers=H(tokC)).status_code == 500, "agent 无key 500")
 ok(c.post("/api/agent", json={"text": ""}, headers=H(tokA)).status_code == 400, "agent 空文本 400")
 ok(c.post("/api/agent", json={"text": "hi"}).status_code == 401, "agent 未登录 401")
 ok(c.post("/api/agent/audio", json={"audio": "", "format": "wav"}, headers=H(tokA)).status_code == 400, "语音直发空录音 400")
+ok(c.post("/api/agent/stream", json={"text": ""}, headers=H(tokA)).status_code == 400, "agent 流式空文本 400")
+
+# 兼容 Agent 也要把供应商增量转成 NDJSON，最终结果仍完整保存。
+_orig_agent_stream = llm.agent_chat_stream
+_stream_deltas = []
+def _fake_agent_stream(messages, tools, on_text_delta=None, **kw):
+    for delta in ("流式", "回复"):
+        _stream_deltas.append(delta)
+        if on_text_delta:
+            on_text_delta(delta)
+    return _msg("流式回复")
+llm.agent_chat_stream = _fake_agent_stream
+stream_cid = c.post(f"/api/works/{wid}/chapters", json={"title": "流式测试"}, headers=H(tokA)).json()["id"]
+_stream_response = c.post(
+    "/api/agent/stream", json={"text": "测试流式输出", "chapter_id": stream_cid}, headers=H(tokA),
+)
+_streamed = _stream_events(_stream_response)
+_stream_result = next((event.get("data") for event in _streamed if event.get("type") == "result"), None)
+ok(_stream_response.status_code == 200 and _stream_response.headers.get("x-accel-buffering") == "no",
+   "兼容 Agent 流式接口关闭代理缓冲")
+ok("".join(event.get("delta", "") for event in _streamed if event.get("type") == "assistant_delta") == "流式回复",
+   "兼容 Agent 文本增量进入 NDJSON")
+ok(_stream_result and _stream_result["reply"] == "流式回复"
+   and db.get_conversation(uidA, stream_cid)["messages"][-1]["content"] == "流式回复",
+   "流式最终结果完整持久化")
+llm.agent_chat_stream = _orig_agent_stream
 
 # 直发语音：本轮模型收到 input_audio，但持久化记录只保存语音占位文本，不存 Base64。
 _orig_ac = llm.agent_chat
@@ -1190,7 +1254,7 @@ ok(c.delete(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)).sta
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260728-2" in _home.text and "app.js?v=ui-20260728-2" in _home.text,
+ok(_home.status_code == 200 and "style.css?v=ui-20260728-3" in _home.text and "app.js?v=ui-20260728-3" in _home.text,
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")

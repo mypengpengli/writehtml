@@ -8,12 +8,13 @@ import re
 import zipfile
 import time
 import threading
+import queue
 from urllib.parse import quote, unquote
 
 import yaml
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import config, context_builder, db, inspiration, llm, pi_agent, skill_runtime, tavily_search
@@ -3293,7 +3294,7 @@ def _pi_tools():
 
 def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                   runtime_system=None, persist=True, session_id=None, work_id=None,
-                  use_history=True, retain_history=True):
+                  use_history=True, retain_history=True, on_event=None):
     """Run the writing agent through the official Pi Coding Agent process."""
     audio = None
     context_instruction = history_text
@@ -3405,7 +3406,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
         "cwd": config.PI_AGENT_WORKSPACE_DIR,
         "skillDirs": [config.PI_AGENT_SKILL_DIR] if config.PI_AGENT_SKILL_DIR else [],
     }
-    turn_messages = pi_agent.run_turn(request, execute_tool)
+    turn_messages = pi_agent.run_turn(request, execute_tool, on_event=on_event)
     reply = ""
     for message in reversed(turn_messages):
         if isinstance(message, dict) and message.get("role") == "assistant":
@@ -3471,7 +3472,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
 
 def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                runtime_system=None, persist=True, session_id=None, work_id=None,
-               use_history=True, retain_history=True):
+               use_history=True, retain_history=True, on_event=None):
     """执行一轮 agent。
 
     history_text 是持久化到 SQLite 的安全文本；model_turn 可在本轮替换成音频等
@@ -3555,7 +3556,16 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
 
     reply = ""
     for _ in range(6):
-        msg = llm.agent_chat(messages, AGENT_TOOLS, base_url=base_url, api_key=api_key, model=model)
+        if on_event:
+            on_event({"type": "assistant_start"})
+            msg = llm.agent_chat_stream(
+                messages, AGENT_TOOLS, base_url=base_url, api_key=api_key, model=model,
+                on_text_delta=lambda delta: on_event({"type": "assistant_delta", "delta": delta}),
+            )
+        else:
+            msg = llm.agent_chat(
+                messages, AGENT_TOOLS, base_url=base_url, api_key=api_key, model=model
+            )
         m = {"role": "assistant", "content": msg.content}
         if msg.tool_calls:
             m["tool_calls"] = [
@@ -3570,6 +3580,8 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
             break
         for tc in msg.tool_calls:
             name = tc.function.name
+            if on_event:
+                on_event({"type": "tool_start", "name": name})
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
@@ -3678,19 +3690,54 @@ def _apply_story_update_proposals(uid, state_request):
 
 
 def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
-                    session_id=None, work_id=None, use_history=True, retain_history=True):
+                    session_id=None, work_id=None, use_history=True, retain_history=True,
+                    on_event=None):
     """执行 Agent，并在启用本机运行时时先缓冲回答、等 after/recovery 确认。"""
+    def emit(event):
+        if not on_event:
+            return
+        try:
+            on_event(event)
+        except Exception:
+            # 进度通道断开不影响模型执行、工具副作用和会话持久化。
+            pass
+
+    emit({"type": "status", "stage": "preparing", "message": "正在准备本轮上下文"})
     turn = None
     try:
         turn = skill_runtime.start_turn(_runtime_request_payload(
             uid, cid, history_text, selection, session_id, work_id, retain_history
         ))
+        text_stream_allowed = turn is None
+        buffered_notice_sent = False
+
+        def relay(event):
+            nonlocal buffered_notice_sent
+            if (
+                not text_stream_allowed
+                and isinstance(event, dict)
+                and event.get("type") in {"assistant_start", "assistant_delta"}
+            ):
+                if not buffered_notice_sent:
+                    buffered_notice_sent = True
+                    emit({
+                        "type": "status", "stage": "generating",
+                        "message": "正在生成，回答将在本机 Skill 确认后显示",
+                    })
+                return
+            emit(event)
+
+        emit({
+            "type": "status", "stage": "generating",
+            "message": "正在生成回答" if text_stream_allowed else "本机 Skill 已加载，正在生成回答",
+        })
         engine = _run_pi_agent if config.PI_AGENT_ENABLED else _run_legacy_agent
         result = engine(
             uid, cid, history_text, selection, skill_ids, model_turn=model_turn,
             runtime_system=turn.system_message if turn else None,
             persist=turn is None, session_id=session_id, work_id=work_id,
             use_history=use_history, retain_history=retain_history,
+            on_event=relay if on_event else None,
         )
     except skill_runtime.SkillRuntimeError as e:
         raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
@@ -3707,6 +3754,7 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     state_request = result.pop("_character_state_request", None)
     if not turn:
         if state_request:
+            emit({"type": "status", "stage": "story_state", "message": "正在整理人物与剧情状态"})
             character_proposals, plot_proposal, memory_proposals = _apply_story_update_proposals(uid, state_request)
             result["character_state_proposals"] = character_proposals
             result["plot_state_proposal"] = plot_proposal
@@ -3714,6 +3762,7 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
         return result
 
     pending = result.pop("_pending_conversation")
+    emit({"type": "status", "stage": "confirming", "message": "正在确认本机 Skill 回合"})
     try:
         runtime_state = turn.complete({
             "reply": result["reply"], "messages": result["messages"],
@@ -3725,6 +3774,7 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
         raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
     saved = None
     if retain_history:
+        emit({"type": "status", "stage": "saving", "message": "正在保存会话"})
         saved = db.save_conversation(
             uid, cid, pending["messages"], pending["summary"],
             session_id=session_id, work_id=work_id,
@@ -3743,6 +3793,7 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     result["temporary"] = not retain_history
     result["conversation_summary"] = pending.get("summary") if retain_history else ""
     if state_request:
+        emit({"type": "status", "stage": "story_state", "message": "正在整理人物与剧情状态"})
         character_proposals, plot_proposal, memory_proposals = _apply_story_update_proposals(uid, state_request)
         result["character_state_proposals"] = character_proposals
         result["plot_state_proposal"] = plot_proposal
@@ -3810,6 +3861,80 @@ async def agent(request: Request):
     )
 
 
+def _agent_stream_error(exc):
+    status = exc.status_code if isinstance(exc, HTTPException) else 500
+    detail = exc.detail if isinstance(exc, HTTPException) else _provider_error(exc)
+    turn_id = None
+    if isinstance(detail, dict):
+        message = detail.get("message") or detail.get("detail") or "Agent 执行失败"
+        turn_id = detail.get("turn_id")
+    else:
+        message = str(detail or "Agent 执行失败")
+    payload = {"type": "error", "status": status, "message": _provider_error(message)}
+    if turn_id:
+        payload["turn_id"] = turn_id
+    return payload
+
+
+def _agent_streaming_response(thread_name, task):
+    events = queue.Queue()
+
+    def publish(event):
+        if isinstance(event, dict):
+            events.put(event)
+
+    def worker():
+        try:
+            publish({"type": "result", "data": task(publish)})
+        except Exception as exc:
+            publish(_agent_stream_error(exc))
+        finally:
+            events.put(None)
+
+    threading.Thread(target=worker, name=thread_name, daemon=True).start()
+
+    def event_lines():
+        while True:
+            try:
+                event = events.get(timeout=12)
+            except queue.Empty:
+                yield '{"type":"ping"}\n'
+                continue
+            if event is None:
+                break
+            yield json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    return StreamingResponse(
+        event_lines(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post("/api/agent/stream")
+async def agent_stream(request: Request):
+    """以 NDJSON 增量返回 Agent 进度和文本，最终 result 仍是权威完整结果。"""
+    uid = _auth(request)
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "没有对话内容")
+    turn = _prepare_agent_turn(uid, body, text)
+    return _agent_streaming_response(
+        f"agent-stream-{uid}-{turn['session_id'] or 'temp'}",
+        lambda publish: _run_agent_turn(
+            uid, turn["chapter_id"], text, body.get("selection"), body.get("skill_ids"),
+            session_id=turn["session_id"], work_id=turn["work_id"],
+            use_history=turn["use_history"], retain_history=turn["retain_history"],
+            on_event=publish,
+        ),
+    )
+
+
 @app.post("/api/agent/context")
 async def inspect_agent_context(request: Request):
     uid = _auth(request)
@@ -3824,11 +3949,7 @@ async def inspect_agent_context(request: Request):
     return result
 
 
-@app.post("/api/agent/audio")
-async def agent_audio(request: Request):
-    """语音直发模式：把 WAV/MP3 作为多模态用户消息交给当前 Agent 模型。"""
-    uid = _auth(request)
-    body = await request.json()
+def _direct_audio_model_turn(body):
     audio_b64 = body.get("audio")
     audio_format = (body.get("format") or "").lower().strip()
     if not isinstance(audio_b64, str) or not audio_b64:
@@ -3844,8 +3965,7 @@ async def agent_audio(request: Request):
     if len(audio) > 5 * 1024 * 1024:
         raise HTTPException(413, "录音太长，请控制在一分钟内")
 
-    # OpenAI Chat Completions 的音频内容格式；不兼容的网关会返回明确的直发失败提示。
-    model_turn = {
+    return audio_format, {
         "role": "user",
         "content": [
             {
@@ -3859,6 +3979,14 @@ async def agent_audio(request: Request):
             },
         ],
     }
+
+
+@app.post("/api/agent/audio")
+async def agent_audio(request: Request):
+    """语音直发模式：把 WAV/MP3 作为多模态用户消息交给当前 Agent 模型。"""
+    uid = _auth(request)
+    body = await request.json()
+    audio_format, model_turn = _direct_audio_model_turn(body)
     try:
         turn = _prepare_agent_turn(uid, body, "语音会话")
         result = _run_agent_turn(
@@ -3879,6 +4007,34 @@ async def agent_audio(request: Request):
         raise HTTPException(502, "语音已直接发送给模型，但当前模型或网关不支持音频输入/工具调用。"
                             "可关闭「直接发送语音给 AI」后改用转写模式。"
                             f" 详情：{_provider_error(e)}")
+
+
+@app.post("/api/agent/audio/stream")
+async def agent_audio_stream(request: Request):
+    """语音直发的增量响应版本；原始录音仍仅存在于当前模型回合。"""
+    uid = _auth(request)
+    body = await request.json()
+    audio_format, model_turn = _direct_audio_model_turn(body)
+    turn = _prepare_agent_turn(uid, body, "语音会话")
+
+    def run(publish):
+        result = _run_agent_turn(
+            uid, turn["chapter_id"], "[voice] 语音指令",
+            body.get("selection"), body.get("skill_ids"), model_turn=model_turn,
+            session_id=turn["session_id"], work_id=turn["work_id"],
+            use_history=turn["use_history"], retain_history=turn["retain_history"],
+            on_event=publish,
+        )
+        settings = db.get_settings(uid) or {}
+        result["voice"] = {
+            "mode": "direct", "route": "/api/agent/audio/stream → 当前 Agent 模型",
+            "model": settings.get("llm_model") or config.LLM_MODEL, "format": audio_format,
+        }
+        return result
+
+    return _agent_streaming_response(
+        f"agent-audio-stream-{uid}-{turn['session_id'] or 'temp'}", run,
+    )
 
 
 @app.post("/api/agent/runtime/recover/{turn_id}")

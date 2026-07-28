@@ -14,6 +14,7 @@
 - **AI 助手（agent）**：🤖 常驻右侧侧栏，用自然语言让 AI 直接动手——改某段文字、续写、回退到历史版本、改标题/备注、加章、摘要、设定校验。每个写操作前自动存版本快照，对话里每步带「撤销」按钮，错了秒回。支持**语音指令**（🎤 默认直发模型，关闭直发后才转写）与**自动朗读**（🔊 把 AI 的回复与操作念给你听）。
 - **多会话与上下文控制**：每个章节可以新建、切换、重命名、归档和删除多组 AI 会话。默认「继续」会读取并保存当前会话；「无历史」本轮不把旧聊天发给模型，但会把本轮结果留在当前会话；「临时一问」既不读取也不保存聊天记录。
 - **Pi 原生智能体**：AI 助手以官方 Pi Coding Agent 运行，原生 `read / bash / edit / write / grep / find / ls`、本机 `SKILL.md`、扩展和已安装包均可用；现有章节、版本和选区工具作为额外 Pi 工具保留。
+- **流式回答**：文字指令和直发语音都通过增量接口返回。模型开始输出后，右侧助手立即显示生成内容和工具执行状态；前端按浏览器绘制帧合并更新，长回复不会每个 token 重排整页。
 - **联网搜索**：在「模型与联网设置」中可保存多条 Tavily Key（每行一条）。Agent 遇到今天、最新、新闻或明确的网上查询时调用 `web_search`，Key 按请求轮换，遇到无效、限流、额度或服务错误会自动尝试下一条；搜索卡片保留可点击来源。
 - **多模态灵感库**：在「⋯」→「灵感库」保存文字、图片、语音、音乐、视频和网页链接。系统先持久保存作者原话与原始素材，再由 AI 后台整理为可检索卡片；通用灵感和作品专用灵感严格隔离于正式故事记忆。Agent 可通过工具真实保存、搜索、编辑并记录灵感实际使用到哪一章。
 - **AI 工具**：✦AI 做一致性校验（只列问题不改字）、生成本章摘要（填进备注当后续上下文）。
@@ -62,6 +63,40 @@ cd /opt/1panel/docker/compose/writehtml && bash deploy.sh
 ```
 
 数据库、灵感原始素材和运行时恢复文件都在 `./data/` 卷里，容器重建不会丢。备份时应备份整个 `./data/`，不能只复制 `writehtml.db`。
+
+### AI 助手流式输出
+
+网页端默认使用以下两个增量接口：
+
+```text
+POST /api/agent/stream
+POST /api/agent/audio/stream
+```
+
+响应类型是 `application/x-ndjson`，一行一个 JSON 事件。`assistant_delta` 用于生成中的文字，`tool_start` 和 `status` 用于显示当前阶段，`ping` 防止长工具任务期间连接空闲超时，最后一条 `result` 携带完整、已保存的权威结果。发生错误时返回 `error`；如果本机 launcher 留下了可恢复回合，事件中会带 `turn_id`。
+
+旧接口 `POST /api/agent` 和 `POST /api/agent/audio` 仍然保留，供旧客户端或接口调用一次性取得完整 JSON。普通润色、扩写、摘要等原子编辑接口仍先生成完整结果再应用，避免半段正文进入编辑器。
+
+Pi 供应商请求和兼容 Agent 请求都会显式开启 `stream=true`。流式 HTTP 任务在独立线程运行，不阻塞 FastAPI 处理其他请求；浏览器最多每个动画帧刷新一次消息 DOM。Pi 进程仍按回合隔离，不复用带状态的全局 Agent 进程，避免并发会话、工具状态和工作目录互相污染。
+
+启用“本机 meta-memory launcher”后是一个有意的例外：浏览器会实时看到“正在生成 / 正在确认 / 正在保存”等状态，但不会提前收到 `assistant_delta`。完整回答必须先写入独立回答文件，并经 `after` 或 `recovery replay` 确认后，才通过最终 `result` 返回。只使用 Pi 原生 Skills、没有配置 launcher 时，文字仍正常实时流出。
+
+应用响应已经包含 `X-Accel-Buffering: no` 和 `Cache-Control: no-cache, no-transform`。如果域名前还有 Nginx、1Panel 反代或 CDN，仍然整段出现而不是逐步显示，应关闭这两个接口的代理缓冲和压缩：
+
+```nginx
+location ~ ^/api/agent/(stream|audio/stream)$ {
+    proxy_pass http://127.0.0.1:9123;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_buffering off;
+    proxy_cache off;
+    gzip off;
+    proxy_read_timeout 300s;
+}
+```
+
+修改 1Panel 生成的站点配置后需要重载 Nginx。若使用 CDN，还要关闭该路径的响应缓存、内容改写和“完整响应后再压缩”一类功能。
 
 ### Pi 原生 Skills、扩展和包（可选）
 
@@ -145,8 +180,8 @@ python main.py
 
 ```bash
 python -m py_compile *.py && node --check static/app.js   # 语法
-python test_smoke.py                                       # 接口冒烟（转写模式，无需 LLM key）
-python test_pi_runtime.py                                  # Pi 原生工具、Skill、语音与 launcher
+python test_smoke.py                                       # 接口、兼容 Agent 流式输出（无需真实 LLM key）
+python test_pi_runtime.py                                  # Pi 流式输出、原生工具、Skill、语音与 launcher
 ```
 
 ## 关于 HTTPS（重要）

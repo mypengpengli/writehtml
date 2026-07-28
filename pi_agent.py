@@ -28,7 +28,7 @@ def _write_command(process, command):
     process.stdin.flush()
 
 
-def run_turn(request, execute_tool, timeout=None):
+def run_turn(request, execute_tool, timeout=None, on_event=None):
     """Run one isolated official Pi Coding Agent process and broker app tools."""
     timeout = float(timeout or config.PI_AGENT_TIMEOUT_SECONDS)
     command = [config.PI_AGENT_NODE, config.PI_AGENT_BRIDGE]
@@ -83,6 +83,14 @@ def run_turn(request, execute_tool, timeout=None):
                 raise PiAgentError(f"Pi bridge emitted invalid JSON: {line[:300]}") from exc
 
             event_type = event.get("type")
+            if event_type in {"assistant_start", "assistant_delta", "tool_start"}:
+                if on_event:
+                    try:
+                        on_event(event)
+                    except Exception:
+                        # 浏览器断开或进度回调异常不能中断模型、工具或会话保存。
+                        pass
+                continue
             if event_type == "tool_call":
                 call_id = event.get("toolCallId")
                 try:

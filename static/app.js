@@ -26,6 +26,9 @@ let dragCid = null;
 // AI 助手（agent）
 let agentMsgs = [];
 let agentBusy = false;
+let agentReplyDraft = "";
+let agentReplyStatus = "";
+let agentReplyRenderPending = false;
 let agentUndone = new Set();
 let agentSelection = null;
 let agentSessions = [];
@@ -197,6 +200,49 @@ async function api(path, opts = {}) {
   if (res.status === 401) { showLogin(); throw new Error("未登录"); }
   if (!res.ok) throw new Error(await responseError(res));
   return res.json();
+}
+
+async function streamAgent(body, onEvent, path = "/api/agent/stream") {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/x-ndjson",
+      ...(token ? { Authorization: "Bearer " + token } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) { showLogin(); throw new Error("未登录"); }
+  if (!res.ok) throw new Error(await responseError(res));
+  if (!res.body) throw new Error("当前浏览器不支持流式响应");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = done ? "" : lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let event;
+      try { event = JSON.parse(line); }
+      catch (e) { throw new Error("流式响应格式无效"); }
+      if (event.type === "ping") continue;
+      if (event.type === "error") {
+        let message = event.message || "Agent 执行失败";
+        if (event.turn_id) message += `（恢复编号：${event.turn_id}）`;
+        throw new Error(message);
+      }
+      if (event.type === "result") result = event.data;
+      else onEvent(event);
+    }
+    if (done) break;
+  }
+  if (!result) throw new Error("Agent 流式响应未返回最终结果");
+  return result;
 }
 
 async function responseError(res) {
@@ -1503,6 +1549,38 @@ function renderAgentSources(sources) {
   }).filter(Boolean).join("");
   return links ? `<div class="agent-source-list"><span>搜索来源</span>${links}</div>` : "";
 }
+function scheduleAgentReplyRender() {
+  if (agentReplyRenderPending) return;
+  agentReplyRenderPending = true;
+  requestAnimationFrame(() => {
+    agentReplyRenderPending = false;
+    if (!agentBusy) return;
+    const host = $("agentMsgs");
+    const draftNode = $("agentStreamText");
+    const statusNode = $("agentStreamStatusText");
+    if (!!draftNode !== !!agentReplyDraft || !!statusNode !== !!agentReplyStatus) {
+      renderAgent();
+      return;
+    }
+    if (draftNode) draftNode.textContent = agentReplyDraft;
+    if (statusNode) statusNode.textContent = agentReplyStatus;
+    if (host) host.scrollTop = host.scrollHeight;
+  });
+}
+function updateAgentReplyStream(event) {
+  if (event.type === "assistant_start") {
+    agentReplyDraft = "";
+    agentReplyStatus = "正在生成回答";
+  } else if (event.type === "assistant_delta" && typeof event.delta === "string") {
+    agentReplyDraft += event.delta;
+    agentReplyStatus = "";
+  } else if (event.type === "tool_start") {
+    agentReplyStatus = `正在使用 ${event.name || "工具"}`;
+  } else if (event.type === "status") {
+    agentReplyStatus = event.message || "";
+  }
+  scheduleAgentReplyRender();
+}
 function renderAgent() {
   const el = $("agentMsgs");
   if (agentConversationLoading) {
@@ -1544,7 +1622,14 @@ function renderAgent() {
       }
     }
   }
-  if (agentBusy) html += '<div class="cm assistant">… 思考中</div>';
+  if (agentBusy && agentReplyDraft) {
+    html += `<div id="agentStreamBubble" class="cm assistant streaming"><span id="agentStreamText">${esc(agentReplyDraft)}</span><span class="stream-caret"></span></div>`;
+  }
+  if (agentBusy && agentReplyStatus) {
+    html += `<div class="agent-stream-status"><span class="spinner"></span><span id="agentStreamStatusText">${esc(agentReplyStatus)}</span></div>`;
+  } else if (agentBusy && !agentReplyDraft) {
+    html += '<div class="cm assistant">… 思考中</div>';
+  }
   el.innerHTML = html;
   el.scrollTop = el.scrollHeight;
 }
@@ -1611,6 +1696,8 @@ async function sendAgent() {
   if (dirty) await saveNow();
   agentMsgs.push({ role: "user", content: text, temporary: conversationMode === "temporary" });
   agentBusy = true;
+  agentReplyDraft = "";
+  agentReplyStatus = "正在发送";
   busy($("sendBtn"), true, "发送");
   renderAgent();
   const selection = agentSelection;
@@ -1621,12 +1708,17 @@ async function sendAgent() {
   if (selection) body.selection = selection;
   if (activeAgentSkillIds.size) body.skill_ids = [...activeAgentSkillIds];
   try {
-    const r = await api("/api/agent", { body });
+    const r = await streamAgent(body, updateAgentReplyStream);
+    agentReplyDraft = "";
+    agentReplyStatus = "正在更新界面";
+    scheduleAgentReplyRender();
     await applyAgentResult(r, selection, baseMessages);
   } catch (e) {
     agentMsgs.push({ role: "assistant", content: "出错：" + e.message });
   } finally {
     agentBusy = false;
+    agentReplyDraft = "";
+    agentReplyStatus = "";
     busy($("sendBtn"), false, "发送");
     setAgentConversationMode("standard");
     renderAgentSessionControls();
@@ -1909,6 +2001,8 @@ async function sendAgentAudio(blob) {
   if (dirty) await saveNow();
   agentMsgs.push({ role: "user", content: "[voice] 语音指令", temporary: conversationMode === "temporary" });
   agentBusy = true;
+  agentReplyDraft = "";
+  agentReplyStatus = "正在处理录音";
   btn.classList.add("is-busy");
   if (!_agentPH) _agentPH = el.placeholder;
   el.placeholder = "正在把语音发送给 AI…";
@@ -1918,21 +2012,15 @@ async function sendAgentAudio(blob) {
     const wav = await recordToMonoWav(blob);
     if (wav.size > 5 * 1024 * 1024) throw new Error("录音太长，请控制在一分钟内");
     const audio = await blobToBase64(wav);
-    const res = await fetch("/api/agent/audio", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: "Bearer " + token } : {}),
-      },
-      body: JSON.stringify({
-        audio, format: "wav", selection, ...agentScopeBody(),
-        session_id: currentAgentSessionId, conversation_mode: conversationMode,
-        ...(activeAgentSkillIds.size ? { skill_ids: [...activeAgentSkillIds] } : {}),
-      }),
-    });
-    if (res.status === 401) { showLogin(); throw new Error("未登录"); }
-    if (!res.ok) throw new Error(await responseError(res));
-    const result = await res.json();
+    const body = {
+      audio, format: "wav", selection, ...agentScopeBody(),
+      session_id: currentAgentSessionId, conversation_mode: conversationMode,
+      ...(activeAgentSkillIds.size ? { skill_ids: [...activeAgentSkillIds] } : {}),
+    };
+    const result = await streamAgent(body, updateAgentReplyStream, "/api/agent/audio/stream");
+    agentReplyDraft = "";
+    agentReplyStatus = "正在更新界面";
+    scheduleAgentReplyRender();
     setVoiceTrace("语音已发送", `${result.voice?.route || "当前 Agent 模型"} · ${result.voice?.model || ""}`, "ok");
     await applyAgentResult(result, selection, baseMessages);
   } catch (e) {
@@ -1941,6 +2029,8 @@ async function sendAgentAudio(blob) {
     showToast("语音直发失败：" + e.message, "err");
   } finally {
     agentBusy = false;
+    agentReplyDraft = "";
+    agentReplyStatus = "";
     btn.classList.remove("is-busy");
     setAgentConversationMode("standard");
     renderAgentSessionControls();

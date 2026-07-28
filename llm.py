@@ -1,5 +1,6 @@
 """OpenAI 兼容的大模型调用。润色 / 扩写 / 续写 三种模式的提示词。"""
 import json
+from types import SimpleNamespace
 from openai import OpenAI
 import config
 
@@ -83,6 +84,63 @@ def agent_chat(messages, tools, *, base_url=None, api_key=None, model=None):
         temperature=0.6,
     )
     return resp.choices[0].message
+
+
+def agent_chat_stream(messages, tools, *, base_url=None, api_key=None, model=None,
+                      on_text_delta=None):
+    """Agent 单步流式调用，并组装成与 ``agent_chat`` 相同的完整 message。"""
+    base_url = base_url or config.LLM_BASE_URL
+    api_key = api_key or config.LLM_API_KEY
+    model = model or config.LLM_MODEL
+    stream = _get_client(base_url, api_key).chat.completions.create(
+        model=model, messages=messages, tools=tools, tool_choice="auto",
+        temperature=0.6, stream=True,
+    )
+    content_parts = []
+    tool_calls = {}
+    for chunk in stream:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        delta = choices[0].delta
+        content = getattr(delta, "content", None)
+        if isinstance(content, str) and content:
+            content_parts.append(content)
+            if on_text_delta:
+                try:
+                    on_text_delta(content)
+                except Exception:
+                    # 展示通道异常不能丢掉已经生成的完整模型消息。
+                    pass
+        for call in getattr(delta, "tool_calls", None) or []:
+            index = getattr(call, "index", 0)
+            if not isinstance(index, int):
+                index = 0
+            current = tool_calls.setdefault(index, {
+                "id": "", "type": "function", "name": "", "arguments": "",
+            })
+            if getattr(call, "id", None):
+                current["id"] = call.id
+            if getattr(call, "type", None):
+                current["type"] = call.type
+            function = getattr(call, "function", None)
+            if function:
+                if getattr(function, "name", None):
+                    current["name"] += function.name
+                if getattr(function, "arguments", None):
+                    current["arguments"] += function.arguments
+    assembled_calls = [
+        SimpleNamespace(
+            id=value["id"] or f"call_{index}",
+            type=value["type"],
+            function=SimpleNamespace(name=value["name"], arguments=value["arguments"]),
+        )
+        for index, value in sorted(tool_calls.items())
+    ]
+    return SimpleNamespace(
+        content="".join(content_parts) or None,
+        tool_calls=assembled_calls,
+    )
 
 
 def summarize(messages, prev="", *, base_url=None, api_key=None, model=None):

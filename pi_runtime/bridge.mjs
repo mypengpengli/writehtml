@@ -398,6 +398,23 @@ async function createPiSession(request) {
   session.agent.state.messages = Array.isArray(request.messages) ? request.messages : [];
   session.agent.sessionId = String(request.sessionId || session.agent.sessionId || "writehtml-pi");
   installWritingToolLifecycle(session);
+  session.subscribe((event) => {
+    if (event.type === "message_start" && event.message?.role === "assistant") {
+      emit({ type: "assistant_start" });
+      return;
+    }
+    if (
+      event.type === "message_update"
+      && event.assistantMessageEvent?.type === "text_delta"
+      && typeof event.assistantMessageEvent.delta === "string"
+    ) {
+      emit({ type: "assistant_delta", delta: event.assistantMessageEvent.delta });
+      return;
+    }
+    if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
+      emit({ type: "tool_start", name: event.toolName });
+    }
+  });
   return session;
 }
 
