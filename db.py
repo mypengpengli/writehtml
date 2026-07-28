@@ -55,6 +55,8 @@ STORY_MEMORY_TYPE_LABELS = {
 }
 MAX_LLM_MODELS = 20
 MAX_LLM_MODEL_ID_LENGTH = 160
+MAX_TAVILY_API_KEYS = 20
+MAX_TAVILY_API_KEY_LENGTH = 500
 
 
 def _normalize_llm_models(models, active_model=""):
@@ -81,6 +83,32 @@ def _decode_llm_models(raw, active_model=""):
     except Exception:
         models = []
     return _normalize_llm_models(models, active_model)
+
+
+def normalize_tavily_api_keys(values):
+    """Normalize a small ordered key list without logging or returning raw errors."""
+    if isinstance(values, str):
+        values = re.split(r"[,;\r\n]+", values)
+    if not isinstance(values, (list, tuple)):
+        return []
+    result = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        key = value.strip().strip("\"'")[:MAX_TAVILY_API_KEY_LENGTH]
+        if key and not key.startswith("****") and key not in result:
+            result.append(key)
+        if len(result) >= MAX_TAVILY_API_KEYS:
+            break
+    return result
+
+
+def _decode_tavily_api_keys(raw):
+    try:
+        values = json.loads(raw or "[]")
+    except Exception:
+        values = []
+    return normalize_tavily_api_keys(values)
 
 
 def normalize_character_state(state, base=None):
@@ -534,12 +562,18 @@ def _migration_agent_sessions(conn):
         )
 
 
+def _migration_tavily_search_settings(conn):
+    """Allow each user to keep a private, ordered Tavily key pool."""
+    _add_col(conn, "user_settings", "tavily_api_keys_json", "TEXT DEFAULT '[]'")
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
     (3, "model_presets", _migration_model_presets),
     (4, "creative_inspiration_library", _migration_creative_inspirations),
     (5, "agent_multi_session", _migration_agent_sessions),
+    (6, "tavily_search_settings", _migration_tavily_search_settings),
 )
 
 
@@ -1309,7 +1343,8 @@ def get_settings(user_id):
     """返回该用户的 LLM 设置；没存过返回 None（调用方用 .env 兜底）。"""
     with get_conn() as conn:
         r = conn.execute(
-            "SELECT llm_base_url, llm_api_key, llm_model, llm_models_json, asr_base_url, asr_api_key, asr_model "
+            "SELECT llm_base_url, llm_api_key, llm_model, llm_models_json, "
+            "asr_base_url, asr_api_key, asr_model, tavily_api_keys_json "
             "FROM user_settings WHERE user_id=?",
             (user_id,),
         ).fetchone()
@@ -1319,16 +1354,21 @@ def get_settings(user_id):
         settings["llm_models"] = _decode_llm_models(
             settings.pop("llm_models_json", "[]"), settings.get("llm_model") or "",
         )
+        settings["tavily_api_keys"] = _decode_tavily_api_keys(
+            settings.pop("tavily_api_keys_json", "[]")
+        )
         return settings
 
 
 def save_settings(user_id, base_url, api_key, model, asr_model=None,
-                  asr_base_url=None, asr_api_key=None, models=None):
+                  asr_base_url=None, asr_api_key=None, models=None,
+                  tavily_api_keys=None):
     """保存设置。api_key 为空或为掩码占位时保留旧值，避免清空已填的 key。"""
     now = time.time()
     with get_conn() as conn:
         old = conn.execute(
-            "SELECT llm_api_key, asr_api_key, llm_model, llm_models_json FROM user_settings WHERE user_id=?", (user_id,)
+            "SELECT llm_api_key, asr_api_key, llm_model, llm_models_json, "
+            "tavily_api_keys_json FROM user_settings WHERE user_id=?", (user_id,)
         ).fetchone()
         if not api_key or api_key.startswith("****"):
             api_key = old["llm_api_key"] if old else ""
@@ -1339,18 +1379,24 @@ def save_settings(user_id, base_url, api_key, model, asr_model=None,
         model_list = _normalize_llm_models(old_models if models is None else models, model)
         if not model and model_list:
             model = model_list[0]
+        if tavily_api_keys is None:
+            tavily_keys = _decode_tavily_api_keys(old["tavily_api_keys_json"]) if old else []
+        else:
+            tavily_keys = normalize_tavily_api_keys(tavily_api_keys)
         conn.execute(
             "INSERT INTO user_settings(user_id, llm_base_url, llm_api_key, llm_model, "
-            "llm_models_json, asr_base_url, asr_api_key, asr_model, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?) "
+            "llm_models_json, asr_base_url, asr_api_key, asr_model, tavily_api_keys_json, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "llm_base_url=excluded.llm_base_url, llm_api_key=excluded.llm_api_key, "
             "llm_model=excluded.llm_model, llm_models_json=excluded.llm_models_json, asr_base_url=excluded.asr_base_url, "
-            "asr_api_key=excluded.asr_api_key, asr_model=excluded.asr_model, updated_at=excluded.updated_at",
+            "asr_api_key=excluded.asr_api_key, asr_model=excluded.asr_model, "
+            "tavily_api_keys_json=excluded.tavily_api_keys_json, updated_at=excluded.updated_at",
             (user_id, base_url, api_key, model, json.dumps(model_list, ensure_ascii=False),
-             asr_base_url or "", asr_api_key, asr_model, now),
+             asr_base_url or "", asr_api_key, asr_model,
+             json.dumps(tavily_keys, ensure_ascii=False), now),
         )
-        return {"model": model, "models": model_list}
+        return {"model": model, "models": model_list, "tavily_user_key_count": len(tavily_keys)}
 
 
 def set_active_llm_model(user_id, model, fallback_models=None):

@@ -219,6 +219,12 @@ const tail = (s, n) => (!s ? "" : s.length > n ? s.slice(-n) : s);
 const charCount = (s) => (s || "").replace(/\s/g, "").length;
 const esc = (s) => (s || "").replace(/[&<>"]/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+  } catch (e) { return ""; }
+}
 const workflowLabels = { planning: "规划", drafting: "写作", review: "复核", final: "定稿" };
 function workflowLabel(status) { return workflowLabels[status] || workflowLabels.drafting; }
 function appendText(t) {
@@ -1014,6 +1020,27 @@ function normalizeModelIds(models, active = "") {
   }
   return result;
 }
+function renderTavilyKeyStatus(settings = {}) {
+  const userCount = Number(settings.tavily_user_key_count || 0);
+  const totalCount = Number(settings.tavily_key_count || 0);
+  const masks = Array.isArray(settings.tavily_api_key_masks) ? settings.tavily_api_key_masks : [];
+  const source = settings.tavily_key_source;
+  const status = $("tavilyKeyStatus");
+  if (status) {
+    if (source === "user") status.textContent = `已保存 ${userCount} 条${masks.length ? ` · ${masks.join("、")}` : ""}`;
+    else if (source === "server") status.textContent = `服务器已配置 ${totalCount} 条`;
+    else status.textContent = "未配置";
+  }
+  const clearRow = $("clearTavilyKeysRow");
+  if (clearRow) clearRow.classList.toggle("hidden", !userCount);
+}
+function toggleTavilyKeyVisibility() {
+  const input = $("setTavilyKeys");
+  if (!input) return;
+  const revealed = input.classList.toggle("revealed");
+  const button = $("toggleTavilyKeysBtn");
+  if (button) button.title = revealed ? "隐藏输入内容" : "显示输入内容";
+}
 function renderModelSelectors(settings = {}) {
   activeModelId = (settings.model || activeModelId || "").trim();
   availableModelIds = normalizeModelIds(settings.models, activeModelId);
@@ -1065,6 +1092,11 @@ async function openSettings() {
     renderModelSelectors(s);
     $("setAsrBaseUrl").value = s.asr_base_url || "";
     $("setAsrModel").value = s.asr_model || "whisper-1";
+    $("setTavilyKeys").value = "";
+    $("setTavilyKeys").classList.remove("revealed");
+    $("toggleTavilyKeysBtn").title = "显示输入内容";
+    $("clearTavilyKeys").checked = false;
+    renderTavilyKeyStatus(s);
     // key 不回传明文：已填则用掩码占位提示，留空表示不改
     $("setApiKey").value = s.api_key_masked || "";
     $("setApiKey").placeholder = s.has_key ? `${s.api_key_masked}（留空=不改）` : "sk-…";
@@ -1095,6 +1127,8 @@ async function saveSettings() {
   const asr_model = $("setAsrModel").value.trim();
   let api_key = $("setApiKey").value.trim();
   let asr_api_key = $("setAsrApiKey").value.trim();
+  const tavily_api_keys = $("setTavilyKeys").value
+    .split(/[\r\n,;]+/).map(value => value.trim()).filter(Boolean);
   // 若用户没动 key 输入框（仍是掩码占位），传空让后端保留旧值
   if (api_key.startsWith("****")) api_key = "";
   if (asr_api_key.startsWith("****")) asr_api_key = "";
@@ -1104,10 +1138,17 @@ async function saveSettings() {
   localStorage.setItem("voiceAsrAutoSend", voiceAsrAutoSend ? "1" : "0");
   setAgentMic(false);
   try {
-    const result = await api("/api/settings", { body: { base_url, api_key, model, models, asr_base_url, asr_api_key, asr_model } });
+    const body = { base_url, api_key, model, models, asr_base_url, asr_api_key, asr_model };
+    if (tavily_api_keys.length) body.tavily_api_keys = tavily_api_keys;
+    else if ($("clearTavilyKeys").checked) body.tavily_api_keys = [];
+    const result = await api("/api/settings", { body });
     renderModelSelectors(result);
+    renderTavilyKeyStatus(result);
     $("setModel").value = result.model || model;
     $("setModels").value = (result.models || models).join("\n");
+    $("setTavilyKeys").value = "";
+    $("setTavilyKeys").classList.remove("revealed");
+    $("clearTavilyKeys").checked = false;
     $("setMsg").textContent = "已保存";
     setTimeout(closeSettings, 600);
   } catch (e) { $("setMsg").textContent = e.message; }
@@ -1451,6 +1492,17 @@ function toggleAISide() {
   }, 50);
   else if ("speechSynthesis" in window) speechSynthesis.cancel(); // 收起侧栏时停止朗读
 }
+function renderAgentSources(sources) {
+  if (!Array.isArray(sources)) return "";
+  const links = sources.slice(0, 10).map((source, index) => {
+    const url = safeHttpUrl(source?.url);
+    if (!url) return "";
+    let domain = "";
+    try { domain = new URL(url).hostname.replace(/^www\./, ""); } catch (e) {}
+    return `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer"><b>${index + 1}. ${esc(source?.title || domain || "网页来源")}</b><small>${esc(domain)}</small></a>`;
+  }).filter(Boolean).join("");
+  return links ? `<div class="agent-source-list"><span>搜索来源</span>${links}</div>` : "";
+}
 function renderAgent() {
   const el = $("agentMsgs");
   if (agentConversationLoading) {
@@ -1486,7 +1538,9 @@ function renderAgent() {
         const card = undone
           ? `<span class="done-tag">已撤销</span>`
           : (rid ? `<button class="undo-btn" onclick="undoAgentAction(${rid})">撤销</button>` : "");
-        html += `<div class="cm action${undone ? " done" : ""}${temporaryClass}"><div class="act-bar"><span class="act-txt">${svg("pen")} ${esc(sum)}</span>${card}</div></div>`;
+        const sources = renderAgentSources(r.sources);
+        const actionIcon = m.name === "web_search" ? "search" : "pen";
+        html += `<div class="cm action${undone ? " done" : ""}${temporaryClass}"><div class="act-bar"><span class="act-txt">${svg(actionIcon)} ${esc(sum)}</span>${card}</div>${sources}</div>`;
       }
     }
   }
@@ -2971,6 +3025,7 @@ function renderAgentContext(data) {
     `工作目录：${runtime.cwd || "无"}`,
     `本机 Skill 目录：${(runtime.skill_dirs || []).join("、") || "无"}`,
     `launcher 生命周期：${runtime.launcher_lifecycle ? "已启用" : "未启用"}`,
+    `联网搜索：${runtime.web_search_enabled ? `${runtime.web_search_provider || "Tavily"} · ${runtime.web_search_key_count || 0} 个 Key · ${runtime.web_search_key_source === "user" ? "用户配置" : "服务器配置"}` : "未配置"}`,
   ].join("\n"));
   $("contextTools").innerHTML = `<div><b>应用工具</b><div class="context-tool-list">${(data.tools || []).map(item =>
     `<details><summary>${esc(item.name)}</summary><p>${esc(item.description)}</p></details>`

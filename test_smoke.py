@@ -99,6 +99,7 @@ c.post("/api/settings", json={
     "base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a",
     "models": ["m-a", "m-polish", "m-fast"],
     "asr_base_url": "https://asr.test/v1", "asr_api_key": "sk-asr-secret", "asr_model": "whisper-test",
+    "tavily_api_keys": ["tvly-test-user-one-1111", "tvly-test-user-two-2222"],
 }, headers=H(tokA))
 s = c.get("/api/settings", headers=H(tokA)).json()
 ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a" and s["asr_model"] == "whisper-test"
@@ -106,6 +107,10 @@ ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a" and s["asr_model
 ok(s["models"] == ["m-a", "m-polish", "m-fast"], "常用模型 ID 列表读回")
 ok(s["has_key"] is True and "secret" not in s["api_key_masked"] and s["api_key_masked"].startswith("****"), "key 掩码不泄露明文")
 ok(s["asr_has_key"] is True and "secret" not in s["asr_api_key_masked"], "转写 key 掩码不泄露明文")
+ok(s["tavily_user_key_count"] == 2 and s["tavily_key_source"] == "user"
+   and s["tavily_api_key_masks"] == ["****1111", "****2222"]
+   and "tvly-test-user-one" not in json.dumps(s),
+   "Tavily 多 Key 按用户保存且接口只返回掩码")
 _model_switch = c.post("/api/settings/active-model", json={"model": "m-polish"}, headers=H(tokA)).json()
 ok(_model_switch["model"] == "m-polish" and c.get("/api/settings", headers=H(tokA)).json()["model"] == "m-polish",
    "可快速切换当前模型")
@@ -116,6 +121,7 @@ c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "", "m
 _alice_settings = c.get("/api/settings", headers=H(tokA)).json()
 ok(_alice_settings["has_key"] is True and _alice_settings["model"] == "m-a2" and "m-polish" in _alice_settings["models"],
    "空 key 不清空已存 key，模型列表保持")
+ok(_alice_settings["tavily_user_key_count"] == 2, "未提交 Tavily 列表时保留原 Key 池")
 
 # AI Skills：通用/作品专用 CRUD、作用域和用户隔离
 ok(c.post("/api/agent/skills", json={"name": "", "instruction": "规则"}, headers=H(tokA)).status_code == 400, "Skill 空名称 400")
@@ -753,6 +759,63 @@ _tr2 = [m for m in ag2["messages"] if m.get("role") == "tool"]
 ok(len(_tr2) == 1 and isinstance(json.loads(_tr2[0]["content"]).get("revisions"), list), "agent list_revisions 返回版本数组")
 c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA))  # 清空，避免影响后续
 
+# 联网搜索：Agent 工具拿到结构化来源，Key 只在服务端设置中存在。
+class _FakeTavilyClient:
+    def __init__(self):
+        self.calls = []
+
+    def search(self, query, **kwargs):
+        self.calls.append({"query": query, **kwargs})
+        return {
+            "query": query,
+            "sources": [{
+                "title": "武汉天气来源",
+                "url": "https://weather.example/wuhan",
+                "content": "武汉今日有阵雨。",
+                "score": 0.9,
+            }],
+            "credits": 1,
+            "response_time": "0.1",
+            "request_id": "search-test",
+        }
+
+
+_fake_tavily = _FakeTavilyClient()
+_orig_tavily_client_for_user = main._tavily_client_for_user
+main._tavily_client_for_user = lambda uid: (_fake_tavily, "user")
+llm.agent_chat = _make_agent([
+    _msg(None, [("search-1", "web_search", json.dumps({
+        "query": "武汉今天天气", "max_results": 3, "topic": "general", "time_range": "day",
+    }))]),
+    _msg("武汉今天有阵雨，来源：https://weather.example/wuhan"),
+])
+web_turn = c.post("/api/agent", json={
+    "text": "查一下武汉今天天气", "chapter_id": cid,
+}, headers=H(tokA)).json()
+web_results = [
+    json.loads(message["content"]) for message in web_turn["messages"]
+    if message.get("role") == "tool" and "sources" in json.loads(message["content"])
+]
+ok(len(web_results) == 1 and web_results[0]["sources"][0]["url"] == "https://weather.example/wuhan",
+   "Agent web_search 返回可引用的结构化来源")
+ok(_fake_tavily.calls[0]["max_results"] == 3 and _fake_tavily.calls[0]["time_range"] == "day",
+   "Agent 将搜索范围参数交给 Tavily 客户端")
+ok("tvly-test-user-one" not in json.dumps(web_turn, ensure_ascii=False),
+   "搜索 Key 不进入 Agent 对话或工具结果")
+main._tavily_client_for_user = _orig_tavily_client_for_user
+c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA))
+
+_settings_before_clear = c.get("/api/settings", headers=H(tokA)).json()
+_cleared_search = c.post("/api/settings", json={
+    "base_url": _settings_before_clear["base_url"],
+    "model": _settings_before_clear["model"],
+    "models": _settings_before_clear["models"],
+    "tavily_api_keys": [],
+}, headers=H(tokA)).json()
+ok(_cleared_search["tavily_user_key_count"] == 0
+   and c.get("/api/settings", headers=H(tokA)).json()["tavily_key_source"] == "none",
+   "用户可明确清空自己的 Tavily Key 池")
+
 # 上下文压缩：调低阈值 + 假 summarize，验证早期轮次被摘要、保留最近几轮
 _orig_sum = llm.summarize
 _orig_cc = config.AGENT_COMPACT_CHARS
@@ -1127,7 +1190,7 @@ ok(c.delete(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)).sta
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260727-3" in _home.text and "app.js?v=ui-20260727-3" in _home.text,
+ok(_home.status_code == 200 and "style.css?v=ui-20260728-1" in _home.text and "app.js?v=ui-20260728-1" in _home.text,
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")

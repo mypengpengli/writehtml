@@ -7,6 +7,7 @@ import io
 import re
 import zipfile
 import time
+import threading
 from urllib.parse import quote, unquote
 
 import yaml
@@ -15,7 +16,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-import config, context_builder, db, inspiration, llm, pi_agent, skill_runtime
+import config, context_builder, db, inspiration, llm, pi_agent, skill_runtime, tavily_search
 
 app = FastAPI(title="写作")
 db.init_db()
@@ -104,6 +105,60 @@ def _model_options_payload(body):
     return values
 
 
+def _tavily_keys_payload(body):
+    if "tavily_api_keys" not in body:
+        return None
+    values = body.get("tavily_api_keys")
+    if isinstance(values, str):
+        values = re.split(r"[,;\r\n]+", values)
+    if not isinstance(values, list) or len(values) > db.MAX_TAVILY_API_KEYS:
+        raise HTTPException(400, f"Tavily Key 最多保存 {db.MAX_TAVILY_API_KEYS} 条")
+    if any(not isinstance(value, str) for value in values):
+        raise HTTPException(400, "Tavily Key 必须是文字")
+    if any(len(value.strip()) > db.MAX_TAVILY_API_KEY_LENGTH for value in values):
+        raise HTTPException(400, "Tavily Key 长度无效")
+    return db.normalize_tavily_api_keys(values)
+
+
+def _tavily_key_state(settings=None):
+    settings = settings or {}
+    user_keys = tuple(settings.get("tavily_api_keys") or ())
+    keys = user_keys or tuple(config.TAVILY_API_KEYS)
+    source = "user" if user_keys else ("server" if keys else "none")
+    return keys, user_keys, source
+
+
+_tavily_clients = {}
+_tavily_clients_lock = threading.Lock()
+
+
+def _reset_tavily_client(uid):
+    with _tavily_clients_lock:
+        _tavily_clients.pop(uid, None)
+
+
+def _tavily_client_for_user(uid):
+    settings = db.get_settings(uid) or {}
+    keys, _, source = _tavily_key_state(settings)
+    signature = (
+        keys, config.TAVILY_PROJECT_ID, config.TAVILY_SEARCH_TIMEOUT_SECONDS,
+        config.TAVILY_SEARCH_DEPTH, config.TAVILY_SEARCH_SAFE_SEARCH,
+    )
+    with _tavily_clients_lock:
+        cached = _tavily_clients.get(uid)
+        if cached and cached[0] == signature:
+            return cached[1], source
+        client = tavily_search.TavilySearchClient(
+            keys,
+            timeout_seconds=config.TAVILY_SEARCH_TIMEOUT_SECONDS,
+            project_id=config.TAVILY_PROJECT_ID,
+            search_depth=config.TAVILY_SEARCH_DEPTH,
+            safe_search=config.TAVILY_SEARCH_SAFE_SEARCH,
+        )
+        _tavily_clients[uid] = (signature, client)
+        return client, source
+
+
 def _provider_error(exc, limit=260):
     """保留可诊断的信息，但不把供应商的整段 JSON 直接塞进手机 toast。"""
     text = " ".join(str(exc).split())
@@ -174,6 +229,7 @@ async def get_settings(request: Request):
     # 明文 key 不回传，只给掩码提示是否已填
     masked = ("****" + key[-4:]) if key else ""
     model, models = _model_options(s)
+    tavily_keys, tavily_user_keys, tavily_source = _tavily_key_state(s)
     return {
         "base_url": s.get("llm_base_url") or config.LLM_BASE_URL,
         "api_key_masked": masked,
@@ -184,6 +240,10 @@ async def get_settings(request: Request):
         "asr_api_key_masked": _mask_key(asr_key),
         "asr_has_key": bool(asr_key),
         "asr_model": s.get("asr_model") or config.ASR_MODEL,
+        "tavily_key_count": len(tavily_keys),
+        "tavily_user_key_count": len(tavily_user_keys),
+        "tavily_key_source": tavily_source,
+        "tavily_api_key_masks": [_mask_key(value) for value in tavily_user_keys],
     }
 
 
@@ -200,8 +260,18 @@ async def save_settings(request: Request):
         (body.get("asr_base_url") or "").strip(),
         (body.get("asr_api_key") or "").strip(),
         _model_options_payload(body),
+        _tavily_keys_payload(body),
     )
-    return {"ok": True, **result}
+    _reset_tavily_client(uid)
+    saved = db.get_settings(uid) or {}
+    tavily_keys, tavily_user_keys, tavily_source = _tavily_key_state(saved)
+    return {
+        "ok": True, **result,
+        "tavily_key_count": len(tavily_keys),
+        "tavily_user_key_count": len(tavily_user_keys),
+        "tavily_key_source": tavily_source,
+        "tavily_api_key_masks": [_mask_key(value) for value in tavily_user_keys],
+    }
 
 
 @app.post("/api/settings/active-model")
@@ -1700,6 +1770,15 @@ AGENT_TOOLS = [
             "applied_excerpt": {"type": "string"}},
             "required": ["inspiration_id","usage_type","usage_status"]}}},
     {"type": "function", "function": {
+        "name": "web_search",
+        "description": "联网搜索公开网页，获取最新事实、新闻、天气、资料和来源链接。涉及“今天、最新、当前、最近、网上查”等时优先调用；每次先使用一个明确查询，回答中必须注明来源。",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "完整、明确的搜索关键词"},
+            "max_results": {"type": "integer", "description": "返回来源数量，默认 5，最大 10"},
+            "topic": {"type": "string", "enum": ["general","news"], "description": "普通资料用 general，新闻用 news"},
+            "time_range": {"type": "string", "enum": ["day","week","month","year"], "description": "可选的时间范围"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
         "name": "activate_skill",
         "description": "按当前用户已安装 Skill 目录中的 id，加载一个与本次任务匹配的 Skill 完整规则。仅在用户明确提到某 Skill，或任务与其说明高度匹配时调用。",
         "parameters": {"type": "object", "properties": {
@@ -2253,7 +2332,9 @@ def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
         "7) 作者明确说“记一下、存起来、以后用”时调用 save_inspiration，工具成功前不得声称已保存；"
         "灵感是未来候选，不是故事事实。需要增强桥段、情绪、画面、笑点或漫剧制作时，可按需调用 "
         "search_inspirations，匹配度低就不要硬塞；实际采用后再调用 mark_inspiration_used；"
-        "8) 回答简洁，做完事说一句即可。"
+        "8) 用户问今天、最新、当前、近期新闻或明确要求网上查时，调用 web_search 后再回答；"
+        "不得假装已经搜索，回答应列出实际使用的来源标题和 URL；"
+        "9) 回答简洁，做完事说一句即可。"
     ]
     if cid:
         c = db.get_chapter_meta(cid, uid)
@@ -2429,6 +2510,7 @@ def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instructio
         system_prompt, conversation.get("messages") or [], instruction
     )
     budget = _agent_context_budget()
+    tavily_keys, _, tavily_source = _tavily_key_state(db.get_settings(uid) or {})
     return {
         "engine": "Pi Coding Agent" if config.PI_AGENT_ENABLED else "兼容 Agent 运行时",
         "chapter": ({"id": chapter["id"], "title": chapter["title"], "ord": chapter.get("ord"),
@@ -2449,6 +2531,10 @@ def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instructio
             "skill_dirs": [config.PI_AGENT_SKILL_DIR] if config.PI_AGENT_SKILL_DIR else [],
             "launcher_lifecycle": bool(skill_runtime.is_enabled()),
             "agent_id": config.AGENT_SKILL_AGENT_ID,
+            "web_search_enabled": bool(tavily_keys),
+            "web_search_provider": "Tavily" if tavily_keys else None,
+            "web_search_key_count": len(tavily_keys),
+            "web_search_key_source": tavily_source,
         },
         "model": (db.get_settings(uid) or {}).get("llm_model") or config.LLM_MODEL,
         "context_items": context.get("context_items") or [],
@@ -2963,6 +3049,47 @@ def _tool_mark_inspiration_used(uid, cid, cfg, args):
     return {**result, "changed": False, "summary": f"已记录灵感 #{inspiration_id} 的实际使用位置"}
 
 
+def _tool_web_search(uid, cid, cfg, args):
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return _agent_err("搜索关键词不能为空")
+    query = query.strip()
+    if len(query) > 500:
+        return _agent_err("搜索关键词过长，请缩短到 500 字以内")
+    max_results = args.get("max_results", config.TAVILY_SEARCH_MAX_RESULTS)
+    if not isinstance(max_results, int) or isinstance(max_results, bool):
+        max_results = config.TAVILY_SEARCH_MAX_RESULTS
+    configured_max = min(10, max(1, config.TAVILY_SEARCH_MAX_RESULTS))
+    max_results = min(configured_max, max(1, max_results))
+    topic = args.get("topic") if args.get("topic") in {"general", "news"} else "general"
+    time_range = args.get("time_range")
+    if time_range not in {"day", "week", "month", "year"}:
+        time_range = None
+    client, key_source = _tavily_client_for_user(uid)
+    try:
+        result = client.search(
+            query,
+            max_results=max_results,
+            topic=topic,
+            time_range=time_range,
+        )
+    except tavily_search.TavilySearchError as exc:
+        return _agent_err(str(exc))
+    sources = result.get("sources") or []
+    short_query = query[:36] + ("…" if len(query) > 36 else "")
+    return {
+        "changed": False,
+        "summary": f"已联网搜索“{short_query}”，找到 {len(sources)} 个来源",
+        "provider": "Tavily",
+        "key_source": key_source,
+        "query": result.get("query") or query,
+        "sources": sources,
+        "credits": result.get("credits"),
+        "response_time": result.get("response_time") or "",
+        "request_id": result.get("request_id") or "",
+    }
+
+
 _AGENT_TOOLS = {
     "read_chapter": _tool_read_chapter, "list_chapters": _tool_list_chapters,
     "activate_skill": _tool_activate_skill, "read_skill_resource": _tool_read_skill_resource,
@@ -2980,6 +3107,7 @@ _AGENT_TOOLS = {
     "save_inspiration": _tool_save_inspiration, "search_inspirations": _tool_search_inspirations,
     "get_inspiration": _tool_get_inspiration, "update_inspiration": _tool_update_inspiration,
     "mark_inspiration_used": _tool_mark_inspiration_used,
+    "web_search": _tool_web_search,
 }
 
 
@@ -3940,6 +4068,7 @@ async def admin_delete_user(request: Request, target_uid: int):
     if not db.admin_delete_user(target_uid):
         raise HTTPException(404, "用户不存在")
     inspiration.delete_user_files(target_uid)
+    _reset_tavily_client(target_uid)
     return {"ok": True}
 
 

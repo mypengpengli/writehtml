@@ -1,5 +1,6 @@
 """配置：从 .env 读取。所有项都可在 .env 里覆盖。"""
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,6 +15,23 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 ASR_BASE_URL = os.getenv("ASR_BASE_URL", "")
 ASR_API_KEY = os.getenv("ASR_API_KEY", "")
 ASR_MODEL = os.getenv("ASR_MODEL", "whisper-1")
+
+# Tavily 联网搜索只由服务端持有密钥。支持逗号、分号或换行分隔的 Key 池；
+# TAVILY_API_KEY 保留为单 Key 兼容项。多个同账号 Key 仍共享账号套餐总额度。
+_tavily_keys_raw = os.getenv("TAVILY_API_KEYS", "")
+_tavily_single_key = os.getenv("TAVILY_API_KEY", "")
+TAVILY_API_KEYS = tuple(dict.fromkeys(
+    value.strip().strip("\"'")
+    for value in re.split(r"[,;\r\n]+", ",".join(filter(None, [_tavily_keys_raw, _tavily_single_key])))
+    if value.strip().strip("\"'")
+))
+TAVILY_PROJECT_ID = os.getenv("TAVILY_PROJECT_ID", "writehtml")
+TAVILY_SEARCH_TIMEOUT_SECONDS = float(os.getenv("TAVILY_SEARCH_TIMEOUT_SECONDS", "20"))
+TAVILY_SEARCH_MAX_RESULTS = int(os.getenv("TAVILY_SEARCH_MAX_RESULTS", "5"))
+TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic").lower()
+TAVILY_SEARCH_SAFE_SEARCH = os.getenv("TAVILY_SEARCH_SAFE_SEARCH", "false").lower() not in {
+    "0", "false", "no",
+}
 
 # SQLite 路径（Docker 里挂到数据卷）
 DB_PATH = os.getenv("DB_PATH", "writehtml.db")

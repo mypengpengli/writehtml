@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ui-20260727-3">
+  <link rel="stylesheet" href="style.css?v=ui-20260728-1">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -102,7 +102,7 @@
             <button data-ic="users" data-label="人物/设定" onclick="openWiki();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI 工具" onclick="openAITools();closeMoreMenu()"></button>
             <button id="adminBtn" class="hidden" data-ic="shield" data-label="后台管理" onclick="openAdmin();closeMoreMenu()"></button>
-            <button data-ic="settings" data-label="大模型设置" onclick="openSettings();closeMoreMenu()"></button>
+            <button data-ic="settings" data-label="模型与联网" onclick="openSettings();closeMoreMenu()"></button>
             <button data-ic="logout" data-label="退出" onclick="doLogout();closeMoreMenu()"></button>
           </div>
         </div>
@@ -583,10 +583,10 @@
   <!-- @提及悬浮卡 -->
   <div id="mentionPop" class="mention-pop hidden"></div>
 
-  <!-- 大模型设置 -->
+  <!-- 模型与联网设置 -->
   <div id="setOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>大模型设置</span><button class="ic" data-ic="x" onclick="closeSettings()"></button></div>
+      <div class="overlay-head"><span>模型与联网设置</span><button class="ic" data-ic="x" onclick="closeSettings()"></button></div>
       <div class="set-form">
         <p class="set-hint">文字模型用于 AI 助手和改稿。勾选“直接发送语音”时，录音会原样交给当前模型；不勾选才使用下方独立的转写服务。</p>
         <label>Base URL</label>
@@ -599,6 +599,16 @@
         <textarea id="setModels" rows="4" placeholder="每行一个模型 ID，例如：&#10;deepseek-chat&#10;qwen-plus"></textarea>
         <p class="set-hint">保存后可在编辑器顶栏或 AI 助手中快速切换；所有常用模型共用上方 Base URL 和 API Key。</p>
         <datalist id="modelIdOptions"></datalist>
+        <hr class="sep settings-sep">
+        <div class="settings-section-head"><b>联网搜索</b><span id="tavilyKeyStatus"></span></div>
+        <label>Tavily API Keys</label>
+        <div class="secret-textarea-wrap">
+          <textarea id="setTavilyKeys" class="secret-textarea" rows="4" spellcheck="false" autocomplete="off" placeholder="每行一个 Key"></textarea>
+          <button id="toggleTavilyKeysBtn" type="button" class="ic" data-ic="eye" onclick="toggleTavilyKeyVisibility()" title="显示输入内容"></button>
+        </div>
+        <p class="set-hint">输入内容会整体替换当前 Key 池；留空则保持不变。Agent 会逐次轮换，当前 Key 不可用时自动尝试下一条。</p>
+        <label id="clearTavilyKeysRow" class="set-row hidden"><input id="clearTavilyKeys" type="checkbox"> 清空我保存的搜索 Key</label>
+        <hr class="sep settings-sep">
         <label class="set-row voice-mode-row"><input id="setVoiceDirect" type="checkbox" onchange="updateVoiceSettingHint()"> 直接发送语音给 AI（不转写）</label>
         <p id="voiceModeHint" class="set-hint voice-mode-hint"></p>
         <div id="asrSettings">
@@ -689,6 +699,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=ui-20260727-3"></script>
+  <script src="app.js?v=ui-20260728-1"></script>
 </body>
 </html>

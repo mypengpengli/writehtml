@@ -328,6 +328,13 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .set-form input { width: 100%; box-sizing: border-box; }
 .set-form textarea { width: 100%; box-sizing: border-box; resize: vertical; font-family: inherit; font-size: 14px; }
 .set-hint { font-size: 13px; color: var(--muted); margin: 0 0 4px; line-height: 1.5; }
+.settings-sep { width: 100%; margin: 12px 0 5px; }
+.settings-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 24px; }
+.settings-section-head span { color: var(--muted); font-size: 12px; text-align: right; overflow-wrap: anywhere; }
+.secret-textarea-wrap { position: relative; }
+.secret-textarea-wrap .secret-textarea { display: block; padding-right: 42px; }
+.secret-textarea:not(.revealed) { -webkit-text-security: disc; }
+.secret-textarea-wrap .ic { position: absolute; top: 5px; right: 5px; min-width: 32px; min-height: 32px; padding: 6px; background: var(--panel); }
 .set-actions { display: flex; gap: 8px; margin-top: 14px; }
 .set-actions button { flex: 1; }
 .ai-result { white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.6;
@@ -372,6 +379,12 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .chat-msgs .cm.action .undo-btn:hover { color: var(--accent-text); border-color: var(--accent); }
 .chat-msgs .cm.action .done-tag { font-size: 13px; color: var(--muted); }
 .chat-msgs .cm.action.done { opacity: .55; }
+.agent-source-list { display: flex; flex-direction: column; gap: 2px; margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--line); white-space: normal; }
+.agent-source-list > span { color: var(--muted); font-size: 11px; }
+.agent-source-list a { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; padding: 3px 0; color: var(--accent-text); text-decoration: none; }
+.agent-source-list a:hover b { text-decoration: underline; }
+.agent-source-list b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 500; }
+.agent-source-list small { flex: 0 0 auto; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
 .ai-backdrop { display: none; }
 .ai-head-tools { display: flex; gap: 4px; }
 #agentMicBtn.on { background: var(--mic); color: #fff; border-color: var(--mic); opacity: 1; animation: rec-pulse 1.4s ease-in-out infinite; }

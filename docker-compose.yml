@@ -21,6 +21,9 @@ services:
       # - ASR_BASE_URL=https://api.openai.com/v1
       # - ASR_API_KEY=sk-xxx
       # - ASR_MODEL=whisper-1
+      # 可选：所有用户共用的 Tavily 搜索兜底 Key 池。用户也可在网页设置里各自配置多条。
+      # - TAVILY_API_KEYS=tvly-key-1,tvly-key-2
+      # - TAVILY_PROJECT_ID=writehtml
       # 可选：本机 meta-memory launcher。取消注释前，先将安装器产物挂载到容器（见下方 volumes）。
       # - AGENT_SKILL_DIR=/opt/meta-skills
       # - AGENT_SKILL_LAUNCHER=/opt/meta-runtime/launcher
