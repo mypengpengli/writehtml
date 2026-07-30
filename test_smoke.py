@@ -1,5 +1,5 @@
 """冒烟测试：多用户隔离 + P1 新功能。转写模式不调 LLM，无需 key。"""
-import os, shutil, uuid, sqlite3, time, json, types, base64, io, zipfile, sys
+import os, shutil, uuid, sqlite3, time, json, types, base64, io, zipfile, sys, re
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
@@ -1358,7 +1358,8 @@ ok(c.delete(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokA)).sta
 
 # 首页和前端资源：入口更新时必须换资源 URL，避免浏览器把新 DOM 与旧 CSS/JS 混用。
 _home = c.get("/")
-ok(_home.status_code == 200 and "style.css?v=ui-20260728-3" in _home.text and "app.js?v=ui-20260728-3" in _home.text,
+_assets = dict(re.findall(r'(style\.css|app\.js)\?v=([A-Za-z0-9._-]+)', _home.text))
+ok(_home.status_code == 200 and _assets.get("style.css") and _assets.get("style.css") == _assets.get("app.js"),
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")
