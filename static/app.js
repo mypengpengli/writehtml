@@ -62,6 +62,7 @@ let pendingEditReview = null;
 let pendingRevisionRestore = null;
 let pendingWorkRevisionRestore = null;
 let voiceTraceState = null;
+let voiceTraceHideTimer = null;
 // 多模态创意灵感库
 let inspirationItems = [];
 let currentInspiration = null;
@@ -1961,6 +1962,10 @@ function openAdmin() { location.href = "admin.html"; }
 /* 智能体语音：默认直发当前模型；关闭直发时才走独立 ASR。 */
 
 function setVoiceTrace(state, detail = "", type = "") {
+  if (voiceTraceHideTimer) {
+    clearTimeout(voiceTraceHideTimer);
+    voiceTraceHideTimer = null;
+  }
   voiceTraceState = { state, detail, type };
   const host = $("voiceTrace");
   if (!host) return;
@@ -1968,6 +1973,17 @@ function setVoiceTrace(state, detail = "", type = "") {
   if (type) host.classList.add(type);
   if (state === "录音中") host.classList.add("recording");
   host.innerHTML = `${svg(state === "出错" ? "alert" : state === "录音中" ? "mic" : "check")}<span><b>${esc(state)}</b>${detail ? `<small>${esc(detail)}</small>` : ""}</span>`;
+  if (type === "ok") {
+    const shownState = voiceTraceState;
+    voiceTraceHideTimer = setTimeout(() => {
+      if (voiceTraceState !== shownState) return;
+      voiceTraceState = null;
+      voiceTraceHideTimer = null;
+      host.classList.add("hidden");
+      host.classList.remove("ok", "recording");
+      host.innerHTML = "";
+    }, 2500);
+  }
 }
 async function micPermissionHint() {
   const parts = [];
@@ -2054,8 +2070,9 @@ async function transcribeAgentAudio(blob) {
     el.placeholder = _agentPH || "";
     const route = r.voice?.route || "转写接口";
     if (voiceAsrAutoSend) {
-      setVoiceTrace("转写完成", `${route} · 正在把文字发送给 AI`, "ok");
-      await sendAgent();
+      const sending = sendAgent();
+      setVoiceTrace("发送完成", `${route} · 文字已发送给 AI`, "ok");
+      await sending;
     }
     else el.focus();
     if (!voiceAsrAutoSend) setVoiceTrace("转写完成", `${route} · 已填入输入框`, "ok");
