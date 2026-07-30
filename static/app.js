@@ -1996,7 +1996,7 @@ function writeWavText(view, offset, text) {
 }
 async function recordToMonoWav(blob) {
   const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx) throw new Error("浏览器无法转换录音格式，请关闭直发语音后使用转写模式");
+  if (!Ctx) throw new Error("浏览器无法转换录音格式");
   const ctx = new Ctx();
   try {
     const source = await ctx.decodeAudioData(await blob.arrayBuffer());
@@ -2032,15 +2032,18 @@ async function transcribeAgentAudio(blob) {
   const el = $("agentInput");
   if (!_agentPH) _agentPH = el.placeholder;
   el.placeholder = "语音转写中…";
-  setVoiceTrace("正在转写", "录音会先发送到配置的 /audio/transcriptions 接口");
+  setVoiceTrace("正在转写", "录音会先转为 16kHz 单声道 WAV，再发送到配置的 /audio/transcriptions 接口");
   try {
+    // MediaRecorder 在 Chrome/Android 上通常生成 WebM/Opus。部分 OpenAI
+    // 兼容网关无法解析 WebM 时长，因此与直发模式一样先统一为 WAV。
+    const wav = await recordToMonoWav(blob);
     const res = await fetch("/api/asr", {
       method: "POST",
       headers: {
-        "Content-Type": blob.type || "audio/webm",
+        "Content-Type": "audio/wav",
         ...(token ? { Authorization: "Bearer " + token } : {}),
       },
-      body: blob,
+      body: wav,
     });
     if (res.status === 401) { showLogin(); throw new Error("未登录"); }
     if (!res.ok) throw new Error(await responseError(res));
