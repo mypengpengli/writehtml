@@ -41,6 +41,7 @@ let agentSessionScopeKey = "";
 let agentSkills = [];
 let agentSkillsWorkId = undefined;
 let activeAgentSkillIds = new Set();
+let pendingAgentDocuments = [];
 let currentUsername = "";
 // 写作工作台：剧情、章节流程、关系、提醒与本回合上下文共用一个右侧抽屉。
 let storyTab = "plot";
@@ -694,6 +695,66 @@ function clearAgentSelection() {
   if (input) input.placeholder = "让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）";
 }
 
+function chooseAgentDocuments() {
+  if (agentBusy) return;
+  $("agentDocumentFiles").click();
+}
+
+function renderAgentDocuments() {
+  const host = $("agentDocuments");
+  if (!host) return;
+  host.classList.toggle("hidden", !pendingAgentDocuments.length);
+  host.innerHTML = pendingAgentDocuments.map((document, index) => `
+    <div class="agent-document-chip" title="${esc(document.name)}">
+      ${svg("paperclip")}
+      <span>${esc(document.name)}</span>
+      <small>${document.chars.toLocaleString()} 字${document.truncated ? " · 已截取" : ""}</small>
+      <button class="ic" onclick="removeAgentDocument(${index})" title="移除附件">${svg("x")}</button>
+    </div>`).join("");
+}
+
+function removeAgentDocument(index) {
+  if (agentBusy) return;
+  pendingAgentDocuments.splice(index, 1);
+  renderAgentDocuments();
+}
+
+async function addAgentDocuments(fileList) {
+  const input = $("agentDocumentFiles");
+  const files = Array.from(fileList || []);
+  if (input) input.value = "";
+  if (!files.length) return;
+  const button = $("agentDocumentBtn");
+  button.disabled = true;
+  button.classList.add("is-busy");
+  try {
+    for (const file of files) {
+      const response = await fetch("/api/agent/documents/extract", {
+        method: "POST",
+        headers: {
+          "Content-Type": file.type || "application/octet-stream",
+          "X-File-Name": encodeURIComponent(file.name),
+          ...(token ? { Authorization: "Bearer " + token } : {}),
+        },
+        body: file,
+      });
+      if (response.status === 401) { showLogin(); throw new Error("未登录"); }
+      if (!response.ok) throw new Error(await responseError(response));
+      const document = await response.json();
+      const existing = pendingAgentDocuments.findIndex(item => item.name === document.name);
+      if (existing >= 0) pendingAgentDocuments.splice(existing, 1, document);
+      else pendingAgentDocuments.push(document);
+      renderAgentDocuments();
+      showToast(`${document.name} 已加入本轮资料${document.truncated ? "（内容较长，已截取）" : ""}`, "ok");
+    }
+  } catch (e) {
+    showToast("添加附件失败：" + e.message, "err");
+  } finally {
+    button.disabled = false;
+    button.classList.remove("is-busy");
+  }
+}
+
 /* ---------- AI 处理：先生成预览，作者确认后才写入正文 ---------- */
 
 async function notifyStoryUpdates(result) {
@@ -1147,7 +1208,7 @@ async function openSettings() {
     $("setApiKey").value = s.api_key_masked || "";
     $("setApiKey").placeholder = s.has_key ? `${s.api_key_masked}（留空=不改）` : "sk-…";
     $("setAsrApiKey").value = s.asr_api_key_masked || "";
-    $("setAsrApiKey").placeholder = s.asr_has_key ? `${s.asr_api_key_masked}（留空=不改）` : "留空则沿用文字模型的 Key";
+    $("setAsrApiKey").placeholder = s.asr_has_key ? `${s.asr_api_key_masked}（留空=不改）` : "留空则沿用上方中转站 Key";
     $("setVoiceDirect").checked = voiceDirectToModel;
     $("setVoiceAuto").checked = voiceAsrAutoSend;
     $("setMsg").textContent = "";
@@ -1163,7 +1224,7 @@ function updateVoiceSettingHint() {
   const hint = $("voiceModeHint");
   if (hint) hint.textContent = direct
     ? "录音会直接发送给当前 AI 模型，不调用 Whisper。当前模型必须支持音频输入。"
-    : "录音会先调用下方转写服务，得到文字后再发送给 AI。";
+    : "录音会先调用下方中转站的转写接口，模型 ID 可自由填写；得到文字后再发送给当前写作模型。";
 }
 async function saveSettings() {
   const base_url = $("setBaseUrl").value.trim();
@@ -1612,10 +1673,11 @@ function renderAgent() {
       } else {
         const sum = r.summary || "已执行操作";
         const rid = r.undo_rid;
+        const actionChapterId = Number.isInteger(r.chapter_id) ? r.chapter_id : currentChapterId;
         const undone = rid && agentUndone.has(rid);
         const card = undone
           ? `<span class="done-tag">已撤销</span>`
-          : (rid ? `<button class="undo-btn" onclick="undoAgentAction(${rid})">撤销</button>` : "");
+          : (rid && actionChapterId ? `<button class="undo-btn" onclick="undoAgentAction(${rid},${actionChapterId})">撤销</button>` : "");
         const sources = renderAgentSources(r.sources);
         const actionIcon = m.name === "web_search" ? "search" : "pen";
         html += `<div class="cm action${undone ? " done" : ""}${temporaryClass}"><div class="act-bar"><span class="act-txt">${svg(actionIcon)} ${esc(sum)}</span>${card}</div>${sources}</div>`;
@@ -1656,15 +1718,19 @@ async function applyAgentResult(r, selection, baseMessages = null) {
   }
   if (r.compacted) showToast("已按上下文预算压缩早期对话", "ok");
   let contentChanged = false, sidebarDirty = false;
+  const changedChapterIds = new Set();
   for (const m of resultMessages) {
     if (m.role === "tool") {
       let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
       if (rr.changed) contentChanged = true;
       if (rr.sidebar_dirty) sidebarDirty = true;
+      if (rr.changed && Number.isInteger(rr.chapter_id)) changedChapterIds.add(rr.chapter_id);
     }
   }
   if (sidebarDirty) await loadChapters();
-  else if (contentChanged && currentChapterId) await loadChapter();
+  if (contentChanged && currentChapterId && (!changedChapterIds.size || changedChapterIds.has(currentChapterId))) {
+    await loadChapter();
+  }
   await notifyStoryUpdates(r);
   if (!$('characterStateOverlay').classList.contains('hidden') && characterStateChapterId === currentChapterId) {
     await loadCharacterState();
@@ -1687,7 +1753,9 @@ function speakLatestAgentTurn() {
 async function sendAgent() {
   if (agentBusy) return;
   const el = $("agentInput");
-  const text = el.value.trim();
+  let text = el.value.trim();
+  const documents = pendingAgentDocuments.map(({ name, text: content }) => ({ name, text: content }));
+  if (!text && documents.length) text = "请阅读并根据本轮附件协助我。";
   if (!text) return;
   const conversationMode = agentConversationMode;
   const baseMessages = agentMsgs.slice();
@@ -1707,8 +1775,11 @@ async function sendAgent() {
   };
   if (selection) body.selection = selection;
   if (activeAgentSkillIds.size) body.skill_ids = [...activeAgentSkillIds];
+  if (documents.length) body.documents = documents;
   try {
     const r = await streamAgent(body, updateAgentReplyStream);
+    pendingAgentDocuments = [];
+    renderAgentDocuments();
     agentReplyDraft = "";
     agentReplyStatus = "正在更新界面";
     scheduleAgentReplyRender();
@@ -1727,12 +1798,13 @@ async function sendAgent() {
     $("agentInput").focus(); // 发完聚焦输入框，方便连续对话
   }
 }
-async function undoAgentAction(rid) {
-  if (!currentChapterId || !rid) return;
+async function undoAgentAction(rid, chapterId = currentChapterId) {
+  if (!chapterId || !rid) return;
   try {
-    await api(`/api/chapters/${currentChapterId}/revisions/${rid}/restore`, { method: "POST" });
+    await api(`/api/chapters/${chapterId}/revisions/${rid}/restore`, { method: "POST" });
     agentUndone.add(rid);
-    await loadChapter();
+    await loadChapters();
+    if (chapterId === currentChapterId) await loadChapter();
     renderAgent();
   } catch (e) { showToast("撤销失败：" + e.message, "err"); }
 }
@@ -2016,8 +2088,13 @@ async function sendAgentAudio(blob) {
       audio, format: "wav", selection, ...agentScopeBody(),
       session_id: currentAgentSessionId, conversation_mode: conversationMode,
       ...(activeAgentSkillIds.size ? { skill_ids: [...activeAgentSkillIds] } : {}),
+      ...(pendingAgentDocuments.length ? {
+        documents: pendingAgentDocuments.map(({ name, text }) => ({ name, text })),
+      } : {}),
     };
     const result = await streamAgent(body, updateAgentReplyStream, "/api/agent/audio/stream");
+    pendingAgentDocuments = [];
+    renderAgentDocuments();
     agentReplyDraft = "";
     agentReplyStatus = "正在更新界面";
     scheduleAgentReplyRender();
@@ -3133,6 +3210,7 @@ async function loadAgentContext() {
       session_id: currentAgentSessionId, use_history: agentConversationMode === "standard",
       selection: agentSelection,
       skill_ids: activeAgentSkillIds.size ? [...activeAgentSkillIds] : [], text: $("agentInput")?.value || "",
+      documents: pendingAgentDocuments.map(({ name, text }) => ({ name, text })),
     }});
     renderAgentContext(data);
   } catch (e) { $("contextMeta").textContent = e.message; }

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ui-20260728-3">
+  <link rel="stylesheet" href="style.css?v=ui-20260730-1">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -186,14 +186,18 @@
         <div id="agentSelectionText" class="agent-selection-text"></div>
       </div>
       <div id="agentSkills" class="agent-skills hidden"></div>
+      <div id="agentDocuments" class="agent-documents hidden" aria-label="本轮附件"></div>
       <div id="voiceTrace" class="voice-trace hidden" aria-live="polite"></div>
       <div class="chat-input-row">
         <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
-        <button class="ic" id="agentInspirationBtn" data-ic="paperclip" onclick="chooseInspirationFileFromAgent()" title="保存图片、音乐或视频灵感"></button>
+        <button class="ic" id="agentDocumentBtn" data-ic="paperclip" onclick="chooseAgentDocuments()" title="添加 TXT、Markdown、Word 或 PDF 作为本轮资料"></button>
         <button class="ic" id="agentMicBtn" data-ic="mic" onclick="toggleAgentMic()" title="语音输入"></button>
         <button id="sendBtn" onclick="sendAgent()">发送</button>
       </div>
+      <input id="agentDocumentFiles" class="hidden" type="file" multiple
+             accept=".txt,.md,.docx,.pdf,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf"
+             onchange="addAgentDocuments(this.files)">
       <input id="inspirationQuickFile" class="hidden" type="file" accept="image/*,audio/*,video/*" onchange="openInspirationCapture(this.files?.[0] || null)">
     </aside>
 
@@ -588,10 +592,10 @@
     <div class="overlay-card">
       <div class="overlay-head"><span>模型与联网设置</span><button class="ic" data-ic="x" onclick="closeSettings()"></button></div>
       <div class="set-form">
-        <p class="set-hint">文字模型用于 AI 助手和改稿。勾选“直接发送语音”时，录音会原样交给当前模型；不勾选才使用下方独立的转写服务。</p>
-        <label>Base URL</label>
+        <p class="set-hint">文字模型用于 AI 助手和改稿，可填写你的 OpenAI 兼容中转站。勾选“直接发送语音”时，录音会原样交给当前模型；不勾选才使用下方转写服务。</p>
+        <label>文字 / Agent Base URL</label>
         <input id="setBaseUrl" placeholder="https://api.deepseek.com/v1">
-        <label>API Key</label>
+        <label>文字 / Agent API Key</label>
         <input id="setApiKey" type="password" placeholder="sk-…（已设置则显示 ****，留空=不改）">
         <label>当前模型 ID</label>
         <input id="setModel" list="modelIdOptions" placeholder="deepseek-chat">
@@ -612,12 +616,13 @@
         <label class="set-row voice-mode-row"><input id="setVoiceDirect" type="checkbox" onchange="updateVoiceSettingHint()"> 直接发送语音给 AI（不转写）</label>
         <p id="voiceModeHint" class="set-hint voice-mode-hint"></p>
         <div id="asrSettings">
-        <label>转写服务 Base URL</label>
-        <input id="setAsrBaseUrl" placeholder="留空则沿用文字模型的 Base URL">
+        <label>转写服务 Base URL（可用中转站）</label>
+        <input id="setAsrBaseUrl" placeholder="留空则沿用上方中转站 Base URL">
         <label>转写服务 API Key</label>
-        <input id="setAsrApiKey" type="password" placeholder="留空则沿用文字模型的 Key">
-        <label>转写模型</label>
-        <input id="setAsrModel" placeholder="whisper-1">
+        <input id="setAsrApiKey" type="password" placeholder="留空则沿用上方中转站 Key">
+        <label>转写模型 ID</label>
+        <input id="setAsrModel" placeholder="填写中转站实际支持的模型 ID">
+        <p class="set-hint">模型 ID 可自由填写，不要求 OpenAI 官方 Key；但该中转站必须实际支持 OpenAI 兼容的 <code>/audio/transcriptions</code> 接口。</p>
         <label class="set-row"><input id="setVoiceAuto" type="checkbox"> 转写完成后自动发送给 AI</label>
         </div>
         <div class="set-actions">
@@ -699,6 +704,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=ui-20260728-3"></script>
+  <script src="app.js?v=ui-20260730-1"></script>
 </body>
 </html>

@@ -51,6 +51,32 @@ def H(tok):
     return {"Authorization": "Bearer " + tok}
 
 
+def _simple_pdf(text="Hello PDF"):
+    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("ascii")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+    output = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(output))
+        output += f"{index} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref = len(output)
+    output += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
+    for offset in offsets[1:]:
+        output += f"{offset:010d} 00000 n \n".encode()
+    output += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref}\n%%EOF\n"
+    ).encode()
+    return bytes(output)
+
+
 # 注册状态
 s = c.get("/api/signup-status").json()
 ok(s["enabled"] and s["needs_code"], "注册：凭码开放")
@@ -122,6 +148,38 @@ _alice_settings = c.get("/api/settings", headers=H(tokA)).json()
 ok(_alice_settings["has_key"] is True and _alice_settings["model"] == "m-a2" and "m-polish" in _alice_settings["models"],
    "空 key 不清空已存 key，模型列表保持")
 ok(_alice_settings["tavily_user_key_count"] == 2, "未提交 Tavily 列表时保留原 Key 池")
+
+# Agent 本轮文档附件：四种格式都由服务端提取文字。
+_txt_doc = c.post(
+    "/api/agent/documents/extract", content="人物小传：林晚怕黑。".encode(),
+    headers={**H(tokA), "Content-Type": "text/plain", "X-File-Name": quote("人物.txt")},
+).json()
+ok(_txt_doc["type"] == "txt" and "林晚怕黑" in _txt_doc["text"], "附件提取 txt")
+_md_doc = c.post(
+    "/api/agent/documents/extract", content=b"# Outline\n\n- Chapter one",
+    headers={**H(tokA), "Content-Type": "text/markdown", "X-File-Name": "outline.md"},
+).json()
+ok(_md_doc["type"] == "md" and "Chapter one" in _md_doc["text"], "附件提取 md")
+from docx import Document as _Document
+_docx_buffer = io.BytesIO()
+_docx_file = _Document()
+_docx_file.add_paragraph("Word reference text")
+_docx_file.save(_docx_buffer)
+_docx_doc = c.post(
+    "/api/agent/documents/extract", content=_docx_buffer.getvalue(),
+    headers={**H(tokA), "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+             "X-File-Name": "reference.docx"},
+).json()
+ok(_docx_doc["type"] == "docx" and "Word reference text" in _docx_doc["text"], "附件提取 docx")
+_pdf_doc = c.post(
+    "/api/agent/documents/extract", content=_simple_pdf(),
+    headers={**H(tokA), "Content-Type": "application/pdf", "X-File-Name": "reference.pdf"},
+).json()
+ok(_pdf_doc["type"] == "pdf" and "Hello PDF" in _pdf_doc["text"], "附件提取可复制文字 PDF")
+ok(c.post(
+    "/api/agent/documents/extract", content=b"legacy",
+    headers={**H(tokA), "X-File-Name": "legacy.rtf"},
+).status_code == 400, "附件拒绝未支持格式")
 
 # AI Skills：通用/作品专用 CRUD、作用域和用户隔离
 ok(c.post("/api/agent/skills", json={"name": "", "instruction": "规则"}, headers=H(tokA)).status_code == 400, "Skill 空名称 400")
@@ -771,6 +829,22 @@ _conv_sel = c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).
 ok(not any("selected_text" in (m.get("content") or "") for m in _conv_sel["messages"]), "agent 选区上下文不持久化")
 ok(not any("本书悬疑节奏" in (m.get("content") or "") for m in _conv_sel["messages"]), "Skill 规则不写入选区对话历史")
 
+_seen_documents = {}
+def _capture_documents(messages, tools, **kw):
+    _seen_documents["messages"] = messages
+    return _msg("已读取附件。")
+llm.agent_chat = _capture_documents
+c.post("/api/agent", json={
+    "text": "按资料检查人物设定", "chapter_id": cid,
+    "documents": [{"name": "人物.md", "text": "林晚的固定设定：害怕黑暗。"}],
+}, headers=H(tokA))
+_document_prompt = "\n".join(m.get("content", "") for m in _seen_documents["messages"] if m.get("role") == "system")
+ok("林晚的固定设定：害怕黑暗" in _document_prompt and "<document" in _document_prompt,
+   "文档附件作为本轮隔离上下文交给 Agent")
+_conv_documents = c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()
+ok(not any("林晚的固定设定：害怕黑暗" in (m.get("content") or "") for m in _conv_documents["messages"]),
+   "文档全文不写入后续会话历史")
+
 ok(c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).status_code == 200, "清空对话 200")
 ok(len(c.get(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA)).json()["messages"]) == 0, "清空后对话为空")
 
@@ -822,6 +896,36 @@ ag2 = c.post("/api/agent", json={"text": "列出版本", "chapter_id": cid}, hea
 _tr2 = [m for m in ag2["messages"] if m.get("role") == "tool"]
 ok(len(_tr2) == 1 and isinstance(json.loads(_tr2[0]["content"]).get("revisions"), list), "agent list_revisions 返回版本数组")
 c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA))  # 清空，避免影响后续
+
+# 同一会话可连续创建并写入多章，也可按 chapter_id 覆盖指定章节。
+llm.agent_chat = _make_agent([
+    _msg(None, [
+        ("multi-1", "create_chapter", json.dumps({"title": "多章甲", "content": "甲章正文"})),
+        ("multi-2", "create_chapter", json.dumps({"title": "多章乙", "content": "乙章正文"})),
+    ]),
+    _msg("两章已经写入。"),
+])
+_multi = c.post("/api/agent", json={"text": "连续写两章", "chapter_id": cid}, headers=H(tokA)).json()
+_multi_tools = [json.loads(item["content"]) for item in _multi["messages"] if item.get("role") == "tool"]
+_multi_ids = [item.get("new_chapter_id") for item in _multi_tools if item.get("new_chapter_id")]
+ok(len(_multi_ids) == 2
+   and c.get(f"/api/chapters/{_multi_ids[0]}", headers=H(tokA)).json()["content"] == "甲章正文"
+   and c.get(f"/api/chapters/{_multi_ids[1]}", headers=H(tokA)).json()["content"] == "乙章正文",
+   "Agent 同一会话连续创建并写入多章")
+llm.agent_chat = _make_agent([
+    _msg(None, [("multi-write", "write_chapter", json.dumps({
+        "chapter_id": _multi_ids[0], "content": "甲章重写正文",
+    }))]),
+    _msg("指定章节已经重写。"),
+])
+_multi_write = c.post("/api/agent", json={"text": "重写多章甲", "chapter_id": cid}, headers=H(tokA)).json()
+_multi_write_tool = next(json.loads(item["content"]) for item in _multi_write["messages"]
+                         if item.get("role") == "tool" and "完整正文" in item.get("content", ""))
+ok(_multi_write_tool["chapter_id"] == _multi_ids[0]
+   and c.get(f"/api/chapters/{_multi_ids[0]}", headers=H(tokA)).json()["content"] == "甲章重写正文"
+   and c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["content"] == "你好",
+   "Agent 按 chapter_id 写指定章节且不误改当前章")
+c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA))
 
 # 联网搜索：Agent 工具拿到结构化来源，Key 只在服务端设置中存在。
 class _FakeTavilyClient:

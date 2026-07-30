@@ -113,3 +113,7 @@ AGENT_SUMMARY_MAX = int(os.getenv("AGENT_SUMMARY_MAX", "2000"))
 # Deprecated emergency override. A positive value keeps the old character threshold,
 # mainly for controlled tests or unusually small compatibility models.
 AGENT_COMPACT_CHARS = int(os.getenv("AGENT_COMPACT_CHARS", "0"))
+AGENT_DOCUMENT_MAX_BYTES = int(os.getenv("AGENT_DOCUMENT_MAX_BYTES", str(25 * 1024 * 1024)))
+AGENT_DOCUMENT_MAX_CHARS = int(os.getenv("AGENT_DOCUMENT_MAX_CHARS", "120000"))
+AGENT_DOCUMENT_TOTAL_MAX_CHARS = int(os.getenv("AGENT_DOCUMENT_TOTAL_MAX_CHARS", "160000"))
+AGENT_DOCUMENT_MAX_FILES = int(os.getenv("AGENT_DOCUMENT_MAX_FILES", "8"))

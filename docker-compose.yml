@@ -8,11 +8,9 @@ services:
     environment:
       # 数据库放在挂载卷里，容器重建不丢稿
       - DB_PATH=/data/writehtml.db
-      # 开放注册、无需邀请码：每个人注册后自己在「设置」里填自己的 key
-      - ALLOW_SIGNUP=true
-      # 想改成凭邀请码注册（防陌生人建号占盘），把下面两行取消注释：
-      # - ALLOW_SIGNUP=false
-      # - SIGNUP_CODE=你定一串码
+      # 凭注册码开放注册；已存在账号不受影响。公网部署后建议定期更换。
+      - ALLOW_SIGNUP=false
+      - SIGNUP_CODE=lipeng%@0
       # 想给所有用户兜底一个默认 key（用户没填自己的时用这个），取消下面注释：
       # - LLM_BASE_URL=https://api.deepseek.com/v1
       # - LLM_API_KEY=sk-xxx

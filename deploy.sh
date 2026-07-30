@@ -8,8 +8,8 @@
 #   2. git clone 最新代码到 /tmp 再覆盖过去（保留 ./data 里的数据库）
 #   3. docker compose down + up -d --build --force-recreate
 #   4. 打印容器状态
-# 无需 .env、无需注册码：部署后访问 http://服务器IP:9123 自由注册，
-# 每位用户登录后在右上角 ⚙ 填自己的 base_url / api_key / 模型ID。
+# 无需 .env：部署后访问 http://服务器IP:9123，使用 docker-compose.yml
+# 中配置的注册码注册；每位用户登录后在设置里填自己的模型配置。
 # ===================================================================
 set -e
 
