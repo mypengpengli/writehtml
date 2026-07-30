@@ -138,6 +138,8 @@ try:
     ok("PI_SKILL_RULE" in second_prompt, "activate_skill injects SKILL.md into the next Pi turn")
     stored = db.get_conversation(uid, chapter["id"])
     ok(any(message.get("role") == "toolResult" for message in stored["messages"]), "database stores Pi-native toolResult")
+    ok(json.dumps(stored["messages"], ensure_ascii=False).count("Use pi-skill") == 1,
+       "Pi successful turn stores the user input only once")
     ok("PI_SKILL_RULE" not in json.dumps(stored["messages"], ensure_ascii=False), "Skill text is not persisted in chat history")
     fetched = client.get(
         f"/api/agent/conversation?chapter_id={chapter['id']}",
@@ -156,6 +158,38 @@ try:
        "Pi text delta reaches the HTTP stream")
     ok(stream_result and stream_result["reply"] == "Pi completed the Skill turn.",
        "Pi stream ends with the authoritative complete result")
+    failed_chapter = db.create_chapter(work["id"], uid, "Failed Pi chapter")
+    original_pi_run_turn = main.pi_agent.run_turn
+    def fail_pi_turn(*args, **kwargs):
+        raise main.pi_agent.PiAgentError("simulated provider network failure")
+    main.pi_agent.run_turn = fail_pi_turn
+    try:
+        _, _, failed_events = post_stream_events(
+            client, "/api/agent/stream",
+            {"text": "Keep this even if Pi fails", "chapter_id": failed_chapter["id"]}, token,
+        )
+    finally:
+        main.pi_agent.run_turn = original_pi_run_turn
+    failed_stored = db.get_conversation(uid, failed_chapter["id"])
+    ok(any(event.get("type") == "error" for event in failed_events),
+       "Pi provider failure reaches the HTTP stream")
+    ok(json.dumps(failed_stored["messages"], ensure_ascii=False).count("Keep this even if Pi fails") == 1,
+       "Pi provider failure still preserves the user input")
+    _, _, resumed_events = post_stream_events(
+        client, "/api/agent/stream",
+        {"text": "Continue after the failed turn", "chapter_id": failed_chapter["id"]}, token,
+    )
+    resumed_result = next(
+        (event.get("data") for event in resumed_events if event.get("type") == "result"), None
+    )
+    resumed_stored = db.get_conversation(uid, failed_chapter["id"])
+    resumed_serialized = json.dumps(resumed_stored["messages"], ensure_ascii=False)
+    ok(
+        resumed_result
+        and resumed_serialized.count("Keep this even if Pi fails") == 1
+        and resumed_serialized.count("Continue after the failed turn") == 1,
+        "Pi next turn keeps failed and current user inputs without duplication",
+    )
     voice = client.post(
         "/api/agent/audio", json={
             "audio": base64.b64encode(b"fake-pi-audio").decode(), "format": "wav", "chapter_id": chapter["id"],

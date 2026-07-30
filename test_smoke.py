@@ -763,6 +763,58 @@ ok("".join(event.get("delta", "") for event in _streamed if event.get("type") ==
 ok(_stream_result and _stream_result["reply"] == "流式回复"
    and db.get_conversation(uidA, stream_cid)["messages"][-1]["content"] == "流式回复",
    "流式最终结果完整持久化")
+
+# 供应商网络失败时也必须保留用户输入；下一轮应自动带上且不得重复。
+failed_turn_cid = c.post(
+    f"/api/works/{wid}/chapters", json={"title": "失败消息持久化"}, headers=H(tokA),
+).json()["id"]
+def _failing_agent_stream(messages, tools, on_text_delta=None, **kw):
+    raise RuntimeError("模拟供应商网络错误")
+llm.agent_chat_stream = _failing_agent_stream
+failed_turn_response = c.post(
+    "/api/agent/stream",
+    json={"text": "这段很重要，网络失败也要记住", "chapter_id": failed_turn_cid},
+    headers=H(tokA),
+)
+failed_turn_events = _stream_events(failed_turn_response)
+failed_turn_messages = db.get_conversation(uidA, failed_turn_cid)["messages"]
+ok(any(event.get("type") == "error" for event in failed_turn_events),
+   "供应商网络错误进入流式错误事件")
+ok(sum(
+    message.get("role") == "user" and message.get("content") == "这段很重要，网络失败也要记住"
+    for message in failed_turn_messages
+) == 1, "AI 回复失败时用户消息仍立即持久化")
+
+recovery_model_messages = []
+def _recover_after_failed_turn(messages, tools, on_text_delta=None, **kw):
+    recovery_model_messages.extend(messages)
+    return _msg("我记得上一条，继续处理。")
+llm.agent_chat_stream = _recover_after_failed_turn
+recovered_turn_response = c.post(
+    "/api/agent/stream",
+    json={"text": "继续处理上一条", "chapter_id": failed_turn_cid},
+    headers=H(tokA),
+)
+recovered_turn_events = _stream_events(recovered_turn_response)
+recovered_result = next(
+    (event.get("data") for event in recovered_turn_events if event.get("type") == "result"), None
+)
+recovery_user_texts = [
+    message.get("content") for message in recovery_model_messages if message.get("role") == "user"
+]
+recovered_saved_messages = db.get_conversation(uidA, failed_turn_cid)["messages"]
+ok(
+    recovery_user_texts.count("这段很重要，网络失败也要记住") == 1
+    and recovery_user_texts.count("继续处理上一条") == 1,
+    "下一轮上下文自动包含失败回合的用户消息且不重复",
+)
+ok(
+    recovered_result and sum(
+        message.get("role") == "user" and message.get("content") == "继续处理上一条"
+        for message in recovered_saved_messages
+    ) == 1,
+    "恢复成功后当前用户消息只保存一次",
+)
 llm.agent_chat_stream = _orig_agent_stream
 
 # 直发语音：本轮模型收到 input_audio，但持久化记录只保存语音占位文本，不存 Base64。

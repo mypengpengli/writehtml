@@ -3522,9 +3522,23 @@ def _pi_tools():
     } for item in AGENT_TOOLS]
 
 
+def _history_before_persisted_input(messages, history_text, input_persisted):
+    """Exclude the just-saved user input from prior history for this model call."""
+    history = list(messages or [])
+    if (
+        input_persisted and history
+        and isinstance(history[-1], dict)
+        and history[-1].get("role") == "user"
+        and _pi_text(history[-1].get("content")).strip() == (history_text or "").strip()
+    ):
+        history.pop()
+    return history
+
+
 def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                   runtime_system=None, persist=True, session_id=None, work_id=None,
-                  use_history=True, retain_history=True, on_event=None, documents=None):
+                  use_history=True, retain_history=True, on_event=None, documents=None,
+                  input_persisted=False):
     """Run the writing agent through the official Pi Coding Agent process."""
     audio = None
     context_instruction = history_text
@@ -3563,6 +3577,9 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
     ) or {"messages": [], "summary": ""}
     summary = conv["summary"] or ""
     stored_history = _legacy_messages_to_pi(conv["messages"], model)
+    stored_history = _history_before_persisted_input(
+        stored_history, history_text, input_persisted,
+    )
     history = list(stored_history) if use_history else []
     system_prompt = _pi_system_prompt(
         uid, cid, selection, skill_ids, runtime_system, summary if use_history else "",
@@ -3707,7 +3724,8 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
 
 def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                runtime_system=None, persist=True, session_id=None, work_id=None,
-               use_history=True, retain_history=True, on_event=None, documents=None):
+               use_history=True, retain_history=True, on_event=None, documents=None,
+               input_persisted=False):
     """执行一轮 agent。
 
     history_text 是持久化到 SQLite 的安全文本；model_turn 可在本轮替换成音频等
@@ -3740,7 +3758,9 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
         db.get_conversation(uid, cid, session_id=session_id, work_id=work_id)
         if retain_history else None
     ) or {"messages": [], "summary": ""}
-    stored_messages = list(conv["messages"])
+    stored_messages = _history_before_persisted_input(
+        conv["messages"], history_text, input_persisted,
+    )
     summary = conv["summary"] or ""
     stored_turn = {"role": "user", "content": history_text}
 
@@ -3935,7 +3955,7 @@ def _apply_story_update_proposals(uid, state_request):
 
 def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                     session_id=None, work_id=None, use_history=True, retain_history=True,
-                    on_event=None, documents=None):
+                    on_event=None, documents=None, input_persisted=False):
     """执行 Agent，并在启用本机运行时时先缓冲回答、等 after/recovery 确认。"""
     def emit(event):
         if not on_event:
@@ -3982,6 +4002,7 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
             persist=turn is None, session_id=session_id, work_id=work_id,
             use_history=use_history, retain_history=retain_history,
             on_event=relay if on_event else None, documents=documents,
+            input_persisted=input_persisted,
         )
     except skill_runtime.SkillRuntimeError as e:
         raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
@@ -4054,7 +4075,34 @@ def _optional_body_int(body, name):
     return value
 
 
-def _prepare_agent_turn(uid, body, title_hint):
+def _persist_agent_input(uid, cid, work_id, session_id, text, title_hint):
+    """Durably record user input before the provider request can fail."""
+    conv = db.get_conversation(uid, cid, session_id=session_id, work_id=work_id)
+    if not conv:
+        raise HTTPException(409, "当前会话已被删除或归档，消息未保存")
+    messages = list(conv.get("messages") or [])
+    if _is_pi_transcript(messages) or (not messages and config.PI_AGENT_ENABLED):
+        user_message = {
+            "role": "user",
+            "content": [{"type": "text", "text": text}],
+            "timestamp": _pi_timestamp(),
+        }
+    else:
+        user_message = {"role": "user", "content": text}
+    messages.append(user_message)
+    settings = db.get_settings(uid) or {}
+    saved = db.save_conversation(
+        uid, cid, messages, conv.get("summary") or "",
+        session_id=session_id, work_id=work_id,
+        title_hint=title_hint or text,
+        model=settings.get("llm_model") or config.LLM_MODEL,
+    )
+    if not saved:
+        raise HTTPException(409, "当前会话已被删除或归档，消息未保存")
+    return saved
+
+
+def _prepare_agent_turn(uid, body, title_hint, history_text=None):
     cid = _optional_body_int(body, "chapter_id")
     work_id = _optional_body_int(body, "work_id")
     scope = db.resolve_agent_scope(uid, cid, work_id)
@@ -4082,10 +4130,19 @@ def _prepare_agent_turn(uid, body, title_hint):
         if not session:
             session = db.create_agent_session(uid, cid, work_id, title_hint or "新会话")
         session_id = session["id"]
+    input_persisted = False
+    if retain_history:
+        saved = _persist_agent_input(
+            uid, cid, work_id, session_id,
+            history_text if history_text is not None else title_hint,
+            title_hint,
+        )
+        session_id = saved["id"]
+        input_persisted = True
     return {
         "chapter_id": cid, "work_id": work_id, "session_id": session_id,
         "use_history": use_history, "retain_history": retain_history,
-        "conversation_mode": mode,
+        "conversation_mode": mode, "input_persisted": input_persisted,
     }
 
 
@@ -4102,7 +4159,7 @@ async def agent(request: Request):
         uid, turn["chapter_id"], text, body.get("selection"), body.get("skill_ids"),
         session_id=turn["session_id"], work_id=turn["work_id"],
         use_history=turn["use_history"], retain_history=turn["retain_history"],
-        documents=body.get("documents"),
+        documents=body.get("documents"), input_persisted=turn["input_persisted"],
     )
 
 
@@ -4176,6 +4233,7 @@ async def agent_stream(request: Request):
             session_id=turn["session_id"], work_id=turn["work_id"],
             use_history=turn["use_history"], retain_history=turn["retain_history"],
             on_event=publish, documents=body.get("documents"),
+            input_persisted=turn["input_persisted"],
         ),
     )
 
@@ -4233,13 +4291,15 @@ async def agent_audio(request: Request):
     body = await request.json()
     audio_format, model_turn = _direct_audio_model_turn(body)
     try:
-        turn = _prepare_agent_turn(uid, body, "语音会话")
+        turn = _prepare_agent_turn(
+            uid, body, "语音会话", history_text="[voice] 语音指令",
+        )
         result = _run_agent_turn(
             uid, turn["chapter_id"], "[voice] 语音指令",
             body.get("selection"), body.get("skill_ids"), model_turn=model_turn,
             session_id=turn["session_id"], work_id=turn["work_id"],
             use_history=turn["use_history"], retain_history=turn["retain_history"],
-            documents=body.get("documents"),
+            documents=body.get("documents"), input_persisted=turn["input_persisted"],
         )
         settings = db.get_settings(uid) or {}
         result["voice"] = {
@@ -4261,7 +4321,9 @@ async def agent_audio_stream(request: Request):
     uid = _auth(request)
     body = await request.json()
     audio_format, model_turn = _direct_audio_model_turn(body)
-    turn = _prepare_agent_turn(uid, body, "语音会话")
+    turn = _prepare_agent_turn(
+        uid, body, "语音会话", history_text="[voice] 语音指令",
+    )
 
     def run(publish):
         result = _run_agent_turn(
@@ -4270,6 +4332,7 @@ async def agent_audio_stream(request: Request):
             session_id=turn["session_id"], work_id=turn["work_id"],
             use_history=turn["use_history"], retain_history=turn["retain_history"],
             on_event=publish, documents=body.get("documents"),
+            input_persisted=turn["input_persisted"],
         )
         settings = db.get_settings(uid) or {}
         result["voice"] = {
