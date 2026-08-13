@@ -233,6 +233,7 @@ def create_inspiration(user_id, payload, *, current_work_id=None, queue=True):
     title_locked = bool(title and payload.get("title_locked", True))
     title = title or _default_title(raw_text, source_type)
     now = time.time()
+    initial_analysis_status = "completed" if payload.get("analysis_status") == "completed" else "pending"
     lists = {field: _json_list(payload.get(field)) for field in _LIST_FIELDS}
     with db.get_conn() as conn:
         work_id = _normalize_scope(conn, user_id, payload, current_work_id)
@@ -269,7 +270,7 @@ def create_inspiration(user_id, payload, *, current_work_id=None, queue=True):
                 _search_tags(lists),
                 _importance(payload.get("importance")),
                 int(bool(payload.get("favorite"))),
-                "pending", "", now, now,
+                initial_analysis_status, "", now, now,
             ),
         )
         inspiration_id = cur.lastrowid

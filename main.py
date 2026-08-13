@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-import config, context_builder, db, image_generation, inspiration, llm, pi_agent, skill_runtime, tavily_search
+import config, context_builder, db, image_generation, inspiration, llm, materials, pi_agent, skill_runtime, tavily_search
 
 app = FastAPI(title="写作")
 db.init_db()
@@ -724,31 +724,81 @@ async def save_entity(eid: int, request: Request):
 @app.delete("/api/entities/{eid}")
 async def del_entity(eid: int, request: Request):
     uid = _auth(request)
-    image = db.get_entity_image_record(eid, uid)
+    image_paths = db.list_entity_image_paths(eid, uid)
     if not db.delete_entity(eid, uid):
         raise HTTPException(404, "实体不存在")
-    if image:
-        image_generation.remove_image(image.get("image_path"))
+    for image_path in image_paths or []:
+        image_generation.remove_image(image_path)
     return {"ok": True}
 
 
 def _default_character_image_prompt(entity, state=None):
     parts = [
-        "小说角色设定图，单人角色肖像，主体清晰，构图完整，统一美术设定，无文字、无水印。",
-        f"角色名：{entity['name']}。",
+        "Create a polished full-body character concept illustration for a novel.",
+        "Show one clearly identifiable character in a vertical 3:4 composition, with the complete silhouette visible, natural posture, coherent costume design, intentional lighting, a harmonious color palette, and an uncluttered atmospheric background.",
+        "Preserve all canonical appearance details below. Express personality through posture, gaze, costume, props, lighting and composition. Do not invent conflicting traits.",
+        "No text, letters, captions, logos, signatures, watermarks, split panels, duplicate people, extra limbs, malformed hands, or cropped feet.",
+        f"Character name for identity reference only (do not render it as text): {entity['name']}.",
     ]
     if entity.get("summary"):
-        parts.append(f"人物摘要：{entity['summary']}。")
+        parts.append(f"Canonical character summary (source language): {entity['summary']}")
     if entity.get("detail"):
-        parts.append(f"外貌、性格与背景设定：{entity['detail']}。")
+        parts.append(f"Canonical appearance, personality and background details (source language): {entity['detail']}")
     state = state if isinstance(state, dict) else {}
     live = "；".join(f"{key}：{value}" for key, value in {
         "所在地点": state.get("location"), "情绪": state.get("emotion"),
         "身体状态": state.get("physical"), "能力与物品": state.get("assets"),
     }.items() if value)
     if live:
-        parts.append(f"当前剧情状态：{live}。")
+        parts.append(f"Current story-state cues (source language; use only visually relevant details): {live}")
     return "\n".join(parts)[:8000]
+
+
+@app.post("/api/entities/{eid}/image/prompt")
+async def polish_entity_image_prompt(eid: int, request: Request):
+    uid = _auth(request)
+    entity = db.get_entity_image_record(eid, uid)
+    if not entity:
+        raise HTTPException(404, "人物卡不存在")
+    if entity.get("kind") != "人物":
+        raise HTTPException(400, "只有人物卡可以整理角色图提示词")
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    state = None
+    chapter_id = body.get("chapter_id")
+    if isinstance(chapter_id, int):
+        overview = db.get_entity_state_overview(eid, uid, chapter_id)
+        if overview and not overview.get("invalid_chapter"):
+            state = overview.get("current_state")
+    draft = str(body.get("prompt") or _default_character_image_prompt(entity, state)).strip()[:8000]
+    style = str(body.get("style") or "").strip()[:1000]
+    cfg = _material_llm_config(uid)
+    instruction = {
+        "task": "Rewrite the character image brief into one production-ready English image-generation prompt.",
+        "rules": [
+            "Return only the final English prompt, without Markdown or explanation.",
+            "Preserve canonical physical traits and identity. Do not add facts that conflict with the source.",
+            "Include visual style, full-body vertical composition, camera, lighting, color palette, costume materials, expression, pose and background.",
+            "A character illustration should be 3:4 or 2:3 and contain one person unless the source explicitly requires otherwise.",
+            "End with negative constraints: no text, watermark, logo, duplicate figure, extra limbs, cropped feet or malformed hands.",
+            "Do not imitate a living artist or reproduce a copyrighted character; describe visual properties instead.",
+        ],
+        "character": {"name": entity["name"], "summary": entity.get("summary") or "", "detail": entity.get("detail") or "", "state": state or {}},
+        "author_style_request": style,
+        "draft_prompt": draft,
+    }
+    try:
+        prompt = llm.chat(
+            [{"role": "system", "content": "You are a senior character concept-art prompt editor."},
+             {"role": "user", "content": json.dumps(instruction, ensure_ascii=False)}],
+            **cfg,
+        ).strip()
+    except Exception as exc:
+        raise HTTPException(502, "AI 整理角色图提示词失败：" + _provider_error(exc, 300))
+    prompt = re.sub(r"^```(?:text)?\s*|\s*```$", "", prompt, flags=re.I).strip()[:8000]
+    if not prompt:
+        raise HTTPException(502, "AI 没有返回可用提示词")
+    return {"prompt": prompt}
 
 
 def _image_provider_settings(uid):
@@ -799,7 +849,7 @@ async def generate_entity_image(eid: int, request: Request):
               _default_character_image_prompt(entity, state)).strip()[:8000]
     style = (body.get("style") or "").strip()[:1000]
     if style:
-        prompt = f"{prompt}\n画面风格：{style}"[:8000]
+        prompt = f"{prompt}\nAdditional visual-style request (source language): {style}"[:8000]
     provider = _image_provider_settings(uid)
     size = (body.get("size") or provider["size"]).strip()[:32]
     try:
@@ -809,13 +859,15 @@ async def generate_entity_image(eid: int, request: Request):
         relative_path, _ = image_generation.save_image(uid, eid, data, content_type)
     except image_generation.ImageGenerationError as exc:
         raise HTTPException(400, str(exc)) from exc
-    saved = db.save_entity_image(eid, uid, relative_path, prompt)
+    saved = db.save_entity_image(
+        eid, uid, relative_path, prompt, style=style, model=provider["model"], size=size,
+    )
     if not saved:
         image_generation.remove_image(relative_path)
         raise HTTPException(404, "实体不存在")
-    image_generation.remove_image(saved.get("old_path"))
     return {"ok": True, "entity_id": eid, "has_image": True,
-            "image_prompt": prompt, "image_updated_at": saved["image_updated_at"]}
+            "image_prompt": prompt, "image_updated_at": saved["image_updated_at"],
+            "image": saved.get("image")}
 
 
 @app.delete("/api/entities/{eid}/image")
@@ -825,6 +877,57 @@ async def delete_entity_image(eid: int, request: Request):
         raise HTTPException(404, "实体不存在")
     image_generation.remove_image(old_path)
     return {"ok": True}
+
+
+@app.get("/api/entities/{eid}/images")
+async def list_entity_image_assets(eid: int, request: Request):
+    items = db.list_entity_images(eid, _auth(request))
+    if items is None:
+        raise HTTPException(404, "人物卡不存在")
+    return {"items": items}
+
+
+@app.get("/api/works/{wid}/images")
+async def list_work_image_assets(wid: int, request: Request):
+    category = (request.query_params.get("category") or "characters").strip()
+    if category not in {"", "characters"}:
+        raise HTTPException(400, "图片分类无效")
+    items = db.list_work_entity_images(wid, _auth(request), category)
+    if items is None:
+        raise HTTPException(404, "作品不存在")
+    return {"items": items}
+
+
+@app.get("/api/entity-images/{image_id}/content")
+async def get_entity_image_asset_content(image_id: int, request: Request):
+    record = db.get_entity_image_asset(image_id, _auth(request), include_path=True)
+    if not record:
+        raise HTTPException(404, "图片不存在")
+    try:
+        path = image_generation.resolve_image_path(record["image_path"])
+    except image_generation.ImageGenerationError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(404, "图片文件不存在")
+    return FileResponse(path, media_type=image_generation.image_media_type(path),
+                        headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/api/entity-images/{image_id}/select")
+async def select_entity_image_asset(image_id: int, request: Request):
+    item = db.select_entity_image(image_id, _auth(request))
+    if not item:
+        raise HTTPException(404, "图片不存在")
+    return {"ok": True, "image": item, "entity_id": item["entity_id"]}
+
+
+@app.delete("/api/entity-images/{image_id}")
+async def delete_entity_image_asset(image_id: int, request: Request):
+    result = db.delete_entity_image_asset(image_id, _auth(request))
+    if not result:
+        raise HTTPException(404, "图片不存在")
+    image_generation.remove_image(result["image_path"])
+    return {"ok": True, **{key: value for key, value in result.items() if key != "image_path"}}
 
 
 # ---------- 人物动态卡（基础设定 + 按章节生效的状态/成长记录）----------
@@ -2059,6 +2162,209 @@ def _normalize_disassembly_result(parsed):
     return result
 
 
+def _normalize_material_analysis(parsed):
+    if not isinstance(parsed, dict):
+        raise ValueError("模型没有返回 JSON 对象")
+    profile_source = parsed.get("style_profile") if isinstance(parsed.get("style_profile"), dict) else parsed
+    profile = materials.normalize_profile(profile_source)
+    plot_devices = parsed.get("plot_devices") if isinstance(parsed.get("plot_devices"), list) else profile.get("plot_devices", [])
+    profile["plot_devices"] = materials.normalize_profile({"plot_devices": plot_devices})["plot_devices"]
+    if not any(value for key, value in profile.items() if key != "plot_devices") and not profile["plot_devices"]:
+        raise ValueError("模型没有提炼出可用的创作资料")
+    return {"style_profile": profile, "plot_devices": profile["plot_devices"]}
+
+
+def _material_llm_config(uid):
+    settings = db.get_settings(uid) or {}
+    result = {
+        "base_url": settings.get("llm_base_url") or config.LLM_BASE_URL,
+        "api_key": settings.get("llm_api_key") or config.LLM_API_KEY,
+        "model": settings.get("llm_model") or config.LLM_MODEL,
+    }
+    if not result["api_key"]:
+        raise HTTPException(500, "未配置 API Key，请先在模型与联网设置中配置文字模型")
+    return result
+
+
+def _analyze_creative_materials(uid, source_label, source_text):
+    cfg = _material_llm_config(uid)
+    prompt = {
+        "task": "从完整作品的跨章摘要与风格观察中，提炼可复用但不照搬原句的创作资料。",
+        "source": source_label,
+        "requirements": [
+            "综合全书，而不是逐章复述。只总结抽象规律，不大段引用原文。",
+            "语言指纹要可执行：视角、叙述声音、节奏、句式、措辞、描写偏好、对话模式、情绪底色和避免事项。",
+            "人物语言指纹按角色区分口头习惯、称呼方式、节奏、词汇和禁忌。",
+            "桥段只提炼机制、铺垫、兑现、适用条件和改编边界；不得保留专有名词，不得复制独特表达。",
+            "只返回 JSON，不要 Markdown。",
+        ],
+        "output_schema": {
+            "style_profile": {
+                "narrative_voice": "", "point_of_view": "", "pacing": "", "sentence_rhythm": "",
+                "diction": "", "description_preferences": "", "dialogue_pattern": "",
+                "emotional_tone": "", "avoid": "",
+                "character_voices": [{"name": "", "speech_habits": "", "addressing": "", "rhythm": "", "lexicon": "", "taboos": ""}],
+                "description_craft": [{"title": "", "technique": "", "when_to_use": "", "pattern": ""}],
+            },
+            "plot_devices": [{"title": "", "mechanism": "", "setup": "", "payoff": "", "suitable_context": "", "adaptation": "", "avoid_copy": ""}],
+        },
+        "material": source_text[:60000],
+    }
+    raw = llm.chat(
+        [{"role": "system", "content": "你是小说创作资料编辑。严格区分故事事实、文风技法和可改编桥段。"},
+         {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
+        **cfg,
+    )
+    return _normalize_material_analysis(_parse_json_from_model(raw))
+
+
+@app.get("/api/works/{wid}/materials")
+async def get_work_materials(wid: int, request: Request):
+    result = materials.get_dashboard(_auth(request), wid)
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return result
+
+
+@app.put("/api/works/{wid}/materials/settings")
+async def save_work_material_settings(wid: int, request: Request):
+    try:
+        result = materials.save_settings(_auth(request), wid, await request.json())
+    except materials.MaterialError as exc:
+        raise HTTPException(400, str(exc))
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return {"ok": True, "settings": result}
+
+
+@app.post("/api/works/{wid}/materials/references")
+async def mount_reference_work(wid: int, request: Request):
+    try:
+        result = materials.save_mount(_auth(request), wid, await request.json())
+    except materials.MaterialError as exc:
+        raise HTTPException(400, str(exc))
+    if result is None:
+        raise HTTPException(404, "作品或参考工程不存在")
+    return {"ok": True, "mount": result}
+
+
+@app.delete("/api/works/{wid}/materials/references/{mount_id}")
+async def unmount_reference_work(wid: int, mount_id: int, request: Request):
+    if not materials.delete_mount(_auth(request), wid, mount_id):
+        raise HTTPException(404, "挂载记录不存在")
+    return {"ok": True}
+
+
+@app.post("/api/works/{wid}/materials/documents")
+async def save_reference_document(wid: int, request: Request):
+    try:
+        result = materials.save_document(_auth(request), wid, await request.json())
+    except materials.MaterialError as exc:
+        raise HTTPException(400, str(exc))
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return {"ok": True, "document": result}
+
+
+@app.put("/api/works/{wid}/materials/documents/{document_id}")
+async def update_reference_document(wid: int, document_id: int, request: Request):
+    result = materials.update_document(_auth(request), wid, document_id, await request.json())
+    if result is None:
+        raise HTTPException(404, "长期资料不存在")
+    return {"ok": True, "document": result}
+
+
+@app.delete("/api/works/{wid}/materials/documents/{document_id}")
+async def delete_reference_document(wid: int, document_id: int, request: Request):
+    if not materials.delete_document(_auth(request), wid, document_id):
+        raise HTTPException(404, "长期资料不存在")
+    return {"ok": True}
+
+
+@app.post("/api/works/{wid}/materials/style/analyze")
+async def analyze_work_style(wid: int, request: Request):
+    uid = _auth(request)
+    chapters = db.list_chapters_full(wid, uid)
+    if chapters is None:
+        raise HTTPException(404, "作品不存在")
+    samples, used = [], 0
+    for chapter in chapters:
+        content = (chapter.get("content") or "").strip()
+        if not content:
+            continue
+        sample = content if len(content) <= 4000 else content[:2200] + "\n[…中段省略…]\n" + content[-1800:]
+        samples.append(f"第{chapter.get('ord') or '?'}章《{chapter.get('title') or '未命名'}》\n{sample}")
+        used += len(sample)
+        if used >= 50000:
+            break
+    if used < 300:
+        raise HTTPException(400, "正文太少，至少写几段后再提炼语言指纹")
+    try:
+        result = _analyze_creative_materials(uid, "作者当前作品正文", "\n\n".join(samples))
+        profile = materials.save_style_profile(
+            uid, wid, result["style_profile"], source_kind="author_text", source_label="当前作品正文"
+        )
+        return {"ok": True, "style_profile": profile}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, "语言指纹提炼失败：" + _provider_error(exc, 400))
+
+
+@app.post("/api/disassembly/jobs/{job_id}/materials/extract")
+async def extract_disassembly_materials(job_id: int, request: Request):
+    uid = _auth(request)
+    source = materials.get_disassembly_material_source(uid, job_id)
+    if not source:
+        raise HTTPException(404, "拆书任务不存在")
+    if not source["chapters"]:
+        raise HTTPException(400, "至少完成一章拆解后才能提炼资料")
+    body = await request.json()
+    blocks = []
+    for chapter in source["chapters"]:
+        result = chapter["result"]
+        blocks.append(json.dumps({
+            "chapter": chapter["title"], "summary": result.get("summary") or "",
+            "style_notes": result.get("style_notes") or "", "characters": result.get("characters") or [],
+            "relations": result.get("relations") or [],
+        }, ensure_ascii=False))
+    try:
+        extracted = _analyze_creative_materials(uid, source["job"]["source_name"], "\n".join(blocks))
+        wid = source["job"]["target_work_id"]
+        profile = materials.save_style_profile(
+            uid, wid, extracted["style_profile"], source_kind="disassembly",
+            source_label=source["job"]["source_name"], source_job_id=job_id,
+        )
+        inspiration_ids = []
+        if body.get("create_inspirations", True):
+            for device in extracted["plot_devices"][:24]:
+                title = device.get("title") or device.get("mechanism") or "拆书桥段"
+                mechanism = device.get("mechanism") or ""
+                adaptation = device.get("adaptation") or ""
+                avoid_copy = device.get("avoid_copy") or ""
+                item = inspiration.create_inspiration(uid, {
+                    "work_id": wid, "scope": "work", "title": title, "title_locked": True,
+                    "raw_text": mechanism, "source_type": "text", "primary_category": "plot",
+                    "library_status": "available", "reuse_mode": "adaptable", "use_policy": "generate_candidate",
+                    "core_mechanism": mechanism,
+                    "creative_summary": "；".join(filter(None, [device.get("setup"), device.get("payoff")]))[:8000],
+                    "suitable_context": device.get("suitable_context") or "",
+                    "adaptation_notes": "；".join(filter(None, [adaptation, avoid_copy]))[:12000],
+                    "tags": ["拆书提炼", "桥段模板"], "analysis_status": "completed",
+                }, current_work_id=wid, queue=False)
+                inspiration_ids.append(item["id"])
+        materials.save_disassembly_extraction(uid, job_id, wid, extracted, inspiration_ids)
+        return {"ok": True, "style_profile": profile, "plot_devices": extracted["plot_devices"],
+                "inspiration_ids": inspiration_ids}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        materials.save_disassembly_extraction(
+            uid, job_id, source["job"]["target_work_id"], {}, [], "failed", _provider_error(exc, 500)
+        )
+        raise HTTPException(502, "整本资料提炼失败：" + _provider_error(exc, 400))
+
+
 @app.get("/api/disassembly/jobs")
 async def list_disassembly_jobs(request: Request):
     uid = _auth(request)
@@ -3010,10 +3316,17 @@ def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
             )
             if context:
                 story_context = context_builder.render_context(
-                    context, {"work_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"},
+                    context, {"work_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary",
+                              "style_profile", "reference_project", "reference_document", "inspiration"},
                 )
                 if story_context:
-                    parts.append("系统为本回合检索到的可信创作上下文：\n" + story_context)
+                    parts.append(
+                        "系统为本回合检索到的创作上下文：\n" + story_context
+                        + "\n\n资料边界：本书设定、人物/剧情状态和已确认故事记忆是事实约束；"
+                          "语言指纹、参考工程、长期参考文档和灵感只是创作辅助。"
+                          "不得把参考资料中的人物、地名或事件写成本书既成事实；只借抽象技法和结构，"
+                          "必须结合本书人物与因果重新创作，不复制来源的独特表达。"
+                    )
     return {"role": "system", "content": "\n\n".join(parts)}
 
 

@@ -42,6 +42,7 @@ let agentSkills = [];
 let agentSkillsWorkId = undefined;
 let activeAgentSkillIds = new Set();
 let pendingAgentDocuments = [];
+let materialData = null;
 let currentUsername = "";
 // 写作工作台：剧情、章节流程、关系、提醒与本回合上下文共用一个右侧抽屉。
 let storyTab = "plot";
@@ -717,6 +718,7 @@ function renderAgentDocuments() {
       ${svg("paperclip")}
       <span>${esc(document.name)}</span>
       <small>${document.chars.toLocaleString()} 字${document.truncated ? " · 已截取" : ""}</small>
+      ${currentWorkId ? `<button class="agent-document-save" onclick="saveAgentDocumentAsMaterial(${index})" title="保存后可在以后回合按需召回">存为长期</button>` : ""}
       <button class="ic" onclick="removeAgentDocument(${index})" title="移除附件">${svg("x")}</button>
     </div>`).join("");
 }
@@ -725,6 +727,18 @@ function removeAgentDocument(index) {
   if (agentBusy) return;
   pendingAgentDocuments.splice(index, 1);
   renderAgentDocuments();
+}
+
+async function saveAgentDocumentAsMaterial(index) {
+  const document = pendingAgentDocuments[index];
+  if (!document || !currentWorkId) return;
+  try {
+    await api(`/api/works/${currentWorkId}/materials/documents`, {
+      body: { name: document.name, content: document.text, enabled: true, pinned: false },
+    });
+    showToast(`《${document.name}》已存为本书长期资料；本轮附件仍保留`, "ok");
+    if (!$('materialOverlay')?.classList.contains('hidden')) await loadMaterialHub();
+  } catch (e) { showToast("保存长期资料失败：" + e.message, "err"); }
 }
 
 async function addAgentDocuments(fileList) {
@@ -1712,6 +1726,145 @@ async function retryDisassemblyChapter(chapterId) {
   renderDisassemblyJob(); showToast("已放回待分析队列", "ok");
 }
 
+/* ---------- 创作资料中心：事实、参考、风格、桥段与附件分层融合 ---------- */
+
+let materialSettingsTimer = null;
+function materialSettingsValue() {
+  return {
+    use_story_memory: $("materialUseMemory").checked,
+    use_reference_projects: $("materialUseReferences").checked,
+    use_style_profile: $("materialUseStyle").checked,
+    use_inspirations: $("materialUseInspirations").checked,
+    use_reference_documents: $("materialUseDocuments").checked,
+    style_strength: $("materialStyleStrength").value,
+  };
+}
+async function openMaterialHub() {
+  if (!currentWorkId) { showToast("先选择一个作品", "err"); return; }
+  $("materialOverlay").classList.remove("hidden");
+  await loadMaterialHub();
+}
+function closeMaterialHub() { $("materialOverlay").classList.add("hidden"); }
+async function loadMaterialHub() {
+  if (!currentWorkId) return;
+  try {
+    materialData = await api(`/api/works/${currentWorkId}/materials`, { method: "GET" });
+    renderMaterialHub();
+  } catch (e) { showToast("资料中心加载失败：" + e.message, "err"); }
+}
+function renderMaterialProfile(styleProfile) {
+  const profile = styleProfile?.profile || {};
+  const labels = {
+    narrative_voice: "叙述声音", point_of_view: "叙事视角", pacing: "节奏", sentence_rhythm: "句式节律",
+    diction: "措辞", description_preferences: "描写偏好", dialogue_pattern: "对话习惯",
+    emotional_tone: "情绪底色", avoid: "避免事项",
+  };
+  const rows = Object.entries(labels).filter(([key]) => profile[key]).map(([key, label]) =>
+    `<div><b>${label}</b><p>${esc(profile[key])}</p></div>`);
+  const groups = [["character_voices", "人物语言指纹"], ["description_craft", "描写技法"], ["plot_devices", "桥段机制"]];
+  for (const [key, label] of groups) {
+    if (!Array.isArray(profile[key]) || !profile[key].length) continue;
+    rows.push(`<div><b>${label}</b><p>${profile[key].slice(0, 12).map(item => esc(Object.values(item || {}).filter(Boolean).join(" · "))).join("<br>")}</p></div>`);
+  }
+  return rows.length ? `${styleProfile?.source_label ? `<small>来源：${esc(styleProfile.source_label)}</small>` : ""}${rows.join("")}` : '<div class="empty">还没有语言指纹。可从当前正文提炼，也可在整本拆书完成后提炼。</div>';
+}
+function renderMaterialHub() {
+  if (!materialData) return;
+  const settings = materialData.settings || {};
+  $("materialUseMemory").checked = settings.use_story_memory !== false;
+  $("materialUseReferences").checked = settings.use_reference_projects !== false;
+  $("materialUseStyle").checked = settings.use_style_profile !== false;
+  $("materialUseInspirations").checked = settings.use_inspirations !== false;
+  $("materialUseDocuments").checked = settings.use_reference_documents !== false;
+  $("materialStyleStrength").value = settings.style_strength || "balanced";
+  $("materialStyleProfile").innerHTML = renderMaterialProfile(materialData.style_profile);
+  const mounted = new Set((materialData.mounts || []).map(item => item.reference_work_id));
+  const available = (materialData.available_works || []).filter(item => !mounted.has(item.id));
+  $("materialReferenceWork").innerHTML = available.length
+    ? available.map(item => `<option value="${item.id}">${esc(item.title)}</option>`).join("")
+    : '<option value="">没有可挂载的其他作品</option>';
+  $("materialReferenceList").innerHTML = (materialData.mounts || []).length ? materialData.mounts.map(item => {
+    const uses = [item.use_style && "文风", item.use_plot && "桥段", item.use_world && "世界观"].filter(Boolean).join("、") || "未启用参考方向";
+    return `<article class="material-list-item"><div><b>${esc(item.reference_title)}</b><small>${esc(uses)} · 只读参考，不作为本书事实</small></div><button class="ic danger-lite" onclick="removeMaterialReference(${item.id})">卸载</button></article>`;
+  }).join("") : '<div class="empty">尚未挂载参考工程。</div>';
+  $("materialDocumentList").innerHTML = (materialData.documents || []).length ? materialData.documents.map(item => `
+    <article class="material-list-item"><div><b>${esc(item.name)}</b><small>${Number(item.chars || 0).toLocaleString()} 字${item.tags ? ` · ${esc(item.tags)}` : ""}</small></div>
+      <label><input type="checkbox" ${item.enabled ? "checked" : ""} onchange="updateMaterialDocument(${item.id},{enabled:this.checked})">启用</label>
+      <label><input type="checkbox" ${item.pinned ? "checked" : ""} onchange="updateMaterialDocument(${item.id},{pinned:this.checked})">置顶</label>
+      <button class="ic danger-lite" onclick="deleteMaterialDocument(${item.id})">删除</button></article>`).join("") : '<div class="empty">还没有长期资料。本轮附件不会自动长期保存。</div>';
+}
+function saveMaterialSettings() {
+  clearTimeout(materialSettingsTimer);
+  $("materialSettingsMsg").textContent = "正在保存…";
+  materialSettingsTimer = setTimeout(async () => {
+    try {
+      const result = await api(`/api/works/${currentWorkId}/materials/settings`, { method: "PUT", body: materialSettingsValue() });
+      if (materialData) materialData.settings = result.settings;
+      $("materialSettingsMsg").textContent = "已保存";
+      setTimeout(() => { if ($("materialSettingsMsg").textContent === "已保存") $("materialSettingsMsg").textContent = ""; }, 1200);
+    } catch (e) { $("materialSettingsMsg").textContent = e.message; }
+  }, 220);
+}
+async function addMaterialReference() {
+  const reference_work_id = +$("materialReferenceWork").value;
+  if (!reference_work_id) { showToast("没有可挂载的参考工程", "err"); return; }
+  try {
+    await api(`/api/works/${currentWorkId}/materials/references`, { body: {
+      reference_work_id, enabled: true, use_style: $("materialRefStyle").checked,
+      use_plot: $("materialRefPlot").checked, use_world: $("materialRefWorld").checked,
+    }});
+    await loadMaterialHub(); showToast("参考工程已挂载", "ok");
+  } catch (e) { showToast(e.message, "err"); }
+}
+async function removeMaterialReference(mountId) {
+  try { await api(`/api/works/${currentWorkId}/materials/references/${mountId}`, { method: "DELETE" }); await loadMaterialHub(); }
+  catch (e) { showToast(e.message, "err"); }
+}
+function chooseMaterialDocument() { $("materialDocumentFile").click(); }
+async function addMaterialDocument(file) {
+  const input = $("materialDocumentFile");
+  if (!file || !currentWorkId) return;
+  try {
+    const response = await fetch("/api/agent/documents/extract", {
+      method: "POST", headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name), ...(token ? { Authorization: "Bearer " + token } : {}) }, body: file,
+    });
+    if (!response.ok) throw new Error(await responseError(response));
+    const document = await response.json();
+    await api(`/api/works/${currentWorkId}/materials/documents`, { body: { name: document.name, content: document.text, enabled: true, pinned: false } });
+    await loadMaterialHub(); showToast(`${document.name} 已存为长期资料`, "ok");
+  } catch (e) { showToast("长期资料保存失败：" + e.message, "err"); }
+  finally { if (input) input.value = ""; }
+}
+async function updateMaterialDocument(documentId, changes) {
+  try { await api(`/api/works/${currentWorkId}/materials/documents/${documentId}`, { method: "PUT", body: changes }); await loadMaterialHub(); }
+  catch (e) { showToast(e.message, "err"); }
+}
+async function deleteMaterialDocument(documentId) {
+  if (!await askCard({ title: "删除这份长期资料？", msg: "仅删除资料中心副本，不影响原文件。", okText: "删除", danger: true })) return;
+  try { await api(`/api/works/${currentWorkId}/materials/documents/${documentId}`, { method: "DELETE" }); await loadMaterialHub(); }
+  catch (e) { showToast(e.message, "err"); }
+}
+async function analyzeMaterialStyle() {
+  if (!currentWorkId) return;
+  const button = $("materialAnalyzeStyleBtn"); busy(button, true, "提炼中");
+  try {
+    const result = await api(`/api/works/${currentWorkId}/materials/style/analyze`, { body: {} });
+    if (materialData) materialData.style_profile = result.style_profile;
+    renderMaterialHub(); showToast("本书语言指纹已刷新", "ok");
+  } catch (e) { showToast(e.message, "err"); }
+  finally { busy(button, false, "从当前正文刷新"); }
+}
+async function extractDisassemblyMaterials() {
+  if (!currentDisassemblyJob) { showToast("先选择一个拆书任务", "err"); return; }
+  const button = $("disassemblyExtractBtn"); busy(button, true, "提炼中");
+  try {
+    const result = await api(`/api/disassembly/jobs/${currentDisassemblyJob.id}/materials/extract`, { body: { create_inspirations: true } });
+    showToast(`整本资料已提炼：语言指纹已保存，${(result.inspiration_ids || []).length} 个桥段已加入灵感库`, "ok");
+    if (currentDisassemblyJob.target_work_id === currentWorkId && !$("materialOverlay").classList.contains("hidden")) await loadMaterialHub();
+  } catch (e) { showToast(e.message, "err"); }
+  finally { busy(button, false, "提炼整本资料"); }
+}
+
 /* ---------- AI 写作工具（校验/摘要，不污染正文） ---------- */
 
 function openAITools() { $("aiResult").textContent = ""; $("aiOverlay").classList.remove("hidden"); }
@@ -2684,6 +2837,10 @@ let characterStateData = null;
 let entityImageEntityId = null;
 let semanticPopTimer = null;
 const entityImageObjectUrls = new Map();
+const imageAssetObjectUrls = new Map();
+let entityImageHistory = [];
+let characterImageLibraryItems = [];
+let characterImageFilter = "all";
 const characterStateFields = [
   ["location", "所在地点", "characterStateLocation"],
   ["goal", "当前目标", "characterStateGoal"],
@@ -2774,12 +2931,14 @@ function entityInitial(entity) { return Array.from((entity?.name || "?").trim())
 function clearEntityImageCache() {
   entityImageObjectUrls.forEach(url => URL.revokeObjectURL(url));
   entityImageObjectUrls.clear();
+  imageAssetObjectUrls.forEach(url => URL.revokeObjectURL(url));
+  imageAssetObjectUrls.clear();
 }
 function entityPortraitHtml(entity, large = false) {
-  return `<div class="character-portrait${large ? " character-portrait-lg" : ""}">
+  return `<button type="button" class="character-portrait${large ? " character-portrait-lg" : ""}" onclick="openEntityImage(${entity.id})" title="打开 ${esc(entity.name)} 的形象与图库">
     <span>${esc(entityInitial(entity))}</span>
     ${entity?.has_image ? `<img class="hidden" data-entity-image="${entity.id}" alt="${esc(entity.name)}的角色图">` : ""}
-  </div>`;
+  </button>`;
 }
 async function entityImageUrl(eid, force = false) {
   if (force && entityImageObjectUrls.has(eid)) {
@@ -2811,14 +2970,67 @@ async function hydrateEntityImages(root = document, force = false) {
   }));
 }
 function defaultCharacterImagePrompt(entity) {
-  const parts = ["小说角色设定图，单人角色肖像，主体清晰，构图完整，统一美术设定，无文字、无水印。", `角色名：${entity.name}。`];
-  if (entity.summary) parts.push(`人物摘要：${entity.summary}。`);
-  if (entity.detail) parts.push(`外貌、性格与背景设定：${entity.detail}。`);
+  const parts = [
+    "Create a polished full-body character concept illustration for a novel.",
+    "Show one clearly identifiable character in a vertical 3:4 composition, complete silhouette and visible feet, natural posture, coherent costume design, intentional lighting, harmonious color palette, and an uncluttered atmospheric background.",
+    "Preserve the canonical details below and express personality through posture, gaze, costume, props, lighting and composition. Do not invent conflicting traits.",
+    "No text, letters, captions, logos, signatures, watermarks, split panels, duplicate people, extra limbs, malformed hands, or cropped feet.",
+    `Character name for identity reference only (do not render it as text): ${entity.name}.`,
+  ];
+  if (entity.summary) parts.push(`Canonical character summary (source language): ${entity.summary}`);
+  if (entity.detail) parts.push(`Canonical appearance, personality and background details (source language): ${entity.detail}`);
   const state = entity.current_state || characterStateData?.current_state || {};
   const live = [["所在地点", state.location], ["情绪", state.emotion], ["身体状态", state.physical], ["能力与物品", state.assets]]
     .filter(([, value]) => value).map(([label, value]) => `${label}：${value}`).join("；");
-  if (live) parts.push(`当前剧情状态：${live}。`);
+  if (live) parts.push(`Current story-state cues (source language; use only visually relevant details): ${live}`);
   return parts.join("\n");
+}
+
+async function imageAssetUrl(imageId, force = false) {
+  if (force && imageAssetObjectUrls.has(imageId)) {
+    URL.revokeObjectURL(imageAssetObjectUrls.get(imageId));
+    imageAssetObjectUrls.delete(imageId);
+  }
+  if (imageAssetObjectUrls.has(imageId)) return imageAssetObjectUrls.get(imageId);
+  const response = await fetch(`/api/entity-images/${imageId}/content`, {
+    headers: token ? { Authorization: "Bearer " + token } : {}, cache: "no-store",
+  });
+  if (!response.ok) return "";
+  const url = URL.createObjectURL(await response.blob());
+  imageAssetObjectUrls.set(imageId, url);
+  return url;
+}
+async function hydrateImageAssets(root = document) {
+  const nodes = [...root.querySelectorAll("img[data-image-asset]")];
+  await Promise.all(nodes.map(async img => {
+    const url = await imageAssetUrl(+img.dataset.imageAsset).catch(() => "");
+    if (url) { img.src = url; img.classList.remove("hidden"); }
+  }));
+}
+function imageAssetCard(item) {
+  const time = item.created_at ? new Date(item.created_at * 1000).toLocaleString() : "";
+  return `<article class="image-asset-card${item.selected ? " selected" : ""}" onclick="openImageAssetLightbox(${item.id})" title="${esc(item.prompt || "点击查看大图")}">
+    <div class="image-asset-thumb"><img class="hidden" data-image-asset="${item.id}" alt="${esc(item.entity_name || "角色")}的形象"><span>${svg("image")}</span>${item.selected ? '<b class="image-selected-badge">当前主图</b>' : ""}</div>
+    <div class="image-asset-meta"><b>${esc(item.entity_name || "角色形象")}</b><small>${esc([item.size, item.model, time].filter(Boolean).join(" · "))}</small></div>
+    <div class="image-asset-actions">
+      ${item.selected ? '<span>正在使用</span>' : `<button onclick="event.stopPropagation();selectCharacterImage(${item.id})">设为主图</button>`}
+      <button class="danger-lite" onclick="event.stopPropagation();deleteCharacterImageAsset(${item.id})">删除</button>
+    </div>
+  </article>`;
+}
+function renderEntityImageHistory() {
+  const host = $("entityImageHistory");
+  if (!host) return;
+  $("entityImageHistoryCount").textContent = `${entityImageHistory.length} 张`;
+  host.innerHTML = entityImageHistory.length ? entityImageHistory.map(imageAssetCard).join("") : '<div class="empty">生成后的图片会保存在这里，不会覆盖旧图。</div>';
+  hydrateImageAssets(host);
+}
+async function loadEntityImageHistory() {
+  if (!entityImageEntityId) { entityImageHistory = []; renderEntityImageHistory(); return []; }
+  const data = await api(`/api/entities/${entityImageEntityId}/images`, { method: "GET" });
+  entityImageHistory = data.items || [];
+  renderEntityImageHistory();
+  return entityImageHistory;
 }
 function renderEntityImagePreview(entity) {
   const host = $("entityImagePreview");
@@ -2839,12 +3051,29 @@ async function openEntityImage(eid) {
   $("entityImageMsg").textContent = "";
   try {
     const settings = await api("/api/settings", { method: "GET" });
-    $("entityImageSize").value = settings.image_size || "1024x1024";
-  } catch (e) { $("entityImageSize").value = "1024x1024"; }
+    const wanted = settings.image_size || "1024x1536";
+    $("entityImageSize").value = [...$("entityImageSize").options].some(option => option.value === wanted) ? wanted : "1024x1536";
+  } catch (e) { $("entityImageSize").value = "1024x1536"; }
   renderEntityImagePreview(entity);
   $("entityImageOverlay").classList.remove("hidden");
+  await loadEntityImageHistory().catch(e => { $("entityImageMsg").textContent = "图库加载失败：" + e.message; });
 }
 function closeEntityImage() { $("entityImageOverlay").classList.add("hidden"); entityImageEntityId = null; }
+async function polishEntityImagePrompt() {
+  if (!entityImageEntityId) return;
+  const button = $("entityImagePolishBtn");
+  $("entityImageMsg").textContent = "";
+  busy(button, true, "正在整理");
+  try {
+    const result = await api(`/api/entities/${entityImageEntityId}/image/prompt`, { body: {
+      prompt: $("entityImagePrompt").value.trim(), style: $("entityImageStyle").value.trim(), chapter_id: currentChapterId,
+    }});
+    $("entityImagePrompt").value = result.prompt || $("entityImagePrompt").value;
+    $("entityImageMsg").textContent = "已结合人物卡整理成英文生图提示词，你仍可继续修改";
+    showToast("角色提示词已整理", "ok");
+  } catch (e) { $("entityImageMsg").textContent = e.message; }
+  finally { busy(button, false, "AI 整理为英文生图词"); applyIcons(); }
+}
 async function generateEntityImage() {
   if (!entityImageEntityId) return;
   const button = $("entityImageGenerateBtn");
@@ -2860,10 +3089,11 @@ async function generateEntityImage() {
     if (characterStateData?.entity?.id === entityImageEntityId) Object.assign(characterStateData.entity, result);
     await entityImageUrl(entityImageEntityId, true);
     renderEntityImagePreview(entity || characterStateData?.entity);
+    await loadEntityImageHistory();
     if (!$("wikiOverlay").classList.contains("hidden")) renderWikiList();
     if (!$("characterStateOverlay").classList.contains("hidden") && characterStateData) renderCharacterState(characterStateData);
-    $("entityImageMsg").textContent = "角色图已生成并保存";
-    showToast("角色图已生成", "ok");
+    $("entityImageMsg").textContent = "角色图已生成，旧图仍保留在下方历史图库";
+    showToast("角色图已生成并加入图库", "ok");
   } catch (e) { $("entityImageMsg").textContent = e.message; }
   finally { busy(button, false, "生成角色图"); }
 }
@@ -2873,14 +3103,108 @@ async function deleteEntityImage() {
     await api(`/api/entities/${entityImageEntityId}/image`, { method: "DELETE" });
     if (entityImageObjectUrls.has(entityImageEntityId)) URL.revokeObjectURL(entityImageObjectUrls.get(entityImageEntityId));
     entityImageObjectUrls.delete(entityImageEntityId);
+    const items = await loadEntityImageHistory();
+    const selected = items.find(item => item.selected);
+    if (selected?.prompt) $("entityImagePrompt").value = selected.prompt;
     const entity = entitiesCache.find(item => item.id === entityImageEntityId);
-    if (entity) entity.has_image = false;
-    if (characterStateData?.entity?.id === entityImageEntityId) characterStateData.entity.has_image = false;
+    if (entity) entity.has_image = items.length > 0;
+    if (characterStateData?.entity?.id === entityImageEntityId) characterStateData.entity.has_image = items.length > 0;
     renderEntityImagePreview(entity || characterStateData?.entity);
     if (!$("wikiOverlay").classList.contains("hidden")) renderWikiList();
     if (!$("characterStateOverlay").classList.contains("hidden") && characterStateData) renderCharacterState(characterStateData);
-    showToast("角色图已删除", "ok");
+    showToast(items.length ? "当前图已删除，已自动切换到上一张" : "角色图已删除", "ok");
   } catch (e) { $("entityImageMsg").textContent = e.message; }
+}
+
+async function openCurrentEntityImageLightbox() {
+  if (!entityImageEntityId) return;
+  if (!entityImageHistory.length) await loadEntityImageHistory().catch(() => {});
+  const item = entityImageHistory.find(row => row.selected) || entityImageHistory[0];
+  if (item) openImageAssetLightbox(item.id);
+}
+async function openImageAssetLightbox(imageId) {
+  const item = [...entityImageHistory, ...characterImageLibraryItems].find(row => row.id === imageId);
+  if (!item) return;
+  const url = await imageAssetUrl(imageId).catch(() => "");
+  if (!url) { showToast("图片载入失败", "err"); return; }
+  $("imageLightboxImg").src = url;
+  $("imageLightboxTitle").textContent = `${item.entity_name || "角色形象"}${item.selected ? " · 当前主图" : ""}`;
+  $("imageLightboxPrompt").textContent = item.prompt || "没有保存提示词";
+  $("imageLightbox").classList.remove("hidden");
+}
+function closeImageLightbox() { $("imageLightbox").classList.add("hidden"); }
+async function openCharacterImageLibrary(entityId = null) {
+  if (!currentWorkId) { showToast("先选择作品", "err"); return; }
+  characterImageFilter = entityId ? String(entityId) : "all";
+  $("characterImageLibraryOverlay").classList.remove("hidden");
+  await loadCharacterImageLibrary();
+}
+function closeCharacterImageLibrary() { $("characterImageLibraryOverlay").classList.add("hidden"); }
+function renderCharacterImageLibrary() {
+  const counts = new Map();
+  characterImageLibraryItems.forEach(item => counts.set(item.entity_id, (counts.get(item.entity_id) || 0) + 1));
+  const characters = [...new Map(characterImageLibraryItems.map(item => [item.entity_id, item.entity_name || "未命名角色"])).entries()];
+  $("characterImageFilters").innerHTML = characters.map(([id, name]) =>
+    `<button class="${characterImageFilter === String(id) ? "active" : ""}" onclick="setCharacterImageFilter('${id}')">${esc(name)} <small>${counts.get(id)}</small></button>`).join("");
+  const allButton = document.querySelector('[data-image-filter="all"]');
+  if (allButton) allButton.classList.toggle("active", characterImageFilter === "all");
+  const visible = characterImageFilter === "all" ? characterImageLibraryItems : characterImageLibraryItems.filter(item => String(item.entity_id) === characterImageFilter);
+  const host = $("characterImageLibraryGrid");
+  host.innerHTML = visible.length ? visible.map(imageAssetCard).join("") : '<div class="empty">这里还没有角色图片。先从人物档案生成一张吧。</div>';
+  hydrateImageAssets(host);
+}
+async function loadCharacterImageLibrary() {
+  if (!currentWorkId) return;
+  try {
+    const data = await api(`/api/works/${currentWorkId}/images?category=characters`, { method: "GET" });
+    characterImageLibraryItems = data.items || [];
+    renderCharacterImageLibrary();
+  } catch (e) { $("characterImageLibraryGrid").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+function setCharacterImageFilter(value) { characterImageFilter = String(value || "all"); renderCharacterImageLibrary(); }
+async function selectCharacterImage(imageId) {
+  try {
+    const result = await api(`/api/entity-images/${imageId}/select`, { body: {} });
+    const eid = result.entity_id;
+    if (entityImageObjectUrls.has(eid)) URL.revokeObjectURL(entityImageObjectUrls.get(eid));
+    entityImageObjectUrls.delete(eid);
+    const entity = entitiesCache.find(item => item.id === eid);
+    if (entity) entity.has_image = true;
+    if (characterStateData?.entity?.id === eid) characterStateData.entity.has_image = true;
+    if (entityImageEntityId === eid) {
+      await loadEntityImageHistory();
+      if (result.image?.prompt) $("entityImagePrompt").value = result.image.prompt;
+      renderEntityImagePreview(entity || characterStateData?.entity);
+    }
+    if (!$("characterImageLibraryOverlay").classList.contains("hidden")) await loadCharacterImageLibrary();
+    if (!$("wikiOverlay").classList.contains("hidden")) renderWikiList();
+    if (!$("characterStateOverlay").classList.contains("hidden") && characterStateData) renderCharacterState(characterStateData);
+    showToast("已设为角色主形象", "ok");
+  } catch (e) { showToast(e.message, "err"); }
+}
+async function deleteCharacterImageAsset(imageId) {
+  if (!await askCard({ title: "从角色图库删除这张图？", msg: "删除后无法恢复；人物设定不会受影响。", okText: "删除", danger: true })) return;
+  try {
+    const result = await api(`/api/entity-images/${imageId}`, { method: "DELETE" });
+    if (imageAssetObjectUrls.has(imageId)) URL.revokeObjectURL(imageAssetObjectUrls.get(imageId));
+    imageAssetObjectUrls.delete(imageId);
+    if (entityImageObjectUrls.has(result.entity_id)) URL.revokeObjectURL(entityImageObjectUrls.get(result.entity_id));
+    entityImageObjectUrls.delete(result.entity_id);
+    const entity = entitiesCache.find(item => item.id === result.entity_id);
+    if (entity) entity.has_image = !!result.has_image;
+    if (characterStateData?.entity?.id === result.entity_id) characterStateData.entity.has_image = !!result.has_image;
+    if (entityImageEntityId === result.entity_id) {
+      await loadEntityImageHistory();
+      const selected = entityImageHistory.find(item => item.selected);
+      if (selected?.prompt) $("entityImagePrompt").value = selected.prompt;
+      renderEntityImagePreview(entity || characterStateData?.entity);
+    }
+    if (!$("characterImageLibraryOverlay").classList.contains("hidden")) await loadCharacterImageLibrary();
+    if (!$("wikiOverlay").classList.contains("hidden")) renderWikiList();
+    if (!$("characterStateOverlay").classList.contains("hidden") && characterStateData) renderCharacterState(characterStateData);
+    closeImageLightbox();
+    showToast("图片已从图库删除", "ok");
+  } catch (e) { showToast(e.message, "err"); }
 }
 
 function entityChapterQuery() { return currentChapterId ? `?chapter_id=${currentChapterId}` : ""; }
@@ -3041,6 +3365,8 @@ function renderCharacterState(data) {
     <div><b>基础设定</b>${entity.summary ? ` · ${esc(entity.summary)}` : ""}</div>
     ${entity.detail ? `<div>${esc(entity.detail)}</div>` : ""}`;
   $("characterStatePortrait").innerHTML = `<span>${esc(entityInitial(entity))}</span>${entity.has_image ? `<img class="hidden" data-entity-image="${entity.id}" alt="${esc(entity.name)}的角色图">` : ""}`;
+  $("characterStatePortrait").onclick = () => openEntityImage(entity.id);
+  $("characterStatePortrait").title = "打开角色形象与历史图库";
   const version = data.state_version;
   $("characterStateSource").textContent = version
     ? `${characterStateSource(version.source)} · 生效于${characterStateLabel({ ord: version.chapter_ord, title: version.chapter_title })}`

@@ -640,6 +640,127 @@ def _migration_book_disassembly(conn):
     )
 
 
+def _migration_unified_materials(conn):
+    """Persistent reference sources shared by writing, disassembly and Agent context."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS work_material_settings (
+            work_id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            use_story_memory INTEGER NOT NULL DEFAULT 1,
+            use_reference_projects INTEGER NOT NULL DEFAULT 1,
+            use_style_profile INTEGER NOT NULL DEFAULT 1,
+            use_inspirations INTEGER NOT NULL DEFAULT 1,
+            use_reference_documents INTEGER NOT NULL DEFAULT 1,
+            style_strength TEXT NOT NULL DEFAULT 'balanced',
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE TABLE IF NOT EXISTS work_reference_mounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            work_id INTEGER NOT NULL,
+            reference_work_id INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            use_style INTEGER NOT NULL DEFAULT 1,
+            use_plot INTEGER NOT NULL DEFAULT 1,
+            use_world INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(work_id, reference_work_id),
+            FOREIGN KEY(work_id) REFERENCES works(id),
+            FOREIGN KEY(reference_work_id) REFERENCES works(id)
+        );
+        CREATE TABLE IF NOT EXISTS work_style_profiles (
+            work_id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            source_kind TEXT NOT NULL DEFAULT 'manual',
+            source_label TEXT DEFAULT '',
+            source_job_id INTEGER,
+            profile_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE TABLE IF NOT EXISTS work_reference_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            work_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            tags TEXT DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(work_id, content_hash),
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE TABLE IF NOT EXISTS disassembly_material_extractions (
+            job_id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            work_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            inspiration_ids_json TEXT NOT NULL DEFAULT '[]',
+            error TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES book_disassembly_jobs(id),
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_material_settings_user
+            ON work_material_settings(user_id, work_id);
+        CREATE INDEX IF NOT EXISTS idx_reference_mounts_work
+            ON work_reference_mounts(work_id, enabled, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_reference_mounts_source
+            ON work_reference_mounts(reference_work_id, enabled);
+        CREATE INDEX IF NOT EXISTS idx_reference_documents_work
+            ON work_reference_documents(work_id, enabled, pinned DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_material_extractions_user
+            ON disassembly_material_extractions(user_id, updated_at DESC);
+        """
+    )
+
+
+def _migration_character_image_library(conn):
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS entity_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            work_id INTEGER NOT NULL,
+            entity_id INTEGER NOT NULL,
+            category TEXT NOT NULL DEFAULT 'characters',
+            image_path TEXT NOT NULL,
+            prompt TEXT NOT NULL DEFAULT '',
+            style TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            size TEXT NOT NULL DEFAULT '',
+            selected INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(image_path),
+            FOREIGN KEY(work_id) REFERENCES works(id),
+            FOREIGN KEY(entity_id) REFERENCES entities(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_entity_images_entity
+            ON entity_images(entity_id, selected DESC, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_entity_images_work
+            ON entity_images(work_id, category, created_at DESC);
+        """
+    )
+    now = time.time()
+    conn.execute(
+        "INSERT OR IGNORE INTO entity_images(user_id,work_id,entity_id,category,image_path,prompt,selected,created_at,updated_at) "
+        "SELECT w.user_id,e.work_id,e.id,'characters',e.image_path,e.image_prompt,1,"
+        "COALESCE(e.image_updated_at,?),COALESCE(e.image_updated_at,?) FROM entities e JOIN works w ON w.id=e.work_id "
+        "WHERE e.image_path<>''",
+        (now, now),
+    )
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
@@ -650,6 +771,8 @@ _MIGRATIONS = (
     (7, "character_images", _migration_character_images),
     (8, "story_sandboxes", _migration_story_sandboxes),
     (9, "book_disassembly", _migration_book_disassembly),
+    (10, "unified_reference_materials", _migration_unified_materials),
+    (11, "character_image_library", _migration_character_image_library),
 )
 
 
@@ -887,6 +1010,81 @@ def init_db():
                 error TEXT DEFAULT '',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS work_material_settings (
+                work_id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                use_story_memory INTEGER NOT NULL DEFAULT 1,
+                use_reference_projects INTEGER NOT NULL DEFAULT 1,
+                use_style_profile INTEGER NOT NULL DEFAULT 1,
+                use_inspirations INTEGER NOT NULL DEFAULT 1,
+                use_reference_documents INTEGER NOT NULL DEFAULT 1,
+                style_strength TEXT NOT NULL DEFAULT 'balanced',
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS work_reference_mounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                work_id INTEGER NOT NULL,
+                reference_work_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                use_style INTEGER NOT NULL DEFAULT 1,
+                use_plot INTEGER NOT NULL DEFAULT 1,
+                use_world INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(work_id, reference_work_id)
+            );
+            CREATE TABLE IF NOT EXISTS work_style_profiles (
+                work_id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT 'manual',
+                source_label TEXT DEFAULT '',
+                source_job_id INTEGER,
+                profile_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS work_reference_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                work_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                tags TEXT DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(work_id, content_hash)
+            );
+            CREATE TABLE IF NOT EXISTS disassembly_material_extractions (
+                job_id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                work_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                inspiration_ids_json TEXT NOT NULL DEFAULT '[]',
+                error TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entity_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                work_id INTEGER NOT NULL,
+                entity_id INTEGER NOT NULL,
+                category TEXT NOT NULL DEFAULT 'characters',
+                image_path TEXT NOT NULL,
+                prompt TEXT NOT NULL DEFAULT '',
+                style TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                size TEXT NOT NULL DEFAULT '',
+                selected INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(image_path)
             );
             CREATE TABLE IF NOT EXISTS chapter_consistency_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1404,9 +1602,15 @@ def admin_delete_user(user_id):
         conn.execute("DELETE FROM plot_state_proposals WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entity_relations WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM story_sandboxes WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM disassembly_material_extractions WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM book_disassembly_chapters WHERE job_id IN (SELECT id FROM book_disassembly_jobs WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM book_disassembly_jobs WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM work_reference_documents WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM work_style_profiles WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM work_reference_mounts WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM work_material_settings WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM work_revisions WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM entity_images WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skills WHERE user_id=?", (user_id,))
@@ -1646,9 +1850,15 @@ def delete_work(wid, user_id):
         conn.execute("DELETE FROM plot_state_proposals WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entity_relations WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM story_sandboxes WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM disassembly_material_extractions WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM book_disassembly_chapters WHERE job_id IN (SELECT id FROM book_disassembly_jobs WHERE target_work_id=?)", (wid,))
         conn.execute("DELETE FROM book_disassembly_jobs WHERE target_work_id=?", (wid,))
+        conn.execute("DELETE FROM work_reference_documents WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM work_style_profiles WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM work_reference_mounts WHERE work_id=? OR reference_work_id=?", (wid, wid))
+        conn.execute("DELETE FROM work_material_settings WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM work_revisions WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM entity_images WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE work_id=?)", (wid,))
         conn.execute("DELETE FROM agent_skills WHERE work_id=?", (wid,))
@@ -2983,17 +3193,37 @@ def get_entity_image_record(eid, user_id):
         return dict(row) if row else None
 
 
-def save_entity_image(eid, user_id, image_path, prompt):
+def _entity_image_payload(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["selected"] = bool(item.get("selected"))
+    item.pop("image_path", None)
+    return item
+
+
+def save_entity_image(eid, user_id, image_path, prompt, style="", model="", size=""):
     now = time.time()
     with get_conn() as conn:
         if not _entity_owned(conn, eid, user_id):
             return None
-        old = conn.execute("SELECT image_path FROM entities WHERE id=?", (eid,)).fetchone()
+        entity = conn.execute("SELECT work_id FROM entities WHERE id=?", (eid,)).fetchone()
+        conn.execute("UPDATE entity_images SET selected=0,updated_at=? WHERE entity_id=?", (now, eid))
+        cur = conn.execute(
+            "INSERT INTO entity_images(user_id,work_id,entity_id,category,image_path,prompt,style,model,size,"
+            "selected,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (user_id, entity["work_id"], eid, "characters", image_path or "", (prompt or "").strip()[:8000],
+             (style or "").strip()[:1000], (model or "").strip()[:200], (size or "").strip()[:32], 1, now, now),
+        )
         conn.execute(
             "UPDATE entities SET image_path=?, image_prompt=?, image_updated_at=?, updated_at=? WHERE id=?",
             (image_path or "", (prompt or "").strip()[:8000], now, now, eid),
         )
-        return {"old_path": old["image_path"] if old else "", "image_updated_at": now}
+        row = conn.execute(
+            "SELECT i.*,e.name AS entity_name FROM entity_images i JOIN entities e ON e.id=i.entity_id WHERE i.id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return {"image": _entity_image_payload(row), "image_updated_at": now}
 
 
 def clear_entity_image(eid, user_id):
@@ -3002,20 +3232,137 @@ def clear_entity_image(eid, user_id):
         if not _entity_owned(conn, eid, user_id):
             return None
         old = conn.execute("SELECT image_path FROM entities WHERE id=?", (eid,)).fetchone()
-        conn.execute(
-            "UPDATE entities SET image_path='', image_updated_at=NULL, updated_at=? WHERE id=?",
-            (now, eid),
-        )
+        conn.execute("DELETE FROM entity_images WHERE entity_id=? AND image_path=?", (eid, old["image_path"] if old else ""))
+        fallback = conn.execute(
+            "SELECT id,image_path,prompt FROM entity_images WHERE entity_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+            (eid,),
+        ).fetchone()
+        if fallback:
+            conn.execute("UPDATE entity_images SET selected=1,updated_at=? WHERE id=?", (now, fallback["id"]))
+            conn.execute(
+                "UPDATE entities SET image_path=?,image_prompt=?,image_updated_at=?,updated_at=? WHERE id=?",
+                (fallback["image_path"], fallback["prompt"], now, now, eid),
+            )
+        else:
+            conn.execute(
+                "UPDATE entities SET image_path='', image_updated_at=NULL, updated_at=? WHERE id=?",
+                (now, eid),
+            )
         return old["image_path"] if old else ""
+
+
+def list_entity_images(eid, user_id):
+    with get_conn() as conn:
+        if not _entity_owned(conn, eid, user_id):
+            return None
+        rows = conn.execute(
+            "SELECT i.*,e.name AS entity_name FROM entity_images i JOIN entities e ON e.id=i.entity_id "
+            "WHERE i.entity_id=? AND i.user_id=? ORDER BY i.selected DESC,i.created_at DESC,i.id DESC",
+            (eid, user_id),
+        ).fetchall()
+        return [_entity_image_payload(row) for row in rows]
+
+
+def list_entity_image_paths(eid, user_id):
+    with get_conn() as conn:
+        if not _entity_owned(conn, eid, user_id):
+            return None
+        return [row["image_path"] for row in conn.execute(
+            "SELECT image_path FROM entity_images WHERE entity_id=? AND user_id=? AND image_path<>''",
+            (eid, user_id),
+        )]
+
+
+def list_work_entity_images(wid, user_id, category="characters"):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        params = [wid, user_id]
+        where = "WHERE i.work_id=? AND i.user_id=?"
+        if category:
+            where += " AND i.category=?"
+            params.append(category)
+        rows = conn.execute(
+            "SELECT i.*,e.name AS entity_name FROM entity_images i JOIN entities e ON e.id=i.entity_id "
+            + where + " ORDER BY i.created_at DESC,i.id DESC LIMIT 300", params,
+        ).fetchall()
+        return [_entity_image_payload(row) for row in rows]
+
+
+def get_entity_image_asset(image_id, user_id, include_path=False):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT i.*,e.name AS entity_name FROM entity_images i JOIN entities e ON e.id=i.entity_id "
+            "JOIN works w ON w.id=i.work_id WHERE i.id=? AND i.user_id=? AND w.user_id=?",
+            (image_id, user_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row) if include_path else _entity_image_payload(row)
+
+
+def select_entity_image(image_id, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT i.* FROM entity_images i JOIN works w ON w.id=i.work_id "
+            "WHERE i.id=? AND i.user_id=? AND w.user_id=?", (image_id, user_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("UPDATE entity_images SET selected=0,updated_at=? WHERE entity_id=?", (now, row["entity_id"]))
+        conn.execute("UPDATE entity_images SET selected=1,updated_at=? WHERE id=?", (now, image_id))
+        conn.execute(
+            "UPDATE entities SET image_path=?,image_prompt=?,image_updated_at=?,updated_at=? WHERE id=?",
+            (row["image_path"], row["prompt"], now, now, row["entity_id"]),
+        )
+        result = conn.execute(
+            "SELECT i.*,e.name AS entity_name FROM entity_images i JOIN entities e ON e.id=i.entity_id WHERE i.id=?",
+            (image_id,),
+        ).fetchone()
+        return _entity_image_payload(result)
+
+
+def delete_entity_image_asset(image_id, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT i.* FROM entity_images i JOIN works w ON w.id=i.work_id "
+            "WHERE i.id=? AND i.user_id=? AND w.user_id=?", (image_id, user_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("DELETE FROM entity_images WHERE id=?", (image_id,))
+        fallback = None
+        if row["selected"]:
+            fallback = conn.execute(
+                "SELECT * FROM entity_images WHERE entity_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+                (row["entity_id"],),
+            ).fetchone()
+            if fallback:
+                conn.execute("UPDATE entity_images SET selected=1,updated_at=? WHERE id=?", (now, fallback["id"]))
+                conn.execute(
+                    "UPDATE entities SET image_path=?,image_prompt=?,image_updated_at=?,updated_at=? WHERE id=?",
+                    (fallback["image_path"], fallback["prompt"], now, now, row["entity_id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE entities SET image_path='',image_updated_at=NULL,updated_at=? WHERE id=?",
+                    (now, row["entity_id"]),
+                )
+        return {"image_path": row["image_path"], "entity_id": row["entity_id"],
+                "selected_image_id": fallback["id"] if fallback else None,
+                "has_image": bool(fallback) if row["selected"] else True}
 
 
 def list_work_entity_image_paths(wid, user_id):
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
             return None
-        return [row["image_path"] for row in conn.execute(
-            "SELECT image_path FROM entities WHERE work_id=? AND image_path<>''", (wid,),
-        )]
+        return list(dict.fromkeys(row["image_path"] for row in conn.execute(
+            "SELECT image_path FROM entity_images WHERE work_id=? AND image_path<>'' UNION ALL "
+            "SELECT image_path FROM entities WHERE work_id=? AND image_path<>''", (wid, wid),
+        )))
 
 
 def delete_entity(eid, user_id):
@@ -3028,6 +3375,7 @@ def delete_entity(eid, user_id):
         conn.execute("DELETE FROM entity_state_versions WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entity_state_proposals WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entity_relations WHERE from_entity_id=? OR to_entity_id=?", (eid, eid))
+        conn.execute("DELETE FROM entity_images WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM story_memory_entity_refs WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entities WHERE id=?", (eid,))
         for memory_id in memory_ids:

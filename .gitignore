@@ -10,6 +10,9 @@ data/
 .env
 .smoke_tmp/
 
+# 本地参考工程分析副本（体积大，不随应用发布）
+.analysis/
+
 # 系统
 .DS_Store
 Thumbs.db

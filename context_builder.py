@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Iterable
 
 import db
+import materials
 
 
 TASK_LABELS = {
@@ -170,12 +171,15 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
         items.append(_item("relationships", "人物关系", _clip(relationships, 5000), "保持人物互动连续", 2))
 
     recall_query = "\n".join((instruction, selected_text, chapter_tail[-1200:]))
-    memories = db.search_story_memories(
-        work_id, user_id, recall_query, entity_ids=entity_ids or None,
-        before_chapter_id=chapter_id, limit=12,
-    ) or []
-    if not memories and chapter_id:
-        memories = db.list_recent_story_memories(work_id, user_id, before_chapter_id=chapter_id, limit=6) or []
+    material_settings = materials.get_settings(user_id, work_id) or materials.DEFAULT_SETTINGS
+    memories = []
+    if material_settings.get("use_story_memory", True):
+        memories = db.search_story_memories(
+            work_id, user_id, recall_query, entity_ids=entity_ids or None,
+            before_chapter_id=chapter_id, limit=12,
+        ) or []
+        if not memories and chapter_id:
+            memories = db.list_recent_story_memories(work_id, user_id, before_chapter_id=chapter_id, limit=6) or []
     if memories:
         items.append(_item(
             "memory", "召回的故事记忆", _render_memories(memories),
@@ -185,6 +189,18 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
     summaries = db.list_recent_chapter_summaries(work_id, user_id, before_chapter_id=chapter_id, limit=4) or []
     if summaries:
         items.append(_item("chapter_summary", "最近章节摘要", _render_summaries(summaries), "补足近期剧情衔接", 3))
+
+    # Reference projects, style fingerprints, reusable documents and inspirations
+    # are optional aids. Canonical work notes and confirmed story facts above keep
+    # higher priority and are never overwritten by these sources.
+    for material in materials.context_items(user_id, work_id, recall_query):
+        items.append(_item(
+            material.get("type") or "reference",
+            material.get("title") or "创作参考资料",
+            material.get("content") or "",
+            material.get("reason") or "作者启用的参考资料",
+            int(material.get("priority", 3)),
+        ))
 
     skills = db.get_agent_skills_for_turn(user_id, work_id, skill_ids or []) if skill_ids else []
     if skills:

@@ -18,7 +18,7 @@ os.environ["AGENT_CONTEXT_TRIGGER_RATIO"] = "0.90"
 os.environ["AGENT_MAX_OUTPUT_TOKENS"] = "8192"
 
 from fastapi.testclient import TestClient
-import main, db, llm, config, context_builder, image_generation, inspiration
+import main, db, llm, config, context_builder, image_generation, inspiration, materials
 
 db.init_db()
 c = TestClient(main.app)
@@ -360,13 +360,40 @@ async def _fake_generate_image(base_url, api_key, model, prompt, size):
     _image_call.update(base_url=base_url, api_key=api_key, model=model, prompt=prompt, size=size)
     return b"\x89PNG\r\n\x1a\nwritehtml-character-image", "image/png"
 image_generation.generate_image = _fake_generate_image
+_orig_image_prompt_chat = llm.chat
+llm.chat = lambda *args, **kwargs: "A cinematic full-body portrait of Lin Wan, calm gaze, black hair, vertical 3:4, soft side lighting, no text, no watermark."
+_polished_prompt = c.post(f"/api/entities/{ent['id']}/image/prompt", json={
+    "prompt": "林晚，黑色长发，冷静神情", "style": "电影感", "chapter_id": cid,
+}, headers=H(tokA))
+ok(_polished_prompt.status_code == 200 and "full-body" in _polished_prompt.json()["prompt"],
+   "角色图提示词可结合人物卡整理成英文画风与构图指令")
+llm.chat = _orig_image_prompt_chat
 _generated_image = c.post(f"/api/entities/{ent['id']}/image/generate", json={
     "prompt": "林晚，黑色长发，冷静神情", "style": "电影感", "size": "1024x1536", "chapter_id": cid,
 }, headers=H(tokA))
 ok(_generated_image.status_code == 200 and _generated_image.json()["has_image"], "人物角色图可生成并保存")
+_first_image_id = _generated_image.json()["image"]["id"]
 ok(_image_call["base_url"] == "https://image.test/v1" and _image_call["model"] == "image-test"
    and _image_call["size"] == "1024x1536" and "电影感" in _image_call["prompt"],
    "角色图请求使用独立 Base URL、模型、尺寸和可编辑画风")
+_second_image = c.post(f"/api/entities/{ent['id']}/image/generate", json={
+    "prompt": "林晚第二套冬季服装", "style": "概念设计", "size": "1024x1536",
+}, headers=H(tokA)).json()
+_second_image_id = _second_image["image"]["id"]
+_image_history = c.get(f"/api/entities/{ent['id']}/images", headers=H(tokA)).json()["items"]
+ok(len(_image_history) == 2 and _image_history[0]["id"] == _second_image_id and _image_history[0]["selected"],
+   "连续生图保留历史，并把最新图片设为主形象")
+_work_gallery = c.get(f"/api/works/{wid}/images?category=characters", headers=H(tokA)).json()["items"]
+ok({_first_image_id, _second_image_id}.issubset({item["id"] for item in _work_gallery}),
+   "作品角色图库可集中查看所有历史图片")
+ok(c.get(f"/api/entity-images/{_first_image_id}/content", headers=H(tokA)).status_code == 200
+   and c.get(f"/api/entity-images/{_first_image_id}/content", headers=H(tokB)).status_code == 404,
+   "角色图库大图内容按用户隔离")
+ok(c.post(f"/api/entity-images/{_first_image_id}/select", json={}, headers=H(tokA)).json()["image"]["selected"],
+   "历史图片可重新设为角色主形象")
+_delete_selected = c.delete(f"/api/entity-images/{_first_image_id}", headers=H(tokA)).json()
+ok(_delete_selected["selected_image_id"] == _second_image_id and _delete_selected["has_image"],
+   "删除当前主图时会自动回退到上一张历史图")
 _entity_with_image = c.get(f"/api/works/{wid}/entities", headers=H(tokA)).json()[0]
 ok(_entity_with_image["has_image"] == 1 and "image_path" not in _entity_with_image,
    "实体列表只暴露角色图状态，不泄露服务端文件路径")
@@ -450,6 +477,67 @@ ok(c.get(f"/api/disassembly/jobs/{_book_job['id']}", headers=H(tokB)).status_cod
    "拆书任务和原文按用户隔离")
 llm.chat = _orig_book_chat
 
+# 统一资料中心：故事事实、参考工程、语言指纹、拆书桥段与长期附件分层保存并按需融合。
+_material_dashboard = c.get(f"/api/works/{wid}/materials", headers=H(tokA))
+ok(_material_dashboard.status_code == 200 and _material_dashboard.json()["settings"]["use_story_memory"],
+   "资料中心提供本书默认融合设置")
+ok(c.get(f"/api/works/{wid}/materials", headers=H(tokB)).status_code == 404,
+   "资料中心按作品作者隔离")
+_material_settings = c.put(f"/api/works/{wid}/materials/settings", json={
+    "use_story_memory": True, "use_reference_projects": True, "use_style_profile": True,
+    "use_inspirations": True, "use_reference_documents": True, "style_strength": "strong",
+}, headers=H(tokA)).json()["settings"]
+ok(_material_settings["style_strength"] == "strong", "资料融合方向和语言指纹强度可配置")
+_long_doc = c.post(f"/api/works/{wid}/materials/documents", json={
+    "name": "蓝鲸协议.md", "content": "蓝鲸协议规定：钟声响起后，林晚必须等待七分钟。",
+    "tags": "规则,悬疑", "enabled": True, "pinned": True,
+}, headers=H(tokA)).json()["document"]
+ok(_long_doc["pinned"] and _long_doc["chars"] > 10, "本轮附件可另存为长期参考资料")
+ok(c.put(f"/api/works/{wid}/materials/documents/{_long_doc['id']}", json={"pinned": False}, headers=H(tokB)).status_code == 404,
+   "他人不能修改长期参考资料")
+_reference_work_id = c.post("/api/works", json={"title": "只读参考工程"}, headers=H(tokA)).json()["id"]
+materials.save_style_profile(uidA, _reference_work_id, {
+    "narrative_voice": "克制的近距离叙述", "point_of_view": "第三人称限知", "pacing": "短场景递进",
+    "sentence_rhythm": "短句与停顿交替", "diction": "具体名词", "description_preferences": "用动作代替判断",
+    "dialogue_pattern": "对白留白", "emotional_tone": "低温悬疑", "avoid": "不复制原句",
+}, source_kind="manual", source_label="参考工程抽象技法")
+_mount = c.post(f"/api/works/{wid}/materials/references", json={
+    "reference_work_id": _reference_work_id, "use_style": True, "use_plot": True, "use_world": False,
+}, headers=H(tokA)).json()["mount"]
+ok(_mount["reference_title"] == "只读参考工程" and not _mount["use_world"],
+   "参考工程可按文风、桥段、世界观三个方向选择性挂载")
+_orig_material_chat = llm.chat
+llm.chat = lambda *args, **kwargs: json.dumps({
+    "style_profile": {
+        "narrative_voice": "冷静克制", "point_of_view": "第三人称限知", "pacing": "冲突后短暂停顿",
+        "sentence_rhythm": "短长句交替", "diction": "具体准确", "description_preferences": "动作与感官细节",
+        "dialogue_pattern": "简短对白与潜台词", "emotional_tone": "低温紧张", "avoid": "避免照搬专名与原句",
+        "character_voices": [{"name": "线索提供者", "speech_habits": "先回避再给出关键信息"}],
+        "description_craft": [{"title": "物件递进", "technique": "用同一物件改变场景目标"}],
+    },
+    "plot_devices": [{
+        "title": "延迟兑现的物件", "mechanism": "前段交付普通物件，后段揭示其真正用途",
+        "setup": "先让物件参与日常行动", "payoff": "危机时改变选择", "suitable_context": "悬疑推进",
+        "adaptation": "替换人物、物件、因果链", "avoid_copy": "不保留原作专名与场景表达",
+    }],
+}, ensure_ascii=False)
+_extracted_materials = c.post(f"/api/disassembly/jobs/{_book_job['id']}/materials/extract", json={
+    "create_inspirations": True,
+}, headers=H(tokA))
+ok(_extracted_materials.status_code == 200 and len(_extracted_materials.json()["inspiration_ids"]) == 1,
+   "整本拆书可提炼语言指纹并把桥段机制加入灵感库")
+llm.chat = _orig_material_chat
+_material_context = context_builder.build_context(
+    uidA, "continue_writing", wid, cid, instruction="按蓝鲸协议续写钟声后的等待，并保持本书语气",
+)
+_material_types = {item["type"] for item in _material_context["context_items"]}
+ok({"style_profile", "reference_project", "reference_document"}.issubset(_material_types)
+   and any("蓝鲸协议" in item["content"] for item in _material_context["context_items"]),
+   "生成上下文融合语言指纹、只读参考工程和匹配的长期资料")
+_agent_material_prompt = main._agent_system(uidA, cid, instruction="继续写蓝鲸协议")['content']
+ok("长期参考文档和灵感只是创作辅助" in _agent_material_prompt and "不复制来源的独特表达" in _agent_material_prompt,
+   "Agent 提示明确参考资料不等于正史且禁止照搬")
+
 # 多模态创意灵感库：原始内容、范围、检索、附件、使用记录和 Agent 工具。
 ok(c.post("/api/inspirations", json={
     "raw_text": "危险链接", "source_url": "javascript:alert(1)", "analyze": False,
@@ -470,7 +558,9 @@ ok(_global_inspiration["scope"] == "global" and _work_inspiration["work_id"] == 
 _inspiration_list = c.get(
     f"/api/inspirations?work_id={wid}&scope=all&status=active", headers=H(tokA)
 ).json()
-ok(_inspiration_list["total"] == 2, "灵感列表合并通用与当前作品")
+ok(_inspiration_list["total"] >= 2
+   and {_global_inspiration["id"], _work_inspiration["id"]}.issubset({item["id"] for item in _inspiration_list["items"]}),
+   "灵感列表合并通用、当前作品与拆书提炼桥段")
 ok(c.get(f"/api/inspirations/{_work_inspiration['id']}", headers=H(tokB)).status_code == 404,
    "灵感详情按用户隔离")
 ok(c.get(f"/api/inspirations?work_id={wid}", headers=H(tokB)).status_code == 400,
@@ -1500,6 +1590,14 @@ with db.get_conn() as conn:
     _nsandbox = conn.execute("SELECT COUNT(*) FROM story_sandboxes WHERE work_id=?", (wid,)).fetchone()[0]
     _nbookjobs = conn.execute("SELECT COUNT(*) FROM book_disassembly_jobs WHERE target_work_id=?", (wid,)).fetchone()[0]
 ok(_nsandbox == 0 and _nbookjobs == 0, "删作品级联清空情节沙盘与拆书任务")
+with db.get_conn() as conn:
+    _nmaterial_settings = conn.execute("SELECT COUNT(*) FROM work_material_settings WHERE work_id=?", (wid,)).fetchone()[0]
+    _nmaterial_docs = conn.execute("SELECT COUNT(*) FROM work_reference_documents WHERE work_id=?", (wid,)).fetchone()[0]
+    _nmaterial_mounts = conn.execute("SELECT COUNT(*) FROM work_reference_mounts WHERE work_id=?", (wid,)).fetchone()[0]
+    _nmaterial_profiles = conn.execute("SELECT COUNT(*) FROM work_style_profiles WHERE work_id=?", (wid,)).fetchone()[0]
+    _nentity_images = conn.execute("SELECT COUNT(*) FROM entity_images WHERE work_id=?", (wid,)).fetchone()[0]
+ok(not any((_nmaterial_settings, _nmaterial_docs, _nmaterial_mounts, _nmaterial_profiles, _nentity_images)),
+   "删作品级联清空资料中心配置、长期资料、挂载、语言指纹与角色图库")
 # 同样应级联清掉该作品各章节的 agent 对话（cid 上留有一条压缩后的对话）
 ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 _archived_inspiration = c.get(

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=roles-20260813-1">
+  <link rel="stylesheet" href="style.css?v=materials-images-20260813-1">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -94,7 +94,9 @@
             <button data-ic="download" data-label="整本 DOCX" onclick="exportChap('work-docx');closeMoreMenu()"></button>
             <div class="menu-sep"></div>
             <div class="menu-label">创作资料</div>
+            <button data-ic="archive" data-label="资料中心" onclick="openMaterialHub();closeMoreMenu()"></button>
             <button data-ic="bulb" data-label="灵感库" onclick="openInspirationLibrary();closeMoreMenu()"></button>
+            <button data-ic="image" data-label="角色图库" onclick="openCharacterImageLibrary();closeMoreMenu()"></button>
             <button data-ic="branch" data-label="情节沙盘" onclick="openOutlineSandbox();closeMoreMenu()"></button>
             <button data-ic="book" data-label="拆书引擎" onclick="openDisassembly();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI Skills" onclick="openSkills();closeMoreMenu()"></button>
@@ -398,6 +400,64 @@
     </div>
   </div>
 
+  <!-- 统一资料中心：事实、参考、风格和附件保持边界，但在生成时按需融合 -->
+  <div id="materialOverlay" class="overlay hidden">
+    <div class="overlay-card material-card">
+      <div class="overlay-head">
+        <span>创作资料中心</span>
+        <span class="overlay-head-actions">
+          <button class="ic" data-ic="refresh" onclick="loadMaterialHub()" title="刷新"></button>
+          <button class="ic" data-ic="x" onclick="closeMaterialHub()" title="关闭"></button>
+        </span>
+      </div>
+      <div class="material-body">
+        <section class="material-section material-switches">
+          <div class="settings-section-head"><b>本书生成时使用</b><span>修改后自动保存</span></div>
+          <p class="set-hint">故事记忆属于事实；其余内容只用于借鉴。发送前可在 AI 侧栏的“眼睛”中检查本轮实际带入了什么。</p>
+          <div class="material-toggle-grid">
+            <label><input id="materialUseMemory" type="checkbox" onchange="saveMaterialSettings()"> 故事记忆 <small>已确认事实与连续性</small></label>
+            <label><input id="materialUseReferences" type="checkbox" onchange="saveMaterialSettings()"> 参考工程 <small>只读借鉴，不混入设定</small></label>
+            <label><input id="materialUseStyle" type="checkbox" onchange="saveMaterialSettings()"> 语言指纹 <small>叙述、句式和人物声音</small></label>
+            <label><input id="materialUseInspirations" type="checkbox" onchange="saveMaterialSettings()"> 灵感与桥段 <small>按本轮意图召回候选</small></label>
+            <label><input id="materialUseDocuments" type="checkbox" onchange="saveMaterialSettings()"> 长期资料 <small>附件保存后的稳定参考</small></label>
+          </div>
+          <label class="material-strength">语言指纹强度
+            <select id="materialStyleStrength" onchange="saveMaterialSettings()">
+              <option value="light">轻度参考</option><option value="balanced">保持一致</option><option value="strong">优先遵循</option>
+            </select>
+          </label>
+          <span id="materialSettingsMsg" class="msg"></span>
+        </section>
+
+        <section class="material-section">
+          <div class="settings-section-head"><b>本书语言指纹</b><button id="materialAnalyzeStyleBtn" onclick="analyzeMaterialStyle()">从当前正文刷新</button></div>
+          <p class="set-hint">提炼叙述声音、视角、节奏、句式、措辞、描写偏好和人物说话习惯；不会保存原文摘抄。</p>
+          <div id="materialStyleProfile" class="material-profile"></div>
+        </section>
+
+        <section class="material-section">
+          <div class="settings-section-head"><b>只读参考工程</b><span>最多 5 本</span></div>
+          <div class="material-reference-add">
+            <select id="materialReferenceWork"></select>
+            <label><input id="materialRefStyle" type="checkbox" checked> 文风</label>
+            <label><input id="materialRefPlot" type="checkbox" checked> 桥段</label>
+            <label><input id="materialRefWorld" type="checkbox"> 世界观</label>
+            <button onclick="addMaterialReference()">挂载</button>
+          </div>
+          <p class="set-hint">建议先在参考工程中完成拆书并“提炼整本资料”。默认不借世界观，避免把别人的设定误写进本书。</p>
+          <div id="materialReferenceList" class="material-list"></div>
+        </section>
+
+        <section class="material-section">
+          <div class="settings-section-head"><b>长期参考资料</b><button class="ic" data-ic="paperclip" onclick="chooseMaterialDocument()">上传文档</button></div>
+          <p class="set-hint">TXT、Markdown、Word、PDF 可保存为本书长期资料。AI 聊天框里的附件仍默认只用一轮，可在附件条上点“存为长期”。</p>
+          <input id="materialDocumentFile" class="hidden" type="file" accept=".txt,.md,.docx,.pdf,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf" onchange="addMaterialDocument(this.files?.[0])">
+          <div id="materialDocumentList" class="material-list"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
   <!-- AI 改稿先预览，作者确认后才写入正文 -->
   <div id="editReviewBackdrop" class="edit-review-backdrop hidden" onclick="closeEditReview()"></div>
   <aside id="editReviewDrawer" class="edit-review-drawer hidden" aria-label="AI 改稿预览">
@@ -529,8 +589,9 @@
               <button id="disassemblyStartBtn" onclick="startDisassembly()">开始 / 继续分析</button>
               <button id="disassemblyPauseBtn" class="ic" onclick="pauseDisassembly()">暂停</button>
               <button id="disassemblyFinishBtn" class="ic" onclick="finishDisassembly()">停止并保存已有结果</button>
+              <button id="disassemblyExtractBtn" class="ic" onclick="extractDisassemblyMaterials()">提炼整本资料</button>
             </div>
-            <p class="set-hint">每分析完一章就立即保存摘要、人物、地点、物品和关系；关闭页面后也能从任务列表继续。</p>
+            <p class="set-hint">每分析完一章就立即保存摘要、人物、地点、物品和关系；“提炼整本资料”会综合已完成章节，生成语言指纹、人物声音与可改编桥段，桥段进入灵感库。</p>
             <div id="disassemblyChapters" class="disassembly-chapters"></div>
           </div>
         </section>
@@ -644,19 +705,51 @@
         <button class="ic" data-ic="x" onclick="closeEntityImage()" title="关闭"></button>
       </div>
       <div class="entity-image-body">
-        <div id="entityImagePreview" class="entity-image-preview"></div>
+        <div>
+          <button id="entityImagePreview" class="entity-image-preview" onclick="openCurrentEntityImageLightbox()" title="点击查看大图"></button>
+          <div class="entity-image-preview-hint">点击当前形象查看大图</div>
+        </div>
         <div class="entity-image-controls">
-          <label>角色形象提示词<textarea id="entityImagePrompt" rows="9" maxlength="8000" placeholder="描述外貌、服装、神态、构图和画风…"></textarea></label>
+          <div class="entity-image-prompt-head"><b>角色形象提示词</b><button id="entityImagePolishBtn" class="ic" data-ic="sparkles" onclick="polishEntityImagePrompt()">AI 整理为英文生图词</button></div>
+          <textarea id="entityImagePrompt" rows="9" maxlength="8000" placeholder="会根据人物卡生成；也可以自己补充外貌、服装、神态、构图和画风…"></textarea>
           <label>补充画风<input id="entityImageStyle" maxlength="1000" placeholder="例如：电影感写实、东方奇幻、柔和侧光"></label>
-          <label>图片尺寸<select id="entityImageSize"><option>1024x1024</option><option>1024x1536</option><option>1536x1024</option><option>512x512</option><option>auto</option></select></label>
-          <p class="set-hint">提示词会保存在人物卡上；再次生成会替换旧图。服务地址、Key 和模型 ID 在“模型与联网设置”中配置。</p>
+          <label>图片尺寸<select id="entityImageSize"><option>1024x1536</option><option>1024x1024</option><option>1536x1024</option><option>512x512</option><option>auto</option></select></label>
+          <p class="set-hint">参考 DeepWrite 的人物立绘流程：英文提示词包含画风、竖版构图、光线、色调和角色细节。新图会进入历史图库，不再覆盖删除旧图；可随时切换主形象。</p>
           <div class="set-actions">
             <button id="entityImageGenerateBtn" onclick="generateEntityImage()">生成角色图</button>
-            <button id="entityImageDeleteBtn" class="ic danger-lite" onclick="deleteEntityImage()">删除图片</button>
+            <button class="ic" onclick="openCharacterImageLibrary(entityImageEntityId)">打开角色图库</button>
+            <button id="entityImageDeleteBtn" class="ic danger-lite" onclick="deleteEntityImage()">删除当前图</button>
           </div>
           <span id="entityImageMsg" class="msg"></span>
         </div>
       </div>
+      <section class="entity-image-history-section">
+        <div class="settings-section-head"><b>这个角色的历史形象</b><span id="entityImageHistoryCount"></span></div>
+        <div id="entityImageHistory" class="image-asset-grid compact"></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- 角色图库：保留每次生成结果，按角色查看、切换主形象和打开大图 -->
+  <div id="characterImageLibraryOverlay" class="overlay hidden">
+    <div class="overlay-card image-library-card">
+      <div class="overlay-head">
+        <span>角色图库</span>
+        <span class="overlay-head-actions"><button class="ic" data-ic="refresh" onclick="loadCharacterImageLibrary()"></button><button class="ic" data-ic="x" onclick="closeCharacterImageLibrary()"></button></span>
+      </div>
+      <div class="image-library-toolbar">
+        <button class="active" data-image-filter="all" onclick="setCharacterImageFilter('all')">全部</button>
+        <div id="characterImageFilters" class="image-character-filters"></div>
+      </div>
+      <div id="characterImageLibraryGrid" class="image-asset-grid library"></div>
+    </div>
+  </div>
+
+  <div id="imageLightbox" class="image-lightbox hidden" onclick="if(event.target===this)closeImageLightbox()">
+    <div class="image-lightbox-card">
+      <img id="imageLightboxImg" alt="角色大图">
+      <div><b id="imageLightboxTitle"></b><p id="imageLightboxPrompt"></p></div>
+      <button class="ic image-lightbox-close" data-ic="x" onclick="closeImageLightbox()" title="关闭"></button>
     </div>
   </div>
 
@@ -844,6 +937,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=roles-20260813-1"></script>
+  <script src="app.js?v=materials-images-20260813-1"></script>
 </body>
 </html>
