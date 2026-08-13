@@ -42,6 +42,14 @@ INSPIRATION_STORAGE_DIR = os.getenv(
     "INSPIRATION_STORAGE_DIR",
     os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "inspirations"),
 )
+ENTITY_IMAGE_STORAGE_DIR = os.getenv(
+    "ENTITY_IMAGE_STORAGE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "entity-images"),
+)
+ENTITY_IMAGE_MAX_BYTES = int(os.getenv("ENTITY_IMAGE_MAX_BYTES", str(25 * 1024 * 1024)))
+BOOK_DISASSEMBLY_MAX_BYTES = int(os.getenv("BOOK_DISASSEMBLY_MAX_BYTES", str(50 * 1024 * 1024)))
+BOOK_DISASSEMBLY_MAX_CHARS = int(os.getenv("BOOK_DISASSEMBLY_MAX_CHARS", str(5_000_000)))
+BOOK_DISASSEMBLY_CHAPTER_AI_CHARS = int(os.getenv("BOOK_DISASSEMBLY_CHAPTER_AI_CHARS", "24000"))
 INSPIRATION_IMAGE_MAX_BYTES = int(os.getenv("INSPIRATION_IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
 INSPIRATION_AUDIO_MAX_BYTES = int(os.getenv("INSPIRATION_AUDIO_MAX_BYTES", str(100 * 1024 * 1024)))
 INSPIRATION_VIDEO_MAX_BYTES = int(os.getenv("INSPIRATION_VIDEO_MAX_BYTES", str(300 * 1024 * 1024)))

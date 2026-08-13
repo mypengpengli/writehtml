@@ -18,7 +18,7 @@ os.environ["AGENT_CONTEXT_TRIGGER_RATIO"] = "0.90"
 os.environ["AGENT_MAX_OUTPUT_TOKENS"] = "8192"
 
 from fastapi.testclient import TestClient
-import main, db, llm, config, context_builder, inspiration
+import main, db, llm, config, context_builder, image_generation, inspiration
 
 db.init_db()
 c = TestClient(main.app)
@@ -125,6 +125,8 @@ c.post("/api/settings", json={
     "base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a",
     "models": ["m-a", "m-polish", "m-fast"],
     "asr_base_url": "https://asr.test/v1", "asr_api_key": "sk-asr-secret", "asr_model": "whisper-test",
+    "image_base_url": "https://image.test/v1", "image_api_key": "sk-image-secret",
+    "image_model": "image-test", "image_size": "1024x1536",
     "tavily_api_keys": ["tvly-test-user-one-1111", "tvly-test-user-two-2222"],
 }, headers=H(tokA))
 s = c.get("/api/settings", headers=H(tokA)).json()
@@ -133,6 +135,9 @@ ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a" and s["asr_model
 ok(s["models"] == ["m-a", "m-polish", "m-fast"], "常用模型 ID 列表读回")
 ok(s["has_key"] is True and "secret" not in s["api_key_masked"] and s["api_key_masked"].startswith("****"), "key 掩码不泄露明文")
 ok(s["asr_has_key"] is True and "secret" not in s["asr_api_key_masked"], "转写 key 掩码不泄露明文")
+ok(s["image_base_url"] == "https://image.test/v1" and s["image_model"] == "image-test"
+   and s["image_size"] == "1024x1536" and s["image_has_key"] is True
+   and "secret" not in s["image_api_key_masked"], "角色生图配置按用户保存且 Key 只返回掩码")
 ok(s["tavily_user_key_count"] == 2 and s["tavily_key_source"] == "user"
    and s["tavily_api_key_masks"] == ["****1111", "****2222"]
    and "tvly-test-user-one" not in json.dumps(s),
@@ -347,6 +352,103 @@ dig = db.get_entity_digest(wid, uidA)
 ok(dig.startswith("作品实体") and "[人物] 林晚" in dig and "女主角，冷静" in dig and "基础设定：冷静" in dig,
    "实体 digest 含摘要与基础设定")
 ok(db.get_entity_digest(wid, uidA + 9999) == "", "他人作品 digest 为空(隔离)")
+
+# 人物角色图：使用独立可配置模型，服务端持久保存并按用户隔离。
+_orig_generate_image = image_generation.generate_image
+_image_call = {}
+async def _fake_generate_image(base_url, api_key, model, prompt, size):
+    _image_call.update(base_url=base_url, api_key=api_key, model=model, prompt=prompt, size=size)
+    return b"\x89PNG\r\n\x1a\nwritehtml-character-image", "image/png"
+image_generation.generate_image = _fake_generate_image
+_generated_image = c.post(f"/api/entities/{ent['id']}/image/generate", json={
+    "prompt": "林晚，黑色长发，冷静神情", "style": "电影感", "size": "1024x1536", "chapter_id": cid,
+}, headers=H(tokA))
+ok(_generated_image.status_code == 200 and _generated_image.json()["has_image"], "人物角色图可生成并保存")
+ok(_image_call["base_url"] == "https://image.test/v1" and _image_call["model"] == "image-test"
+   and _image_call["size"] == "1024x1536" and "电影感" in _image_call["prompt"],
+   "角色图请求使用独立 Base URL、模型、尺寸和可编辑画风")
+_entity_with_image = c.get(f"/api/works/{wid}/entities", headers=H(tokA)).json()[0]
+ok(_entity_with_image["has_image"] == 1 and "image_path" not in _entity_with_image,
+   "实体列表只暴露角色图状态，不泄露服务端文件路径")
+_image_file = c.get(f"/api/entities/{ent['id']}/image", headers=H(tokA))
+ok(_image_file.status_code == 200 and _image_file.content.startswith(b"\x89PNG"), "作者可读取持久化角色图")
+ok(c.get(f"/api/entities/{ent['id']}/image", headers=H(tokB)).status_code == 404,
+   "其他用户无法读取角色图")
+ok(c.delete(f"/api/entities/{ent['id']}/image", headers=H(tokA)).status_code == 200
+   and c.get(f"/api/entities/{ent['id']}/image", headers=H(tokA)).status_code == 404,
+   "角色图可删除且不影响人物卡")
+image_generation.generate_image = _orig_generate_image
+
+# 可视化大纲 / 情节沙盘：多沙盘持久化、章节关联、分支候选和用户隔离。
+_sandbox = c.post(f"/api/works/{wid}/sandboxes", json={"name": "主线推演", "data": {
+    "nodes": [{"id": "chapter-root", "title": "抵达北城", "summary": "林晚开始调查", "kind": "chapter", "chapter_id": cid, "x": 80, "y": 90}],
+    "edges": [],
+}}, headers=H(tokA)).json()
+ok(_sandbox["name"] == "主线推演" and _sandbox["data"]["nodes"][0]["chapter_id"] == cid,
+   "情节沙盘可保存关联正文章节的节点")
+_sandbox_saved = c.put(f"/api/sandboxes/{_sandbox['id']}", json={"data": {
+    "nodes": _sandbox["data"]["nodes"] + [{"id": "branch-a", "title": "追向旧码头", "summary": "选择追击", "kind": "choice", "x": 360, "y": 90}],
+    "edges": [{"id": "edge-a", "from": "chapter-root", "to": "branch-a", "label": "发散"}],
+}}, headers=H(tokA)).json()
+ok(len(_sandbox_saved["data"]["nodes"]) == 2 and len(c.get(f"/api/works/{wid}/sandboxes", headers=H(tokA)).json()) == 1,
+   "沙盘节点与分支连线可持久保存")
+ok(c.get(f"/api/sandboxes/{_sandbox['id']}", headers=H(tokB)).status_code == 404,
+   "其他用户无法读取情节沙盘")
+_orig_sandbox_chat = llm.chat
+llm.chat = lambda *args, **kwargs: json.dumps([
+    {"title": "陌生来信", "summary": "新人物带来另一条线索", "direction": "发散", "characters": "林晚"},
+    {"title": "核对证词", "summary": "回收旧码头证词矛盾", "direction": "收束", "characters": "林晚"},
+    {"title": "潜入码头", "summary": "冲突推进到正面调查", "direction": "推进", "characters": "林晚"},
+], ensure_ascii=False)
+_expanded = c.post(f"/api/sandboxes/{_sandbox['id']}/expand", json={"node_id": "branch-a"}, headers=H(tokA)).json()
+ok([item["direction"] for item in _expanded["candidates"]] == ["发散", "收束", "推进"],
+   "沙盘 AI 展开返回发散、收束、推进三类候选且不直接改正文")
+llm.chat = _orig_sandbox_chat
+
+# 拆书：自动切章后逐章分析；每章成果立即落到目标作品，任务可以再次读取。
+_epub_buf = io.BytesIO()
+with zipfile.ZipFile(_epub_buf, "w") as _epub:
+    _epub.writestr("OPS/chapter1.xhtml", "<html><body><h1>第一章 EPUB</h1><p>林晚走进北城。</p></body></html>")
+ok("林晚走进北城" in main._extract_book_document("参考书.epub", _epub_buf.getvalue()),
+   "拆书可从 EPUB 提取正文")
+_book_text = "第一章 雨夜\n林晚在北城遇见顾川。\n\n第二章 旧门\n顾川把铜钥匙交给林晚。".encode("utf-8")
+_prepared = c.post("/api/disassembly/prepare", content=_book_text, headers={
+    **H(tokA), "Content-Type": "text/plain", "X-File-Name": quote("参考书.txt"),
+    "X-Disassembly-Mode": "merge", "X-Disassembly-Strategy": "close_reading", "X-Target-Work-Id": str(wid),
+})
+ok(_prepared.status_code == 200 and _prepared.json()["chapter_count"] == 2,
+   "拆书可读取 TXT 并自动切分章节")
+_book_job = _prepared.json()["job"]
+ok(_book_job["status"] == "ready" and len(_book_job["chapters"]) == 2,
+   "切章后先提供可检查的任务，不会在一个长请求中一次跑完")
+_orig_book_chat = llm.chat
+def _book_chat(messages, **kwargs):
+    text = messages[-1]["content"]
+    second = "铜钥匙" in text
+    return json.dumps({
+        "summary": "顾川交出铜钥匙" if second else "林晚在雨夜遇见顾川",
+        "characters": [{"name": "顾川", "summary": "掌握线索的人", "detail": "行事谨慎"}],
+        "locations": [] if second else [{"name": "北城", "summary": "故事发生地"}],
+        "items": [{"name": "铜钥匙", "summary": "开启旧门"}] if second else [],
+        "organizations": [],
+        "relations": [{"from": "顾川", "to": "林晚", "relation": "交付线索", "detail": "铜钥匙"}] if second else [],
+        "style_notes": "短句推进",
+    }, ensure_ascii=False)
+llm.chat = _book_chat
+_book_step1 = c.post(f"/api/disassembly/jobs/{_book_job['id']}/step", json={}, headers=H(tokA)).json()
+_book_step2 = c.post(f"/api/disassembly/jobs/{_book_job['id']}/step", json={}, headers=H(tokA)).json()
+ok(_book_step1["ok"] and _book_step1["job"]["processed_chapters"] == 1,
+   "拆书每完成一章就立即保存进度")
+ok(_book_step2["ok"] and _book_step2["job"]["status"] == "completed"
+   and _book_step2["job"]["stats"]["characters"] == 1,
+   "逐章拆书完成后汇总实体统计")
+_book_entities = c.get(f"/api/works/{wid}/entities", headers=H(tokA)).json()
+ok(any(item["name"] == "顾川" and item["kind"] == "人物" for item in _book_entities)
+   and any(item["name"] == "铜钥匙" and item["kind"] == "物品" for item in _book_entities),
+   "拆书发现的人物与物品立即进入语义实体库")
+ok(c.get(f"/api/disassembly/jobs/{_book_job['id']}", headers=H(tokB)).status_code == 404,
+   "拆书任务和原文按用户隔离")
+llm.chat = _orig_book_chat
 
 # 多模态创意灵感库：原始内容、范围、检索、附件、使用记录和 Agent 工具。
 ok(c.post("/api/inspirations", json={
@@ -1394,6 +1496,10 @@ ok(_nres == 0, "删作品级联清空 Skill 资料")
 with db.get_conn() as conn:
     _nmem = conn.execute("SELECT COUNT(*) FROM story_memory_items WHERE work_id=?", (wid,)).fetchone()[0]
 ok(_nmem == 0, "删作品级联清空故事记忆")
+with db.get_conn() as conn:
+    _nsandbox = conn.execute("SELECT COUNT(*) FROM story_sandboxes WHERE work_id=?", (wid,)).fetchone()[0]
+    _nbookjobs = conn.execute("SELECT COUNT(*) FROM book_disassembly_jobs WHERE target_work_id=?", (wid,)).fetchone()[0]
+ok(_nsandbox == 0 and _nbookjobs == 0, "删作品级联清空情节沙盘与拆书任务")
 # 同样应级联清掉该作品各章节的 agent 对话（cid 上留有一条压缩后的对话）
 ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 _archived_inspiration = c.get(

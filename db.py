@@ -567,6 +567,79 @@ def _migration_tavily_search_settings(conn):
     _add_col(conn, "user_settings", "tavily_api_keys_json", "TEXT DEFAULT '[]'")
 
 
+def _migration_character_images(conn):
+    """Configurable image providers and persisted entity portraits."""
+    _add_col(conn, "user_settings", "image_base_url", "TEXT DEFAULT ''")
+    _add_col(conn, "user_settings", "image_api_key", "TEXT DEFAULT ''")
+    _add_col(conn, "user_settings", "image_model", "TEXT DEFAULT ''")
+    _add_col(conn, "user_settings", "image_size", "TEXT DEFAULT '1024x1024'")
+    _add_col(conn, "entities", "image_path", "TEXT DEFAULT ''")
+    _add_col(conn, "entities", "image_prompt", "TEXT DEFAULT ''")
+    _add_col(conn, "entities", "image_updated_at", "REAL")
+
+
+def _migration_story_sandboxes(conn):
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS story_sandboxes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_id INTEGER NOT NULL,
+            name TEXT NOT NULL DEFAULT '主线推演',
+            data_json TEXT NOT NULL DEFAULT '{"nodes":[],"edges":[]}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_story_sandboxes_work
+            ON story_sandboxes(work_id, updated_at DESC, id DESC);
+        """
+    )
+
+
+def _migration_book_disassembly(conn):
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS book_disassembly_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            target_work_id INTEGER NOT NULL,
+            source_name TEXT NOT NULL,
+            strategy TEXT NOT NULL DEFAULT 'close_reading',
+            status TEXT NOT NULL DEFAULT 'ready',
+            total_chapters INTEGER NOT NULL DEFAULT 0,
+            processed_chapters INTEGER NOT NULL DEFAULT 0,
+            failed_chapters INTEGER NOT NULL DEFAULT 0,
+            stats_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            finished_at REAL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(target_work_id) REFERENCES works(id)
+        );
+        CREATE TABLE IF NOT EXISTS book_disassembly_chapters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            ord INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            target_chapter_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES book_disassembly_jobs(id),
+            FOREIGN KEY(target_chapter_id) REFERENCES chapters(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_disassembly_jobs_user
+            ON book_disassembly_jobs(user_id, updated_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_disassembly_chapters_job
+            ON book_disassembly_chapters(job_id, ord, id);
+        """
+    )
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
@@ -574,6 +647,9 @@ _MIGRATIONS = (
     (4, "creative_inspiration_library", _migration_creative_inspirations),
     (5, "agent_multi_session", _migration_agent_sessions),
     (6, "tavily_search_settings", _migration_tavily_search_settings),
+    (7, "character_images", _migration_character_images),
+    (8, "story_sandboxes", _migration_story_sandboxes),
+    (9, "book_disassembly", _migration_book_disassembly),
 )
 
 
@@ -686,6 +762,10 @@ def init_db():
                 llm_base_url TEXT,
                 llm_api_key TEXT,
                 llm_model TEXT,
+                image_base_url TEXT DEFAULT '',
+                image_api_key TEXT DEFAULT '',
+                image_model TEXT DEFAULT '',
+                image_size TEXT DEFAULT '1024x1024',
                 updated_at REAL
             );
             CREATE TABLE IF NOT EXISTS entities (
@@ -695,6 +775,9 @@ def init_db():
                 kind TEXT NOT NULL,
                 summary TEXT DEFAULT '',
                 detail TEXT DEFAULT '',
+                image_path TEXT DEFAULT '',
+                image_prompt TEXT DEFAULT '',
+                image_updated_at REAL,
                 created_at REAL,
                 updated_at REAL,
                 FOREIGN KEY(work_id) REFERENCES works(id)
@@ -766,6 +849,44 @@ def init_db():
                 FOREIGN KEY(work_id) REFERENCES works(id),
                 FOREIGN KEY(from_entity_id) REFERENCES entities(id),
                 FOREIGN KEY(to_entity_id) REFERENCES entities(id)
+            );
+            CREATE TABLE IF NOT EXISTS story_sandboxes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id INTEGER NOT NULL,
+                name TEXT NOT NULL DEFAULT '主线推演',
+                data_json TEXT NOT NULL DEFAULT '{"nodes":[],"edges":[]}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(work_id) REFERENCES works(id)
+            );
+            CREATE TABLE IF NOT EXISTS book_disassembly_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                target_work_id INTEGER NOT NULL,
+                source_name TEXT NOT NULL,
+                strategy TEXT NOT NULL DEFAULT 'close_reading',
+                status TEXT NOT NULL DEFAULT 'ready',
+                total_chapters INTEGER NOT NULL DEFAULT 0,
+                processed_chapters INTEGER NOT NULL DEFAULT 0,
+                failed_chapters INTEGER NOT NULL DEFAULT 0,
+                stats_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                finished_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS book_disassembly_chapters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                ord INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                target_chapter_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS chapter_consistency_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1282,6 +1403,9 @@ def admin_delete_user(user_id):
         conn.execute("DELETE FROM plot_state_versions WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM plot_state_proposals WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entity_relations WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM story_sandboxes WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM book_disassembly_chapters WHERE job_id IN (SELECT id FROM book_disassembly_jobs WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM book_disassembly_jobs WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM work_revisions WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE user_id=?)", (user_id,))
@@ -1344,7 +1468,8 @@ def get_settings(user_id):
     with get_conn() as conn:
         r = conn.execute(
             "SELECT llm_base_url, llm_api_key, llm_model, llm_models_json, "
-            "asr_base_url, asr_api_key, asr_model, tavily_api_keys_json "
+            "asr_base_url, asr_api_key, asr_model, tavily_api_keys_json, "
+            "image_base_url, image_api_key, image_model, image_size "
             "FROM user_settings WHERE user_id=?",
             (user_id,),
         ).fetchone()
@@ -1362,18 +1487,31 @@ def get_settings(user_id):
 
 def save_settings(user_id, base_url, api_key, model, asr_model=None,
                   asr_base_url=None, asr_api_key=None, models=None,
-                  tavily_api_keys=None):
+                  tavily_api_keys=None, image_base_url=None,
+                  image_api_key=None, image_model=None, image_size=None):
     """保存设置。api_key 为空或为掩码占位时保留旧值，避免清空已填的 key。"""
     now = time.time()
     with get_conn() as conn:
         old = conn.execute(
             "SELECT llm_api_key, asr_api_key, llm_model, llm_models_json, "
-            "tavily_api_keys_json FROM user_settings WHERE user_id=?", (user_id,)
+            "tavily_api_keys_json, image_base_url, image_api_key, image_model, image_size "
+            "FROM user_settings WHERE user_id=?", (user_id,)
         ).fetchone()
         if not api_key or api_key.startswith("****"):
             api_key = old["llm_api_key"] if old else ""
         if not asr_api_key or asr_api_key.startswith("****"):
             asr_api_key = old["asr_api_key"] if old else ""
+        if not image_api_key or image_api_key.startswith("****"):
+            image_api_key = old["image_api_key"] if old else ""
+        if image_base_url is None:
+            image_base_url = old["image_base_url"] if old else ""
+        if image_model is None:
+            image_model = old["image_model"] if old else ""
+        if image_size is None:
+            image_size = old["image_size"] if old else "1024x1024"
+        image_size = (image_size or "1024x1024").strip()[:32]
+        if image_size != "auto" and not re.fullmatch(r"\d{2,4}x\d{2,4}", image_size):
+            image_size = "1024x1024"
         model = (model or "").strip()[:MAX_LLM_MODEL_ID_LENGTH]
         old_models = _decode_llm_models(old["llm_models_json"], old["llm_model"] or "") if old else []
         model_list = _normalize_llm_models(old_models if models is None else models, model)
@@ -1385,18 +1523,24 @@ def save_settings(user_id, base_url, api_key, model, asr_model=None,
             tavily_keys = normalize_tavily_api_keys(tavily_api_keys)
         conn.execute(
             "INSERT INTO user_settings(user_id, llm_base_url, llm_api_key, llm_model, "
-            "llm_models_json, asr_base_url, asr_api_key, asr_model, tavily_api_keys_json, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "llm_models_json, asr_base_url, asr_api_key, asr_model, tavily_api_keys_json, "
+            "image_base_url, image_api_key, image_model, image_size, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "llm_base_url=excluded.llm_base_url, llm_api_key=excluded.llm_api_key, "
             "llm_model=excluded.llm_model, llm_models_json=excluded.llm_models_json, asr_base_url=excluded.asr_base_url, "
             "asr_api_key=excluded.asr_api_key, asr_model=excluded.asr_model, "
-            "tavily_api_keys_json=excluded.tavily_api_keys_json, updated_at=excluded.updated_at",
+            "tavily_api_keys_json=excluded.tavily_api_keys_json, image_base_url=excluded.image_base_url, "
+            "image_api_key=excluded.image_api_key, image_model=excluded.image_model, "
+            "image_size=excluded.image_size, updated_at=excluded.updated_at",
             (user_id, base_url, api_key, model, json.dumps(model_list, ensure_ascii=False),
              asr_base_url or "", asr_api_key, asr_model,
-             json.dumps(tavily_keys, ensure_ascii=False), now),
+             json.dumps(tavily_keys, ensure_ascii=False), image_base_url or "", image_api_key,
+             (image_model or "").strip()[:MAX_LLM_MODEL_ID_LENGTH], image_size, now),
         )
-        return {"model": model, "models": model_list, "tavily_user_key_count": len(tavily_keys)}
+        return {"model": model, "models": model_list, "tavily_user_key_count": len(tavily_keys),
+                "image_model": (image_model or "").strip()[:MAX_LLM_MODEL_ID_LENGTH],
+                "image_size": image_size}
 
 
 def set_active_llm_model(user_id, model, fallback_models=None):
@@ -1501,6 +1645,9 @@ def delete_work(wid, user_id):
         conn.execute("DELETE FROM plot_state_versions WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM plot_state_proposals WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entity_relations WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM story_sandboxes WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM book_disassembly_chapters WHERE job_id IN (SELECT id FROM book_disassembly_jobs WHERE target_work_id=?)", (wid,))
+        conn.execute("DELETE FROM book_disassembly_jobs WHERE target_work_id=?", (wid,))
         conn.execute("DELETE FROM work_revisions WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE work_id=?)", (wid,))
@@ -1546,6 +1693,348 @@ def update_work_notes(wid, user_id, notes):
         return True
 
 
+# ---------- 可视化大纲 / 情节分支沙盘 ----------
+
+def _sandbox_payload(row, include_data=True):
+    if not row:
+        return None
+    item = dict(row)
+    raw = item.pop("data_json", "{}")
+    if include_data:
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:
+            data = {}
+        item["data"] = data if isinstance(data, dict) else {"nodes": [], "edges": []}
+    return item
+
+
+def list_story_sandboxes(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        rows = conn.execute(
+            "SELECT id,work_id,name,data_json,created_at,updated_at FROM story_sandboxes "
+            "WHERE work_id=? ORDER BY updated_at DESC,id DESC", (wid,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = _sandbox_payload(row)
+            data = item.pop("data")
+            item["node_count"] = len(data.get("nodes") or [])
+            item["edge_count"] = len(data.get("edges") or [])
+            result.append(item)
+        return result
+
+
+def get_story_sandbox(sid, user_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT s.id,s.work_id,s.name,s.data_json,s.created_at,s.updated_at "
+            "FROM story_sandboxes s JOIN works w ON w.id=s.work_id WHERE s.id=? AND w.user_id=?",
+            (sid, user_id),
+        ).fetchone()
+        return _sandbox_payload(row)
+
+
+def create_story_sandbox(wid, user_id, name="主线推演", data=None):
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        clean_name = " ".join((name or "主线推演").split())[:80] or "主线推演"
+        payload = data if isinstance(data, dict) else {"nodes": [], "edges": []}
+        cur = conn.execute(
+            "INSERT INTO story_sandboxes(work_id,name,data_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (wid, clean_name, json.dumps(payload, ensure_ascii=False), now, now),
+        )
+        row = conn.execute(
+            "SELECT id,work_id,name,data_json,created_at,updated_at FROM story_sandboxes WHERE id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return _sandbox_payload(row)
+
+
+def update_story_sandbox(sid, user_id, name=None, data=None):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT s.id FROM story_sandboxes s JOIN works w ON w.id=s.work_id "
+            "WHERE s.id=? AND w.user_id=?", (sid, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        clean_name = None if name is None else (" ".join((name or "").split())[:80] or "未命名沙盘")
+        raw = None if data is None else json.dumps(data, ensure_ascii=False)
+        conn.execute(
+            "UPDATE story_sandboxes SET name=COALESCE(?,name),data_json=COALESCE(?,data_json),updated_at=? WHERE id=?",
+            (clean_name, raw, now, sid),
+        )
+        result = conn.execute(
+            "SELECT id,work_id,name,data_json,created_at,updated_at FROM story_sandboxes WHERE id=?", (sid,),
+        ).fetchone()
+        return _sandbox_payload(result)
+
+
+def delete_story_sandbox(sid, user_id):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM story_sandboxes WHERE id=? AND work_id IN (SELECT id FROM works WHERE user_id=?)",
+            (sid, user_id),
+        )
+        return cur.rowcount > 0
+
+
+# ---------- 拆书任务（逐章落盘，可暂停、重试和续跑） ----------
+
+def _decode_json_object(raw):
+    try:
+        value = json.loads(raw or "{}")
+    except Exception:
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def _disassembly_stats(conn, job_id):
+    found = {"characters": set(), "locations": set(), "items": set(), "organizations": set(), "relations": set()}
+    rows = conn.execute(
+        "SELECT result_json FROM book_disassembly_chapters WHERE job_id=? AND status='done'", (job_id,),
+    )
+    for row in rows:
+        result = _decode_json_object(row["result_json"])
+        for key in ("characters", "locations", "items", "organizations"):
+            for item in result.get(key) or []:
+                if isinstance(item, dict) and item.get("name"):
+                    found[key].add(str(item["name"]).strip())
+        for item in result.get("relations") or []:
+            if isinstance(item, dict):
+                signature = (str(item.get("from") or "").strip(), str(item.get("to") or "").strip(),
+                             str(item.get("relation") or "").strip())
+                if all(signature):
+                    found["relations"].add(signature)
+    return {key: len(values) for key, values in found.items()}
+
+
+def _disassembly_job_payload(conn, row, include_chapters=False):
+    if not row:
+        return None
+    item = dict(row)
+    item["stats"] = _decode_json_object(item.pop("stats_json", "{}"))
+    if include_chapters:
+        chapters = conn.execute(
+            "SELECT id,ord,title,target_chapter_id,status,result_json,error,length(content) AS chars,"
+            "substr(content,1,180) AS excerpt,updated_at FROM book_disassembly_chapters "
+            "WHERE job_id=? ORDER BY ord,id", (item["id"],),
+        ).fetchall()
+        item["chapters"] = []
+        for row_chapter in chapters:
+            chapter = dict(row_chapter)
+            chapter["result"] = _decode_json_object(chapter.pop("result_json", "{}"))
+            item["chapters"].append(chapter)
+    return item
+
+
+def create_disassembly_job(user_id, target_work_id, source_name, strategy, chapters):
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, target_work_id, user_id):
+            return None
+        cur = conn.execute(
+            "INSERT INTO book_disassembly_jobs(user_id,target_work_id,source_name,strategy,status,total_chapters,"
+            "processed_chapters,failed_chapters,stats_json,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (user_id, target_work_id, (source_name or "导入书稿")[:240], strategy, "ready", len(chapters),
+             0, 0, "{}", "", now, now),
+        )
+        job_id = cur.lastrowid
+        next_ord = conn.execute("SELECT COALESCE(MAX(ord),0)+1 FROM chapters WHERE work_id=?", (target_work_id,)).fetchone()[0]
+        for index, item in enumerate(chapters):
+            title = (item.get("title") or f"第{index + 1}章").strip()[:200]
+            content = item.get("content") or ""
+            chapter_cur = conn.execute(
+                "INSERT INTO chapters(work_id,title,ord,content,notes,content_hash,content_revision,analysis_status,"
+                "analysis_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (target_work_id, title, next_ord + index, content, "拆书导入，等待逐章分析", _content_fingerprint(content),
+                 1, "fresh", "", now, now),
+            )
+            conn.execute(
+                "INSERT INTO book_disassembly_chapters(job_id,ord,title,content,target_chapter_id,status,result_json,error,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (job_id, index + 1, title, content, chapter_cur.lastrowid, "pending", "{}", "", now, now),
+            )
+        conn.execute("UPDATE works SET updated_at=? WHERE id=?", (now, target_work_id))
+        row = conn.execute("SELECT * FROM book_disassembly_jobs WHERE id=?", (job_id,)).fetchone()
+        return _disassembly_job_payload(conn, row, True)
+
+
+def list_disassembly_jobs(user_id, target_work_id=None):
+    with get_conn() as conn:
+        params = [user_id]
+        where = "WHERE user_id=?"
+        if target_work_id is not None:
+            if not _work_owned(conn, target_work_id, user_id):
+                return None
+            where += " AND target_work_id=?"
+            params.append(target_work_id)
+        rows = conn.execute(
+            "SELECT * FROM book_disassembly_jobs " + where + " ORDER BY updated_at DESC,id DESC LIMIT 30", params,
+        ).fetchall()
+        return [_disassembly_job_payload(conn, row) for row in rows]
+
+
+def get_disassembly_job(job_id, user_id, include_chapters=True):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM book_disassembly_jobs WHERE id=? AND user_id=?", (job_id, user_id)).fetchone()
+        return _disassembly_job_payload(conn, row, include_chapters)
+
+
+def next_disassembly_chapter(job_id, user_id):
+    with get_conn() as conn:
+        job = conn.execute("SELECT * FROM book_disassembly_jobs WHERE id=? AND user_id=?", (job_id, user_id)).fetchone()
+        if not job:
+            return None
+        row = conn.execute(
+            "SELECT * FROM book_disassembly_chapters WHERE job_id=? AND status='pending' ORDER BY ord,id LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        return {"job": _disassembly_job_payload(conn, job), "chapter": dict(row) if row else None}
+
+
+def set_disassembly_job_status(job_id, user_id, status, error=""):
+    if status not in {"ready", "running", "paused", "partial", "completed", "cancelled"}:
+        return {"invalid_status": True}
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute("SELECT id FROM book_disassembly_jobs WHERE id=? AND user_id=?", (job_id, user_id)).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE book_disassembly_jobs SET status=?,error=?,updated_at=?,finished_at=CASE WHEN ? IN ('partial','completed','cancelled') THEN ? ELSE finished_at END WHERE id=?",
+            (status, (error or "")[:1000], now, status, now, job_id),
+        )
+        result = conn.execute("SELECT * FROM book_disassembly_jobs WHERE id=?", (job_id,)).fetchone()
+        return _disassembly_job_payload(conn, result, True)
+
+
+def _upsert_disassembled_entity(conn, wid, kind, item, now):
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("name") or "").strip()[:160]
+    if not name:
+        return None
+    summary = str(item.get("summary") or item.get("role") or "").strip()[:1000]
+    detail = str(item.get("detail") or item.get("description") or "").strip()[:5000]
+    row = conn.execute("SELECT id,summary,detail FROM entities WHERE work_id=? AND name=? AND kind=?", (wid, name, kind)).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE entities SET summary=CASE WHEN summary='' THEN ? ELSE summary END,"
+            "detail=CASE WHEN detail='' THEN ? ELSE detail END,updated_at=? WHERE id=?",
+            (summary, detail, now, row["id"]),
+        )
+        return row["id"]
+    cur = conn.execute(
+        "INSERT INTO entities(work_id,name,kind,summary,detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+        (wid, name, kind, summary, detail, now, now),
+    )
+    return cur.lastrowid
+
+
+def complete_disassembly_chapter(job_id, user_id, chapter_row_id, result):
+    now = time.time()
+    result = result if isinstance(result, dict) else {}
+    with get_conn() as conn:
+        job = conn.execute("SELECT * FROM book_disassembly_jobs WHERE id=? AND user_id=?", (job_id, user_id)).fetchone()
+        chapter = conn.execute(
+            "SELECT * FROM book_disassembly_chapters WHERE id=? AND job_id=?", (chapter_row_id, job_id),
+        ).fetchone()
+        if not job or not chapter:
+            return None
+        wid = job["target_work_id"]
+        kinds = (("characters", "人物"), ("locations", "地点"), ("items", "物品"), ("organizations", "组织"))
+        for key, kind in kinds:
+            for entity in result.get(key) or []:
+                _upsert_disassembled_entity(conn, wid, kind, entity, now)
+        for relation in result.get("relations") or []:
+            if not isinstance(relation, dict):
+                continue
+            from_name, to_name = str(relation.get("from") or "").strip(), str(relation.get("to") or "").strip()
+            rel = str(relation.get("relation") or "").strip()[:160]
+            if not from_name or not to_name or not rel:
+                continue
+            a = conn.execute("SELECT id FROM entities WHERE work_id=? AND name=? ORDER BY kind='人物' DESC,id LIMIT 1", (wid, from_name)).fetchone()
+            b = conn.execute("SELECT id FROM entities WHERE work_id=? AND name=? ORDER BY kind='人物' DESC,id LIMIT 1", (wid, to_name)).fetchone()
+            if not a or not b or a["id"] == b["id"]:
+                continue
+            exists = conn.execute(
+                "SELECT id FROM entity_relations WHERE work_id=? AND from_entity_id=? AND to_entity_id=? AND relation=?",
+                (wid, a["id"], b["id"], rel),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO entity_relations(work_id,from_entity_id,to_entity_id,relation,detail,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (wid, a["id"], b["id"], rel, str(relation.get("detail") or "")[:2000], "active", now, now),
+                )
+        summary = str(result.get("summary") or "").strip()[:4000]
+        if chapter["target_chapter_id"]:
+            conn.execute(
+                "UPDATE chapters SET workflow_summary=?,notes=CASE WHEN notes LIKE '拆书导入%' THEN ? ELSE notes END,updated_at=? WHERE id=?",
+                (summary, f"拆书分析摘要：\n{summary}" if summary else "拆书导入", now, chapter["target_chapter_id"]),
+            )
+        conn.execute(
+            "UPDATE book_disassembly_chapters SET status='done',result_json=?,error='',updated_at=? WHERE id=?",
+            (json.dumps(result, ensure_ascii=False), now, chapter_row_id),
+        )
+        processed = conn.execute("SELECT COUNT(*) FROM book_disassembly_chapters WHERE job_id=? AND status='done'", (job_id,)).fetchone()[0]
+        failed = conn.execute("SELECT COUNT(*) FROM book_disassembly_chapters WHERE job_id=? AND status='error'", (job_id,)).fetchone()[0]
+        pending = conn.execute("SELECT COUNT(*) FROM book_disassembly_chapters WHERE job_id=? AND status='pending'", (job_id,)).fetchone()[0]
+        stats = _disassembly_stats(conn, job_id)
+        status = job["status"] if job["status"] in {"partial", "cancelled"} else (
+            "completed" if pending == 0 and failed == 0 else "running"
+        )
+        conn.execute(
+            "UPDATE book_disassembly_jobs SET status=?,processed_chapters=?,failed_chapters=?,stats_json=?,error='',updated_at=?,"
+            "finished_at=CASE WHEN ?='completed' THEN ? ELSE finished_at END WHERE id=?",
+            (status, processed, failed, json.dumps(stats, ensure_ascii=False), now, status, now, job_id),
+        )
+        result_row = conn.execute("SELECT * FROM book_disassembly_jobs WHERE id=?", (job_id,)).fetchone()
+        return _disassembly_job_payload(conn, result_row, True)
+
+
+def fail_disassembly_chapter(job_id, user_id, chapter_row_id, error):
+    now = time.time()
+    with get_conn() as conn:
+        job = conn.execute("SELECT id FROM book_disassembly_jobs WHERE id=? AND user_id=?", (job_id, user_id)).fetchone()
+        if not job:
+            return None
+        conn.execute(
+            "UPDATE book_disassembly_chapters SET status='error',error=?,updated_at=? WHERE id=? AND job_id=?",
+            ((error or "")[:1000], now, chapter_row_id, job_id),
+        )
+        failed = conn.execute("SELECT COUNT(*) FROM book_disassembly_chapters WHERE job_id=? AND status='error'", (job_id,)).fetchone()[0]
+        status = "partial" if conn.execute(
+            "SELECT status FROM book_disassembly_jobs WHERE id=?", (job_id,),
+        ).fetchone()["status"] == "partial" else "paused"
+        conn.execute("UPDATE book_disassembly_jobs SET status=?,failed_chapters=?,error=?,updated_at=? WHERE id=?",
+                     (status, failed, (error or "")[:1000], now, job_id))
+        row = conn.execute("SELECT * FROM book_disassembly_jobs WHERE id=?", (job_id,)).fetchone()
+        return _disassembly_job_payload(conn, row, True)
+
+
+def retry_disassembly_chapter(job_id, user_id, chapter_row_id):
+    now = time.time()
+    with get_conn() as conn:
+        if not conn.execute("SELECT id FROM book_disassembly_jobs WHERE id=? AND user_id=?", (job_id, user_id)).fetchone():
+            return None
+        cur = conn.execute(
+            "UPDATE book_disassembly_chapters SET status='pending',error='',updated_at=? WHERE id=? AND job_id=? AND status='error'",
+            (now, chapter_row_id, job_id),
+        )
+        if not cur.rowcount:
+            return {"invalid": True}
+        conn.execute("UPDATE book_disassembly_jobs SET status='ready',error='',updated_at=? WHERE id=?", (now, job_id))
+        row = conn.execute("SELECT * FROM book_disassembly_jobs WHERE id=?", (job_id,)).fetchone()
+        return _disassembly_job_payload(conn, row, True)
+
+
 # ---------- 实体卡片（作品级 wiki）----------
 
 def _state_version_payload(row):
@@ -1572,7 +2061,9 @@ def _state_proposal_payload(row):
 
 def _entity_row(conn, eid, user_id):
     row = conn.execute(
-        "SELECT e.id, e.work_id, e.name, e.kind, e.summary, e.detail, e.created_at, e.updated_at "
+        "SELECT e.id, e.work_id, e.name, e.kind, e.summary, e.detail, e.image_prompt, "
+        "CASE WHEN e.image_path<>'' THEN 1 ELSE 0 END AS has_image, e.image_updated_at, "
+        "e.created_at, e.updated_at "
         "FROM entities e JOIN works w ON e.work_id=w.id WHERE e.id=? AND w.user_id=?",
         (eid, user_id),
     ).fetchone()
@@ -2422,7 +2913,9 @@ def list_entities(wid, user_id, at_chapter_id=None):
         if at_chapter_id is not None and not _chapter_for_work(conn, at_chapter_id, wid):
             return None
         rows = [dict(r) for r in conn.execute(
-            "SELECT id, name, kind, summary, detail, created_at, updated_at "
+            "SELECT id, name, kind, summary, detail, image_prompt, "
+            "CASE WHEN image_path<>'' THEN 1 ELSE 0 END AS has_image, image_updated_at, "
+            "created_at, updated_at "
             "FROM entities WHERE work_id=? ORDER BY kind, id", (wid,)
         )]
         if at_chapter_id is None:
@@ -2478,6 +2971,51 @@ def update_entity(eid, user_id, name, kind, summary, detail):
             (name, kind, summary, detail, now, eid),
         )
         return True
+
+
+def get_entity_image_record(eid, user_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT e.id, e.work_id, e.name, e.kind, e.summary, e.detail, e.image_path, "
+            "e.image_prompt, e.image_updated_at FROM entities e JOIN works w ON w.id=e.work_id "
+            "WHERE e.id=? AND w.user_id=?", (eid, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def save_entity_image(eid, user_id, image_path, prompt):
+    now = time.time()
+    with get_conn() as conn:
+        if not _entity_owned(conn, eid, user_id):
+            return None
+        old = conn.execute("SELECT image_path FROM entities WHERE id=?", (eid,)).fetchone()
+        conn.execute(
+            "UPDATE entities SET image_path=?, image_prompt=?, image_updated_at=?, updated_at=? WHERE id=?",
+            (image_path or "", (prompt or "").strip()[:8000], now, now, eid),
+        )
+        return {"old_path": old["image_path"] if old else "", "image_updated_at": now}
+
+
+def clear_entity_image(eid, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        if not _entity_owned(conn, eid, user_id):
+            return None
+        old = conn.execute("SELECT image_path FROM entities WHERE id=?", (eid,)).fetchone()
+        conn.execute(
+            "UPDATE entities SET image_path='', image_updated_at=NULL, updated_at=? WHERE id=?",
+            (now, eid),
+        )
+        return old["image_path"] if old else ""
+
+
+def list_work_entity_image_paths(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        return [row["image_path"] for row in conn.execute(
+            "SELECT image_path FROM entities WHERE work_id=? AND image_path<>''", (wid,),
+        )]
 
 
 def delete_entity(eid, user_id):
@@ -2547,6 +3085,14 @@ def get_entity_state_overview(eid, user_id, at_chapter_id=None):
                 "ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END, p.id DESC",
                 (eid, at_chapter_id),
             ).fetchall()
+        relation_rows = conn.execute(
+            "SELECT r.id, r.from_entity_id, r.to_entity_id, r.relation, r.detail, r.status, "
+            "a.name AS from_name, b.name AS to_name FROM entity_relations r "
+            "JOIN entities a ON a.id=r.from_entity_id JOIN entities b ON b.id=r.to_entity_id "
+            "WHERE r.work_id=? AND (r.from_entity_id=? OR r.to_entity_id=?) "
+            "ORDER BY r.updated_at DESC, r.id DESC",
+            (entity["work_id"], eid, eid),
+        ).fetchall()
         return {
             "entity": entity,
             "target_chapter": target,
@@ -2554,6 +3100,7 @@ def get_entity_state_overview(eid, user_id, at_chapter_id=None):
             "state_version": version,
             "history": [_state_version_payload(row) for row in history_rows],
             "proposals": [_state_proposal_payload(row) for row in proposal_rows],
+            "relations": [dict(row) for row in relation_rows],
         }
 
 

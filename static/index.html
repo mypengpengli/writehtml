@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ui-20260730-2">
+  <link rel="stylesheet" href="style.css?v=roles-20260813-1">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -95,6 +95,8 @@
             <div class="menu-sep"></div>
             <div class="menu-label">创作资料</div>
             <button data-ic="bulb" data-label="灵感库" onclick="openInspirationLibrary();closeMoreMenu()"></button>
+            <button data-ic="branch" data-label="情节沙盘" onclick="openOutlineSandbox();closeMoreMenu()"></button>
+            <button data-ic="book" data-label="拆书引擎" onclick="openDisassembly();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI Skills" onclick="openSkills();closeMoreMenu()"></button>
             <div class="menu-sep"></div>
             <div class="menu-label">作品与账户</div>
@@ -141,7 +143,10 @@
 
       <div class="editor-surface">
         <div id="draft" class="draft">这里显示你正在说的话…</div>
-        <textarea id="content" class="content" spellcheck="true" lang="zh-CN" placeholder="从这里开始写…"></textarea>
+        <div class="semantic-editor">
+          <div id="semanticLayer" class="semantic-layer" aria-hidden="true"><div id="semanticText" class="semantic-text"></div></div>
+          <textarea id="content" class="content" spellcheck="true" lang="zh-CN" placeholder="从这里开始写…"></textarea>
+        </div>
       </div>
     </main>
 
@@ -446,6 +451,93 @@
     </div>
   </div>
 
+  <!-- 可视化大纲与情节分支沙盘：试错不影响正文，采纳后才创建章节 -->
+  <div id="outlineOverlay" class="overlay sandbox-overlay hidden">
+    <div class="sandbox-shell">
+      <div class="overlay-head sandbox-head">
+        <span>可视化大纲 · 情节分支沙盘</span>
+        <span class="overlay-head-actions">
+          <button class="ic" onclick="syncSandboxChapters()">同步章节</button>
+          <button class="ic" onclick="addSandboxRoot()">新增根节点</button>
+          <button class="ic" onclick="addSandboxBranch()">添加分支</button>
+          <button class="ic" onclick="autoLayoutSandbox()">整理布局</button>
+          <button id="sandboxSaveBtn" onclick="saveOutlineSandbox()">保存</button>
+          <button class="ic" data-ic="x" onclick="closeOutlineSandbox()" title="关闭"></button>
+        </span>
+      </div>
+      <div class="sandbox-body">
+        <aside class="sandbox-list-panel">
+          <div class="sandbox-panel-title"><b>沙盘</b><button class="ic" data-ic="plus" onclick="newOutlineSandbox()" title="新建沙盘"></button></div>
+          <div id="sandboxList" class="sandbox-list"></div>
+          <p class="set-hint">一棵沙盘探索一个假设，沙盘内容不会直接改正文。</p>
+        </aside>
+        <main id="sandboxViewport" class="sandbox-viewport">
+          <div id="sandboxWorld" class="sandbox-world">
+            <svg id="sandboxEdges" class="sandbox-edges" width="2400" height="1600" aria-hidden="true"></svg>
+            <div id="sandboxNodes"></div>
+          </div>
+        </main>
+        <aside class="sandbox-inspector">
+          <div id="sandboxEmptyInspector" class="empty">选择一个节点后编辑或展开分支</div>
+          <div id="sandboxNodeInspector" class="sandbox-node-form hidden">
+            <div class="sandbox-panel-title"><b>节点详情</b><span id="sandboxNodeBadge"></span></div>
+            <label>标题<input id="sandboxNodeTitle" maxlength="160" oninput="updateSelectedSandboxNode()"></label>
+            <label>摘要<textarea id="sandboxNodeSummary" rows="7" maxlength="4000" oninput="updateSelectedSandboxNode()"></textarea></label>
+            <label>层级<select id="sandboxNodeKind" onchange="updateSelectedSandboxNode()"><option value="volume">卷</option><option value="chapter">章</option><option value="plot">情节点</option><option value="choice">选择</option><option value="ending">结局</option></select></label>
+            <label>涉及角色<input id="sandboxNodeCharacters" maxlength="1000" oninput="updateSelectedSandboxNode()" placeholder="林晚、顾川"></label>
+            <div class="set-actions">
+              <button id="sandboxOpenChapterBtn" class="ic" onclick="openSandboxChapter()">打开章节</button>
+              <button id="sandboxAdoptBtn" onclick="adoptSandboxNode()">采纳为新章节</button>
+              <button class="ic danger-lite" onclick="deleteSelectedSandboxNode()">删除节点</button>
+            </div>
+            <hr class="sep">
+            <label>AI 展开要求<input id="sandboxAiInstruction" maxlength="1000" placeholder="例如：三条路线都不要让反派立刻现身"></label>
+            <button id="sandboxAiBtn" onclick="expandSandboxNode()">AI 展开三个候选</button>
+            <div id="sandboxCandidates" class="sandbox-candidates"></div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <!-- 拆书引擎：文件切章、逐章分析、随时暂停续跑 -->
+  <div id="disassemblyOverlay" class="overlay hidden">
+    <div class="overlay-card disassembly-card">
+      <div class="overlay-head">
+        <span>拆书引擎</span>
+        <span class="overlay-head-actions"><button class="ic" data-ic="x" onclick="closeDisassembly()"></button></span>
+      </div>
+      <div class="disassembly-body">
+        <section class="disassembly-prepare">
+          <div class="settings-section-head"><b>导入书稿</b><span>TXT / Markdown / Word / PDF / EPUB</span></div>
+          <input id="disassemblyFile" type="file" accept=".txt,.md,.docx,.pdf,.epub,text/plain,application/pdf" onchange="previewDisassemblyFile()">
+          <div id="disassemblyFileMeta" class="set-hint">选择文件后自动识别章节；开始前会显示切章结果。</div>
+          <label>目标<select id="disassemblyMode" onchange="updateDisassemblyMode()"><option value="merge">合入当前作品</option><option value="new">新建拆书作品</option></select></label>
+          <label id="disassemblyTitleRow" class="hidden">新作品名称<input id="disassemblyTitle" maxlength="200" placeholder="默认使用文件名"></label>
+          <label>策略<select id="disassemblyStrategy"><option value="close_reading">逐章精读（稳，适合短中篇）</option><option value="skeleton_first">骨架优先（快，适合长篇）</option></select></label>
+          <button id="disassemblyPrepareBtn" onclick="prepareDisassembly()">上传并自动切章</button>
+          <span id="disassemblyPrepareMsg" class="msg"></span>
+        </section>
+        <section class="disassembly-progress-panel">
+          <div class="settings-section-head"><b>任务进度</b><select id="disassemblyJobSwitch" onchange="switchDisassemblyJob(this.value)"><option value="">暂无任务</option></select></div>
+          <div id="disassemblyEmpty" class="empty">上传一本书后，这里会显示切章预览和逐章提取进度。</div>
+          <div id="disassemblyJob" class="hidden">
+            <div class="disassembly-job-head"><b id="disassemblyJobName"></b><span id="disassemblyJobStatus"></span></div>
+            <div class="disassembly-progress"><span id="disassemblyProgressBar"></span></div>
+            <div id="disassemblyStats" class="disassembly-stats"></div>
+            <div class="set-actions">
+              <button id="disassemblyStartBtn" onclick="startDisassembly()">开始 / 继续分析</button>
+              <button id="disassemblyPauseBtn" class="ic" onclick="pauseDisassembly()">暂停</button>
+              <button id="disassemblyFinishBtn" class="ic" onclick="finishDisassembly()">停止并保存已有结果</button>
+            </div>
+            <p class="set-hint">每分析完一章就立即保存摘要、人物、地点、物品和关系；关闭页面后也能从任务列表继续。</p>
+            <div id="disassemblyChapters" class="disassembly-chapters"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
   <!-- 版本对比 -->
   <div id="diffOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
@@ -502,7 +594,15 @@
           <label>查看时点<select id="characterStateChapter" onchange="changeCharacterStateChapter()"></select></label>
           <span id="characterStateMeta" class="character-state-meta"></span>
         </div>
-        <div id="characterStateBase" class="character-state-base"></div>
+        <div class="character-profile">
+          <div id="characterStatePortrait" class="character-portrait character-portrait-lg"></div>
+          <div class="character-profile-main">
+            <div id="characterStateBase" class="character-state-base"></div>
+            <div class="character-profile-actions">
+              <button class="ic" data-ic="image" onclick="openEntityImage(characterStateEntityId)">生成 / 管理角色图</button>
+            </div>
+          </div>
+        </div>
         <div id="characterStateProposals" class="character-state-proposals"></div>
         <section class="character-state-section">
           <div class="character-state-section-head"><b>当前状态</b><span id="characterStateSource" class="character-state-meta"></span></div>
@@ -525,9 +625,37 @@
           <span id="characterStateMsg" class="msg"></span>
         </section>
         <section class="character-state-section">
+          <div class="character-state-section-head"><b>人物关系</b><span class="character-state-meta">随人物档案一起查看</span></div>
+          <div id="characterStateRelations" class="character-relations"></div>
+        </section>
+        <section class="character-state-section">
           <div class="character-state-section-head"><b>成长记录</b></div>
           <div id="characterStateHistory" class="character-state-history"></div>
         </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 角色形象生成 -->
+  <div id="entityImageOverlay" class="overlay hidden" onclick="if(event.target===this)closeEntityImage()">
+    <div class="overlay-card entity-image-card">
+      <div class="overlay-head">
+        <span id="entityImageTitle">角色形象</span>
+        <button class="ic" data-ic="x" onclick="closeEntityImage()" title="关闭"></button>
+      </div>
+      <div class="entity-image-body">
+        <div id="entityImagePreview" class="entity-image-preview"></div>
+        <div class="entity-image-controls">
+          <label>角色形象提示词<textarea id="entityImagePrompt" rows="9" maxlength="8000" placeholder="描述外貌、服装、神态、构图和画风…"></textarea></label>
+          <label>补充画风<input id="entityImageStyle" maxlength="1000" placeholder="例如：电影感写实、东方奇幻、柔和侧光"></label>
+          <label>图片尺寸<select id="entityImageSize"><option>1024x1024</option><option>1024x1536</option><option>1536x1024</option><option>512x512</option><option>auto</option></select></label>
+          <p class="set-hint">提示词会保存在人物卡上；再次生成会替换旧图。服务地址、Key 和模型 ID 在“模型与联网设置”中配置。</p>
+          <div class="set-actions">
+            <button id="entityImageGenerateBtn" onclick="generateEntityImage()">生成角色图</button>
+            <button id="entityImageDeleteBtn" class="ic danger-lite" onclick="deleteEntityImage()">删除图片</button>
+          </div>
+          <span id="entityImageMsg" class="msg"></span>
+        </div>
       </div>
     </div>
   </div>
@@ -586,6 +714,7 @@
 
   <!-- @提及悬浮卡 -->
   <div id="mentionPop" class="mention-pop hidden"></div>
+  <div id="semanticPop" class="mention-pop semantic-pop hidden"></div>
 
   <!-- 模型与联网设置 -->
   <div id="setOverlay" class="overlay hidden">
@@ -612,6 +741,17 @@
         </div>
         <p class="set-hint">输入内容会整体替换当前 Key 池；留空则保持不变。Agent 会逐次轮换，当前 Key 不可用时自动尝试下一条。</p>
         <label id="clearTavilyKeysRow" class="set-row hidden"><input id="clearTavilyKeys" type="checkbox"> 清空我保存的搜索 Key</label>
+        <hr class="sep settings-sep">
+        <div class="settings-section-head"><b>角色生图</b><span>OpenAI 兼容接口</span></div>
+        <label>生图服务 Base URL</label>
+        <input id="setImageBaseUrl" placeholder="留空则沿用文字模型 Base URL">
+        <label>生图服务 API Key</label>
+        <input id="setImageApiKey" type="password" placeholder="留空则沿用文字模型 Key">
+        <label>生图模型 ID</label>
+        <input id="setImageModel" placeholder="例如：gpt-image-1 或中转站提供的模型 ID">
+        <label>默认图片尺寸</label>
+        <select id="setImageSize"><option>1024x1024</option><option>1024x1536</option><option>1536x1024</option><option>512x512</option><option>auto</option></select>
+        <p class="set-hint">请求会发送到 <code>Base URL/images/generations</code>。地址与 Key 留空时沿用文字模型配置，但仍需填写实际可用的生图模型 ID。</p>
         <hr class="sep settings-sep">
         <label class="set-row voice-mode-row"><input id="setVoiceDirect" type="checkbox" onchange="updateVoiceSettingHint()"> 直接发送语音给 AI（不转写）</label>
         <p id="voiceModeHint" class="set-hint voice-mode-hint"></p>
@@ -704,6 +844,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=ui-20260730-2"></script>
+  <script src="app.js?v=roles-20260813-1"></script>
 </body>
 </html>

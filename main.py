@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-import config, context_builder, db, inspiration, llm, pi_agent, skill_runtime, tavily_search
+import config, context_builder, db, image_generation, inspiration, llm, pi_agent, skill_runtime, tavily_search
 
 app = FastAPI(title="写作")
 db.init_db()
@@ -231,6 +231,7 @@ async def get_settings(request: Request):
     masked = ("****" + key[-4:]) if key else ""
     model, models = _model_options(s)
     tavily_keys, tavily_user_keys, tavily_source = _tavily_key_state(s)
+    image_key = s.get("image_api_key") or key or config.LLM_API_KEY
     return {
         "base_url": s.get("llm_base_url") or config.LLM_BASE_URL,
         "api_key_masked": masked,
@@ -245,6 +246,12 @@ async def get_settings(request: Request):
         "tavily_user_key_count": len(tavily_user_keys),
         "tavily_key_source": tavily_source,
         "tavily_api_key_masks": [_mask_key(value) for value in tavily_user_keys],
+        "image_base_url": s.get("image_base_url") or "",
+        "image_api_key_masked": _mask_key(image_key),
+        "image_has_key": bool(image_key),
+        "image_uses_text_service": not bool(s.get("image_base_url") or s.get("image_api_key")),
+        "image_model": s.get("image_model") or "",
+        "image_size": s.get("image_size") or "1024x1024",
     }
 
 
@@ -262,6 +269,10 @@ async def save_settings(request: Request):
         (body.get("asr_api_key") or "").strip(),
         _model_options_payload(body),
         _tavily_keys_payload(body),
+        image_base_url=(body.get("image_base_url") or "").strip() if "image_base_url" in body else None,
+        image_api_key=(body.get("image_api_key") or "").strip() if "image_api_key" in body else None,
+        image_model=(body.get("image_model") or "").strip() if "image_model" in body else None,
+        image_size=(body.get("image_size") or "").strip() if "image_size" in body else None,
     )
     _reset_tavily_client(uid)
     saved = db.get_settings(uid) or {}
@@ -492,8 +503,12 @@ async def new_work(request: Request):
 
 @app.delete("/api/works/{wid}")
 async def del_work(wid: int, request: Request):
-    if not db.delete_work(wid, _auth(request)):
+    uid = _auth(request)
+    image_paths = db.list_work_entity_image_paths(wid, uid)
+    if image_paths is None or not db.delete_work(wid, uid):
         raise HTTPException(404, "作品不存在")
+    for image_path in image_paths:
+        image_generation.remove_image(image_path)
     return {"ok": True}
 
 
@@ -511,6 +526,161 @@ async def save_work_notes(wid: int, request: Request):
     if not db.update_work_notes(wid, _auth(request), body.get("notes", "")):
         raise HTTPException(404, "作品不存在")
     return {"ok": True}
+
+
+# ---------- 可视化大纲 / 情节分支沙盘 ----------
+
+def _normalize_sandbox_data(data, wid, uid):
+    if not isinstance(data, dict):
+        raise HTTPException(400, "沙盘数据格式不正确")
+    raw_nodes, raw_edges = data.get("nodes"), data.get("edges")
+    if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list):
+        raise HTTPException(400, "沙盘节点或连线格式不正确")
+    if len(raw_nodes) > 500 or len(raw_edges) > 1000:
+        raise HTTPException(400, "单个沙盘最多 500 个节点和 1000 条连线")
+    chapter_ids = {item["id"] for item in (db.list_chapters(wid, uid) or [])}
+    nodes, seen = [], set()
+    for raw in raw_nodes:
+        if not isinstance(raw, dict):
+            continue
+        node_id = str(raw.get("id") or "").strip()[:80]
+        if not node_id or node_id in seen:
+            continue
+        seen.add(node_id)
+        try:
+            x = max(0.0, min(10000.0, float(raw.get("x", 0))))
+            y = max(0.0, min(10000.0, float(raw.get("y", 0))))
+        except (TypeError, ValueError):
+            x = y = 0.0
+        chapter_id = raw.get("chapter_id")
+        if chapter_id not in chapter_ids:
+            chapter_id = None
+        kind = raw.get("kind") if raw.get("kind") in {"volume", "chapter", "plot", "choice", "ending"} else "plot"
+        direction = raw.get("direction") if raw.get("direction") in {"发散", "收束", "推进", ""} else ""
+        characters = raw.get("characters")
+        if isinstance(characters, list):
+            characters = "、".join(str(item).strip() for item in characters if str(item).strip())
+        nodes.append({
+            "id": node_id, "title": str(raw.get("title") or "未命名情节点").strip()[:160] or "未命名情节点",
+            "summary": str(raw.get("summary") or "").strip()[:4000], "kind": kind,
+            "direction": direction, "characters": str(characters or "").strip()[:1000],
+            "chapter_id": chapter_id, "x": round(x, 2), "y": round(y, 2),
+            "collapsed": bool(raw.get("collapsed")),
+        })
+    edges, edge_seen = [], set()
+    for raw in raw_edges:
+        if not isinstance(raw, dict):
+            continue
+        source, target = str(raw.get("from") or "")[:80], str(raw.get("to") or "")[:80]
+        if source not in seen or target not in seen or source == target:
+            continue
+        edge_id = str(raw.get("id") or f"{source}-{target}").strip()[:120]
+        if not edge_id or edge_id in edge_seen:
+            continue
+        edge_seen.add(edge_id)
+        edges.append({"id": edge_id, "from": source, "to": target,
+                      "label": str(raw.get("label") or "").strip()[:160]})
+    return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/api/works/{wid}/sandboxes")
+async def list_sandboxes(wid: int, request: Request):
+    result = db.list_story_sandboxes(wid, _auth(request))
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return result
+
+
+@app.post("/api/works/{wid}/sandboxes")
+async def create_sandbox(wid: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    data = _normalize_sandbox_data(body.get("data") or {"nodes": [], "edges": []}, wid, uid)
+    result = db.create_story_sandbox(wid, uid, body.get("name") or "主线推演", data)
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return result
+
+
+@app.get("/api/sandboxes/{sid}")
+async def get_sandbox(sid: int, request: Request):
+    result = db.get_story_sandbox(sid, _auth(request))
+    if not result:
+        raise HTTPException(404, "沙盘不存在")
+    return result
+
+
+@app.put("/api/sandboxes/{sid}")
+async def save_sandbox(sid: int, request: Request):
+    uid = _auth(request)
+    current = db.get_story_sandbox(sid, uid)
+    if not current:
+        raise HTTPException(404, "沙盘不存在")
+    body = await request.json()
+    data = _normalize_sandbox_data(body["data"], current["work_id"], uid) if "data" in body else None
+    return db.update_story_sandbox(sid, uid, body.get("name") if "name" in body else None, data)
+
+
+@app.delete("/api/sandboxes/{sid}")
+async def delete_sandbox(sid: int, request: Request):
+    if not db.delete_story_sandbox(sid, _auth(request)):
+        raise HTTPException(404, "沙盘不存在")
+    return {"ok": True}
+
+
+@app.post("/api/sandboxes/{sid}/expand")
+async def expand_sandbox_node(sid: int, request: Request):
+    uid = _auth(request)
+    sandbox = db.get_story_sandbox(sid, uid)
+    if not sandbox:
+        raise HTTPException(404, "沙盘不存在")
+    body = await request.json()
+    node_id = str(body.get("node_id") or "")
+    node = next((item for item in sandbox["data"].get("nodes", []) if item.get("id") == node_id), None)
+    if not node:
+        raise HTTPException(404, "情节点不存在")
+    settings = db.get_settings(uid) or {}
+    base_url = settings.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = settings.get("llm_api_key") or config.LLM_API_KEY
+    model = settings.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        raise HTTPException(500, "未配置 API Key，请先在设置中配置文字模型")
+    work = db.get_work(sandbox["work_id"], uid) or {}
+    notes = (work.get("notes") or "")[:6000]
+    instruction = str(body.get("instruction") or "").strip()[:1000]
+    prompt = (
+        "请为小说情节沙盘中的当前节点生成三个明显不同、可以继续写下去的候选子节点。"
+        "三个方向依次必须是：发散（开启新可能）、收束（回收已有线索）、推进（顺势推进冲突）。"
+        "只输出 JSON 数组，每项字段为 title、summary、direction、characters；不要 Markdown。\n"
+        f"作品设定：{notes or '未提供'}\n当前节点标题：{node.get('title')}\n"
+        f"当前节点摘要：{node.get('summary') or '未填写'}\n作者补充要求：{instruction or '无'}"
+    )
+    try:
+        parsed = _parse_json_from_model(llm.chat(
+            [{"role": "system", "content": "你是小说策划编辑，候选分支要互有差异且不替作者强行定稿。"},
+             {"role": "user", "content": prompt}],
+            base_url=base_url, api_key=api_key, model=model,
+        ))
+    except Exception as exc:
+        raise HTTPException(502, f"AI 展开失败：{_provider_error(exc)}") from exc
+    if isinstance(parsed, dict):
+        parsed = parsed.get("candidates") or parsed.get("branches") or []
+    if not isinstance(parsed, list):
+        parsed = []
+    directions = ("发散", "收束", "推进")
+    candidates = []
+    for index, raw in enumerate(parsed[:3]):
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title") or "").strip()[:160]
+        summary = str(raw.get("summary") or raw.get("content") or "").strip()[:2000]
+        if title and summary:
+            candidates.append({"title": title, "summary": summary,
+                               "direction": raw.get("direction") if raw.get("direction") in directions else directions[index],
+                               "characters": str(raw.get("characters") or "").strip()[:1000]})
+    if not candidates:
+        raise HTTPException(502, "AI 没有返回可用的分支候选")
+    return {"candidates": candidates}
 
 
 # ---------- 实体卡片（作品级 wiki）----------
@@ -553,8 +723,107 @@ async def save_entity(eid: int, request: Request):
 
 @app.delete("/api/entities/{eid}")
 async def del_entity(eid: int, request: Request):
-    if not db.delete_entity(eid, _auth(request)):
+    uid = _auth(request)
+    image = db.get_entity_image_record(eid, uid)
+    if not db.delete_entity(eid, uid):
         raise HTTPException(404, "实体不存在")
+    if image:
+        image_generation.remove_image(image.get("image_path"))
+    return {"ok": True}
+
+
+def _default_character_image_prompt(entity, state=None):
+    parts = [
+        "小说角色设定图，单人角色肖像，主体清晰，构图完整，统一美术设定，无文字、无水印。",
+        f"角色名：{entity['name']}。",
+    ]
+    if entity.get("summary"):
+        parts.append(f"人物摘要：{entity['summary']}。")
+    if entity.get("detail"):
+        parts.append(f"外貌、性格与背景设定：{entity['detail']}。")
+    state = state if isinstance(state, dict) else {}
+    live = "；".join(f"{key}：{value}" for key, value in {
+        "所在地点": state.get("location"), "情绪": state.get("emotion"),
+        "身体状态": state.get("physical"), "能力与物品": state.get("assets"),
+    }.items() if value)
+    if live:
+        parts.append(f"当前剧情状态：{live}。")
+    return "\n".join(parts)[:8000]
+
+
+def _image_provider_settings(uid):
+    settings = db.get_settings(uid) or {}
+    return {
+        "base_url": settings.get("image_base_url") or settings.get("llm_base_url") or config.LLM_BASE_URL,
+        "api_key": settings.get("image_api_key") or settings.get("llm_api_key") or config.LLM_API_KEY,
+        "model": settings.get("image_model") or "",
+        "size": settings.get("image_size") or "1024x1024",
+    }
+
+
+@app.get("/api/entities/{eid}/image")
+async def get_entity_image(eid: int, request: Request):
+    record = db.get_entity_image_record(eid, _auth(request))
+    if not record:
+        raise HTTPException(404, "实体不存在")
+    if not record.get("image_path"):
+        raise HTTPException(404, "尚未生成角色图片")
+    try:
+        path = image_generation.resolve_image_path(record["image_path"])
+    except image_generation.ImageGenerationError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(404, "角色图片文件不存在")
+    return FileResponse(path, media_type=image_generation.image_media_type(path),
+                        headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/api/entities/{eid}/image/generate")
+async def generate_entity_image(eid: int, request: Request):
+    uid = _auth(request)
+    entity = db.get_entity_image_record(eid, uid)
+    if not entity:
+        raise HTTPException(404, "实体不存在")
+    if entity.get("kind") != "人物":
+        raise HTTPException(400, "当前版本只为人物卡生成角色图")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求格式不正确")
+    chapter_id = body.get("chapter_id")
+    state = None
+    if isinstance(chapter_id, int):
+        overview = db.get_entity_state_overview(eid, uid, chapter_id)
+        if overview and not overview.get("invalid_chapter"):
+            state = overview.get("current_state")
+    prompt = (body.get("prompt") or entity.get("image_prompt") or
+              _default_character_image_prompt(entity, state)).strip()[:8000]
+    style = (body.get("style") or "").strip()[:1000]
+    if style:
+        prompt = f"{prompt}\n画面风格：{style}"[:8000]
+    provider = _image_provider_settings(uid)
+    size = (body.get("size") or provider["size"]).strip()[:32]
+    try:
+        data, content_type = await image_generation.generate_image(
+            provider["base_url"], provider["api_key"], provider["model"], prompt, size,
+        )
+        relative_path, _ = image_generation.save_image(uid, eid, data, content_type)
+    except image_generation.ImageGenerationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    saved = db.save_entity_image(eid, uid, relative_path, prompt)
+    if not saved:
+        image_generation.remove_image(relative_path)
+        raise HTTPException(404, "实体不存在")
+    image_generation.remove_image(saved.get("old_path"))
+    return {"ok": True, "entity_id": eid, "has_image": True,
+            "image_prompt": prompt, "image_updated_at": saved["image_updated_at"]}
+
+
+@app.delete("/api/entities/{eid}/image")
+async def delete_entity_image(eid: int, request: Request):
+    old_path = db.clear_entity_image(eid, _auth(request))
+    if old_path is None:
+        raise HTTPException(404, "实体不存在")
+    image_generation.remove_image(old_path)
     return {"ok": True}
 
 
@@ -1644,6 +1913,277 @@ async def extract_agent_document(request: Request):
     if not filename:
         raise HTTPException(400, "附件文件名无效")
     return _extract_agent_document(filename, data)
+
+
+# ---------- 拆书引擎：切章预览、逐章分析、暂停续跑 ----------
+
+def _epub_text(data):
+    import html as html_lib
+    import posixpath
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        if sum(item.file_size for item in archive.infolist()) > 300 * 1024 * 1024:
+            raise HTTPException(413, "EPUB 解压后过大")
+        names = set(archive.namelist())
+        ordered = []
+        try:
+            container = ET.fromstring(archive.read("META-INF/container.xml"))
+            rootfile = next(node for node in container.iter() if node.tag.endswith("rootfile"))
+            opf_path = rootfile.attrib["full-path"]
+            opf = ET.fromstring(archive.read(opf_path))
+            manifest = {node.attrib.get("id"): node.attrib.get("href") for node in opf.iter() if node.tag.endswith("item")}
+            base = posixpath.dirname(opf_path)
+            for node in opf.iter():
+                if not node.tag.endswith("itemref"):
+                    continue
+                href = manifest.get(node.attrib.get("idref"))
+                if href:
+                    path = posixpath.normpath(posixpath.join(base, href)).split("#", 1)[0]
+                    if path in names:
+                        ordered.append(path)
+        except Exception:
+            ordered = []
+        if not ordered:
+            ordered = sorted(name for name in names if name.lower().endswith((".xhtml", ".html", ".htm")))
+        blocks = []
+        for path in ordered:
+            raw = archive.read(path)
+            page = raw.decode("utf-8", errors="ignore")
+            page = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", "", page, flags=re.I | re.S)
+            page = re.sub(r"</?(?:p|div|h[1-6]|li|br|section|article)\b[^>]*>", "\n", page, flags=re.I)
+            page = html_lib.unescape(re.sub(r"<[^>]+>", "", page))
+            page = re.sub(r"[ \t]+", " ", page)
+            page = re.sub(r"\n{3,}", "\n\n", page).strip()
+            if page:
+                blocks.append(page)
+        return "\n\n".join(blocks)
+
+
+def _extract_book_document(filename, data):
+    ext = "." + filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext not in {".txt", ".md", ".docx", ".pdf", ".epub"}:
+        raise HTTPException(400, "拆书支持 .txt、.md、.docx、.pdf 和 .epub")
+    try:
+        if ext in {".txt", ".md"}:
+            text = _decode_agent_text_document(data)
+        elif ext == ".epub":
+            text = _epub_text(data)
+        elif ext == ".docx":
+            from docx import Document
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                if sum(item.file_size for item in archive.infolist()) > 200 * 1024 * 1024:
+                    raise HTTPException(413, "Word 文档解压后过大")
+            document = Document(io.BytesIO(data))
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
+        else:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            if reader.is_encrypted and not reader.decrypt(""):
+                raise HTTPException(422, "PDF 已加密，请先解除密码")
+            text = "\n\n".join((page.extract_text() or "").strip() for page in reader.pages if (page.extract_text() or "").strip())
+    except HTTPException:
+        raise
+    except (zipfile.BadZipFile, KeyError, ValueError) as exc:
+        raise HTTPException(422, f"书稿损坏或格式不正确：{_provider_error(exc, 120)}") from exc
+    except Exception as exc:
+        raise HTTPException(422, f"无法读取书稿：{_provider_error(exc, 160)}") from exc
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        raise HTTPException(422, "书稿中没有可读取的文字；扫描版 PDF 暂不支持 OCR")
+    if len(text) > config.BOOK_DISASSEMBLY_MAX_CHARS:
+        raise HTTPException(413, f"书稿超过 {config.BOOK_DISASSEMBLY_MAX_CHARS} 字的单次拆书上限")
+    return text
+
+
+_BOOK_HEADING = re.compile(
+    r"(?m)^\s*((?:第[0-9零〇一二三四五六七八九十百千万两]+[卷部篇章节回集][^\n]{0,60})|(?:chapter\s+[0-9ivxlcdm]+[^\n]{0,60}))\s*$",
+    re.I,
+)
+
+
+def _split_book_chapters(text):
+    matches = list(_BOOK_HEADING.finditer(text))
+    chapters = []
+    if len(matches) >= 2:
+        prefix = text[:matches[0].start()].strip()
+        if prefix:
+            chapters.append({"title": "前言", "content": prefix})
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            title = " ".join(match.group(1).split())[:200]
+            content = text[match.end():end].strip()
+            if content:
+                chapters.append({"title": title, "content": content})
+    else:
+        max_chars = 12000
+        remaining, index = text, 1
+        while remaining:
+            if len(remaining) <= max_chars:
+                chunk, remaining = remaining, ""
+            else:
+                cut = remaining.rfind("\n\n", 0, max_chars)
+                if cut < max_chars // 2:
+                    cut = remaining.rfind("\n", 0, max_chars)
+                if cut < max_chars // 2:
+                    cut = max_chars
+                chunk, remaining = remaining[:cut], remaining[cut:]
+            if chunk.strip():
+                chapters.append({"title": f"第{index}部分", "content": chunk.strip()})
+                index += 1
+    expanded = []
+    for chapter in chapters:
+        content = chapter["content"]
+        if len(content) <= 80000:
+            expanded.append(chapter)
+            continue
+        for offset in range(0, len(content), 60000):
+            expanded.append({"title": f"{chapter['title']}（{offset // 60000 + 1}）", "content": content[offset:offset + 60000]})
+    if not expanded:
+        raise HTTPException(422, "未能从书稿中切分出有效内容")
+    if len(expanded) > 1000:
+        raise HTTPException(413, "自动切分超过 1000 章，请先分卷后再导入")
+    return expanded
+
+
+def _normalize_disassembly_result(parsed):
+    if not isinstance(parsed, dict):
+        raise ValueError("模型没有返回 JSON 对象")
+    result = {"summary": str(parsed.get("summary") or parsed.get("outline") or "").strip()[:4000],
+              "style_notes": str(parsed.get("style_notes") or "").strip()[:3000]}
+    for key in ("characters", "locations", "items", "organizations", "relations"):
+        values = parsed.get(key) or []
+        result[key] = [item for item in values[:80] if isinstance(item, dict)] if isinstance(values, list) else []
+    if not result["summary"]:
+        raise ValueError("模型没有返回章节摘要")
+    return result
+
+
+@app.get("/api/disassembly/jobs")
+async def list_disassembly_jobs(request: Request):
+    uid = _auth(request)
+    work_id = _qparam_int(request, "work_id")
+    result = db.list_disassembly_jobs(uid, work_id)
+    if result is None:
+        raise HTTPException(404, "作品不存在")
+    return result
+
+
+@app.post("/api/disassembly/prepare")
+async def prepare_disassembly(request: Request):
+    uid = _auth(request)
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "没有收到书稿")
+    if len(data) > config.BOOK_DISASSEMBLY_MAX_BYTES:
+        raise HTTPException(413, "书稿文件过大")
+    filename = unquote(request.headers.get("X-File-Name") or "导入书稿")
+    filename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()[:240]
+    strategy = request.headers.get("X-Disassembly-Strategy") or "close_reading"
+    if strategy not in {"close_reading", "skeleton_first"}:
+        raise HTTPException(400, "拆书策略无效")
+    mode = request.headers.get("X-Disassembly-Mode") or "merge"
+    if mode not in {"new", "merge"}:
+        raise HTTPException(400, "拆书目标模式无效")
+    text = _extract_book_document(filename, data)
+    chapters = _split_book_chapters(text)
+    created_work = None
+    if mode == "new":
+        title = unquote(request.headers.get("X-Project-Title") or "").strip()[:200]
+        if not title:
+            title = filename.rsplit(".", 1)[0][:200] or "拆书项目"
+        created_work = db.create_work(uid, title)
+        target_work_id = created_work["id"]
+    else:
+        try:
+            target_work_id = int(request.headers.get("X-Target-Work-Id") or 0)
+        except ValueError:
+            target_work_id = 0
+        if not db.get_work(target_work_id, uid):
+            raise HTTPException(404, "目标作品不存在")
+    job = db.create_disassembly_job(uid, target_work_id, filename, strategy, chapters)
+    if not job:
+        raise HTTPException(404, "目标作品不存在")
+    return {"job": job, "created_work": created_work,
+            "source_chars": len(text), "chapter_count": len(chapters)}
+
+
+@app.get("/api/disassembly/jobs/{job_id}")
+async def get_disassembly_job(job_id: int, request: Request):
+    result = db.get_disassembly_job(job_id, _auth(request), True)
+    if not result:
+        raise HTTPException(404, "拆书任务不存在")
+    return result
+
+
+@app.post("/api/disassembly/jobs/{job_id}/step")
+async def run_disassembly_step(job_id: int, request: Request):
+    uid = _auth(request)
+    next_item = db.next_disassembly_chapter(job_id, uid)
+    if not next_item:
+        raise HTTPException(404, "拆书任务不存在")
+    job, chapter = next_item["job"], next_item["chapter"]
+    if job["status"] in {"partial", "completed", "cancelled"}:
+        return {"ok": True, "job": db.get_disassembly_job(job_id, uid, True)}
+    if not chapter:
+        status = "paused" if job["failed_chapters"] else "completed"
+        return {"ok": True, "job": db.set_disassembly_job_status(job_id, uid, status)}
+    settings = db.get_settings(uid) or {}
+    base_url = settings.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = settings.get("llm_api_key") or config.LLM_API_KEY
+    model = settings.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        raise HTTPException(500, "未配置 API Key，请先在设置中配置拆书使用的文字模型")
+    db.set_disassembly_job_status(job_id, uid, "running")
+    content = chapter["content"][:max(2000, config.BOOK_DISASSEMBLY_CHAPTER_AI_CHARS)]
+    existing = db.get_entity_digest(job["target_work_id"], uid)[:6000]
+    strategy_hint = "逐章精读，关注本章新增事实与跨章变化" if job["strategy"] == "close_reading" else "先抓主线骨架、关键转折和核心人物"
+    prompt = (
+        f"请拆解小说章节《{chapter['title']}》。策略：{strategy_hint}。\n"
+        "只输出 JSON 对象，字段：summary（剧情摘要）；characters/locations/items/organizations（数组，每项 name,summary,detail）；"
+        "relations（数组，每项 from,to,relation,detail）；style_notes（文风和技法）。不要 Markdown。"
+        "同名实体沿用已有名称，不要为称呼变化重复建卡。\n"
+        f"已有设定：\n{existing or '暂无'}\n\n章节正文：\n{content}"
+    )
+    try:
+        parsed = _parse_json_from_model(llm.chat(
+            [{"role": "system", "content": "你是长篇小说拆书编辑，必须以原文证据为准，不虚构未出现的设定。"},
+             {"role": "user", "content": prompt}],
+            base_url=base_url, api_key=api_key, model=model,
+        ))
+        result = _normalize_disassembly_result(parsed)
+        updated = db.complete_disassembly_chapter(job_id, uid, chapter["id"], result)
+        return {"ok": True, "chapter_id": chapter["id"], "result": result, "job": updated}
+    except Exception as exc:
+        message = _provider_error(exc, 500)
+        failed = db.fail_disassembly_chapter(job_id, uid, chapter["id"], message)
+        return {"ok": False, "chapter_id": chapter["id"], "error": message, "job": failed}
+
+
+@app.post("/api/disassembly/jobs/{job_id}/pause")
+async def pause_disassembly(job_id: int, request: Request):
+    result = db.set_disassembly_job_status(job_id, _auth(request), "paused")
+    if not result:
+        raise HTTPException(404, "拆书任务不存在")
+    return result
+
+
+@app.post("/api/disassembly/jobs/{job_id}/finish")
+async def finish_disassembly(job_id: int, request: Request):
+    result = db.set_disassembly_job_status(job_id, _auth(request), "partial")
+    if not result:
+        raise HTTPException(404, "拆书任务不存在")
+    return result
+
+
+@app.post("/api/disassembly/jobs/{job_id}/chapters/{chapter_id}/retry")
+async def retry_disassembly(job_id: int, chapter_id: int, request: Request):
+    result = db.retry_disassembly_chapter(job_id, _auth(request), chapter_id)
+    if result is None:
+        raise HTTPException(404, "拆书任务不存在")
+    if result.get("invalid"):
+        raise HTTPException(409, "该章节当前不需要重试")
+    return result
 
 
 @app.post("/api/asr")
@@ -4533,6 +5073,7 @@ async def admin_delete_user(request: Request, target_uid: int):
     if not db.admin_delete_user(target_uid):
         raise HTTPException(404, "用户不存在")
     inspiration.delete_user_files(target_uid)
+    image_generation.remove_user_images(target_uid)
     _reset_tavily_client(target_uid)
     return {"ok": True}
 

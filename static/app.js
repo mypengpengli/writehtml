@@ -315,6 +315,7 @@ async function doRegister() {
 
 async function doLogout() {
   try { await api("/api/logout"); } catch (e) {}
+  clearEntityImageCache();
   token = ""; localStorage.removeItem("token");
   agentSessions = []; currentAgentSessionId = null; agentMsgs = [];
   agentConversationSummary = ""; agentSessionScopeKey = ""; currentUsername = "";
@@ -327,6 +328,7 @@ async function init() {
   showApp();
   const me = await api("/api/me", { method: "GET" });
   if (currentUsername && currentUsername !== me.username) {
+    clearEntityImageCache();
     agentSkills = []; agentSkillsWorkId = undefined; activeAgentSkillIds = new Set();
     agentSessions = []; currentAgentSessionId = null; agentMsgs = [];
     agentConversationSummary = ""; agentSessionScopeKey = "";
@@ -382,6 +384,8 @@ async function selectWork(wid) {
   if (dirty) await saveNow();
   currentWorkId = wid;
   currentChapterId = null;
+  entitiesCache = []; entitiesCacheWorkId = null; entitiesCacheChapterId = null;
+  renderSemanticEditor();
   await loadChapters();
 }
 
@@ -398,7 +402,7 @@ async function loadChapters() {
   if (currentChapterId) await Promise.all([loadChapter(), loadAgentSessions()]);
   else {
     $("content").value = ""; $("chapTitle").value = ""; $("notes").value = "";
-    await loadAgentSessions();
+    await Promise.all([loadAgentSessions(), loadWikiEntities()]);
   }
   renderTree(); updateWC();
   await loadAgentSkills();
@@ -424,12 +428,14 @@ async function loadChapter() {
   const c = await api(`/api/chapters/${currentChapterId}`, { method: "GET" });
   $("chapTitle").value = c.title || "";
   $("content").value = c.content || "";
+  renderSemanticEditor();
   $("notes").value = c.notes || "";
   dirty = false; updateSaveStat("");
   updateWC();
   const cur = chapters.find(x => x.id === currentChapterId);
   if (cur) cur.chars = charCount(c.content || "");
-  if (entitiesCacheWorkId === currentWorkId) entitiesCacheChapterId = null;
+  try { await loadWikiEntities(); }
+  catch (e) { entitiesCache = []; entitiesCacheWorkId = null; entitiesCacheChapterId = null; renderSemanticEditor(); }
   if (!$("wikiOverlay").classList.contains("hidden")) await refreshCharacterCards();
   if (!$("characterStateOverlay").classList.contains("hidden") && characterStateChapterId === currentChapterId) {
     await loadCharacterState();
@@ -519,6 +525,7 @@ function onContentInput() {
   saveTimer = setTimeout(saveNow, 1500);
   typewriterCenter();
   updateSelectionTools();
+  renderSemanticEditor();
 }
 function onNotesInput() { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); }
 
@@ -1200,6 +1207,9 @@ async function openSettings() {
     renderModelSelectors(s);
     $("setAsrBaseUrl").value = s.asr_base_url || "";
     $("setAsrModel").value = s.asr_model || "whisper-1";
+    $("setImageBaseUrl").value = s.image_base_url || "";
+    $("setImageModel").value = s.image_model || "";
+    $("setImageSize").value = s.image_size || "1024x1024";
     $("setTavilyKeys").value = "";
     $("setTavilyKeys").classList.remove("revealed");
     $("toggleTavilyKeysBtn").title = "显示输入内容";
@@ -1210,6 +1220,9 @@ async function openSettings() {
     $("setApiKey").placeholder = s.has_key ? `${s.api_key_masked}（留空=不改）` : "sk-…";
     $("setAsrApiKey").value = s.asr_api_key_masked || "";
     $("setAsrApiKey").placeholder = s.asr_has_key ? `${s.asr_api_key_masked}（留空=不改）` : "留空则沿用上方中转站 Key";
+    $("setImageApiKey").value = s.image_api_key_masked || "";
+    $("setImageApiKey").placeholder = s.image_has_key
+      ? `${s.image_api_key_masked}（留空=不改；可沿用文字模型）` : "留空则沿用文字模型 Key";
     $("setVoiceDirect").checked = voiceDirectToModel;
     $("setVoiceAuto").checked = voiceAsrAutoSend;
     $("setMsg").textContent = "";
@@ -1235,18 +1248,24 @@ async function saveSettings() {
   const asr_model = $("setAsrModel").value.trim();
   let api_key = $("setApiKey").value.trim();
   let asr_api_key = $("setAsrApiKey").value.trim();
+  let image_api_key = $("setImageApiKey").value.trim();
   const tavily_api_keys = $("setTavilyKeys").value
     .split(/[\r\n,;]+/).map(value => value.trim()).filter(Boolean);
   // 若用户没动 key 输入框（仍是掩码占位），传空让后端保留旧值
   if (api_key.startsWith("****")) api_key = "";
   if (asr_api_key.startsWith("****")) asr_api_key = "";
+  if (image_api_key.startsWith("****")) image_api_key = "";
   voiceDirectToModel = $("setVoiceDirect").checked;
   voiceAsrAutoSend = $("setVoiceAuto").checked;
   localStorage.setItem("voiceDirectToModel", voiceDirectToModel ? "1" : "0");
   localStorage.setItem("voiceAsrAutoSend", voiceAsrAutoSend ? "1" : "0");
   setAgentMic(false);
   try {
-    const body = { base_url, api_key, model, models, asr_base_url, asr_api_key, asr_model };
+    const body = {
+      base_url, api_key, model, models, asr_base_url, asr_api_key, asr_model,
+      image_base_url: $("setImageBaseUrl").value.trim(), image_api_key,
+      image_model: $("setImageModel").value.trim(), image_size: $("setImageSize").value,
+    };
     if (tavily_api_keys.length) body.tavily_api_keys = tavily_api_keys;
     else if ($("clearTavilyKeys").checked) body.tavily_api_keys = [];
     const result = await api("/api/settings", { body });
@@ -1281,6 +1300,416 @@ async function saveWorkNotes() {
     $("wnMsg").textContent = "已保存";
     setTimeout(closeWorkNotes, 600);
   } catch (e) { $("wnMsg").textContent = e.message; }
+}
+
+/* ---------- 可视化大纲 / 情节分支沙盘 ---------- */
+
+let sandboxList = [];
+let currentSandbox = null;
+let selectedSandboxNodeId = null;
+let sandboxSaveTimer = null;
+let sandboxDrag = null;
+let sandboxAiCandidates = [];
+
+function sandboxNodeId(prefix = "plot") {
+  return `${prefix}-${globalThis.crypto?.randomUUID?.() || (Date.now().toString(36) + Math.random().toString(36).slice(2))}`;
+}
+function sandboxData() {
+  if (!currentSandbox.data || !Array.isArray(currentSandbox.data.nodes) || !Array.isArray(currentSandbox.data.edges)) {
+    currentSandbox.data = { nodes: [], edges: [] };
+  }
+  return currentSandbox.data;
+}
+async function openOutlineSandbox() {
+  if (!currentWorkId) { showToast("先选一个作品", "err"); return; }
+  if (dirty) await saveNow();
+  $("outlineOverlay").classList.remove("hidden");
+  try {
+    sandboxList = await api(`/api/works/${currentWorkId}/sandboxes`, { method: "GET" });
+    if (!sandboxList.length) {
+      currentSandbox = await api(`/api/works/${currentWorkId}/sandboxes`, { body: { name: "主线推演", data: { nodes: [], edges: [] } } });
+      sandboxList = [{ id: currentSandbox.id, name: currentSandbox.name, node_count: 0, edge_count: 0 }];
+      syncSandboxChapters(false);
+      await saveOutlineSandbox(false);
+    } else await loadOutlineSandbox(sandboxList[0].id);
+    renderSandboxList();
+  } catch (e) { showToast("沙盘加载失败：" + e.message, "err"); }
+}
+async function closeOutlineSandbox() {
+  clearTimeout(sandboxSaveTimer);
+  if (currentSandbox) await saveOutlineSandbox(false).catch(() => {});
+  $("outlineOverlay").classList.add("hidden");
+  sandboxDrag = null;
+}
+async function loadOutlineSandbox(sid) {
+  currentSandbox = await api(`/api/sandboxes/${sid}`, { method: "GET" });
+  selectedSandboxNodeId = null; sandboxAiCandidates = [];
+  renderSandboxList(); renderOutlineSandbox(); renderSandboxInspector();
+}
+function renderSandboxList() {
+  const host = $("sandboxList"); if (!host) return;
+  host.innerHTML = sandboxList.map(item => `
+    <button class="sandbox-list-item ${currentSandbox?.id === item.id ? "active" : ""}" data-sandbox-id="${item.id}">
+      <span>${esc(item.name)}</span><small>${item.node_count || 0} 节点</small>
+    </button>`).join("") || '<div class="empty">暂无沙盘</div>';
+  host.querySelectorAll("[data-sandbox-id]").forEach(button => button.addEventListener("click", () => loadOutlineSandbox(+button.dataset.sandboxId)));
+}
+async function newOutlineSandbox() {
+  const name = await askCard({ title: "新建情节沙盘", input: "沙盘名称", def: `情节假设 ${sandboxList.length + 1}`, okText: "新建" });
+  if (!name) return;
+  const created = await api(`/api/works/${currentWorkId}/sandboxes`, { body: { name, data: { nodes: [], edges: [] } } });
+  sandboxList.unshift({ id: created.id, name: created.name, node_count: 0, edge_count: 0 });
+  await loadOutlineSandbox(created.id);
+}
+function scheduleSandboxSave() {
+  clearTimeout(sandboxSaveTimer);
+  sandboxSaveTimer = setTimeout(() => saveOutlineSandbox(false), 900);
+}
+async function saveOutlineSandbox(feedback = true) {
+  if (!currentSandbox) return;
+  clearTimeout(sandboxSaveTimer);
+  const button = $("sandboxSaveBtn");
+  if (feedback) busy(button, true, "保存中");
+  try {
+    const saved = await api(`/api/sandboxes/${currentSandbox.id}`, { method: "PUT", body: { name: currentSandbox.name, data: sandboxData() } });
+    currentSandbox = saved;
+    const row = sandboxList.find(item => item.id === saved.id);
+    if (row) Object.assign(row, { name: saved.name, node_count: saved.data.nodes.length, edge_count: saved.data.edges.length });
+    renderSandboxList();
+    if (feedback) showToast("沙盘已保存", "ok");
+  } catch (e) { if (feedback) showToast("沙盘保存失败：" + e.message, "err"); }
+  finally { if (feedback) busy(button, false, "保存"); }
+}
+function sandboxKindLabel(kind) {
+  return ({ volume: "卷", chapter: "章", plot: "情节", choice: "选择", ending: "结局" })[kind] || "情节";
+}
+function renderOutlineSandbox() {
+  if (!currentSandbox) return;
+  const data = sandboxData(), nodesHost = $("sandboxNodes"), edgeHost = $("sandboxEdges"), world = $("sandboxWorld");
+  const maxX = Math.max(2200, ...data.nodes.map(node => (+node.x || 0) + 360));
+  const maxY = Math.max(1400, ...data.nodes.map(node => (+node.y || 0) + 260));
+  world.style.width = `${maxX}px`; world.style.height = `${maxY}px`;
+  edgeHost.setAttribute("width", maxX); edgeHost.setAttribute("height", maxY);
+  nodesHost.innerHTML = data.nodes.map(node => `
+    <article class="sandbox-node kind-${esc(node.kind)} ${node.id === selectedSandboxNodeId ? "selected" : ""}"
+      data-node-id="${esc(node.id)}" style="left:${+node.x || 0}px;top:${+node.y || 0}px">
+      <div class="sandbox-node-dir">${esc(node.direction || sandboxKindLabel(node.kind))}</div>
+      <div class="sandbox-node-title">${esc(node.title)}</div>
+      <div class="sandbox-node-summary">${esc(node.summary || "点击填写这个情节点会发生什么")}</div>
+      <div class="sandbox-node-meta">${node.chapter_id ? "已关联正文章节" : "沙盘草案"}${node.characters ? ` · ${esc(node.characters)}` : ""}</div>
+    </article>`).join("");
+  nodesHost.querySelectorAll(".sandbox-node").forEach(element => {
+    element.addEventListener("pointerdown", startSandboxDrag);
+    element.addEventListener("click", () => selectSandboxNode(element.dataset.nodeId));
+  });
+  renderSandboxEdges();
+}
+function renderSandboxEdges() {
+  if (!currentSandbox) return;
+  const data = sandboxData(), byId = new Map(data.nodes.map(node => [node.id, node]));
+  $("sandboxEdges").innerHTML = data.edges.map(edge => {
+    const from = byId.get(edge.from), to = byId.get(edge.to); if (!from || !to) return "";
+    const x1 = (+from.x || 0) + 220, y1 = (+from.y || 0) + 48, x2 = +to.x || 0, y2 = (+to.y || 0) + 48;
+    const bend = Math.max(50, Math.abs(x2 - x1) * .45);
+    const path = `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+    return `<path class="sandbox-edge" d="${path}"></path>${edge.label ? `<text class="sandbox-edge-label" x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 6}">${esc(edge.label)}</text>` : ""}`;
+  }).join("");
+}
+function selectSandboxNode(nodeId) {
+  selectedSandboxNodeId = nodeId; sandboxAiCandidates = [];
+  $("sandboxNodes").querySelectorAll(".sandbox-node").forEach(el => el.classList.toggle("selected", el.dataset.nodeId === nodeId));
+  renderSandboxInspector();
+}
+function selectedSandboxNode() { return sandboxData().nodes.find(node => node.id === selectedSandboxNodeId); }
+function renderSandboxInspector() {
+  const node = currentSandbox && selectedSandboxNode();
+  $("sandboxEmptyInspector").classList.toggle("hidden", !!node);
+  $("sandboxNodeInspector").classList.toggle("hidden", !node);
+  if (!node) return;
+  $("sandboxNodeBadge").textContent = node.direction || sandboxKindLabel(node.kind);
+  $("sandboxNodeTitle").value = node.title || ""; $("sandboxNodeSummary").value = node.summary || "";
+  $("sandboxNodeKind").value = node.kind || "plot"; $("sandboxNodeCharacters").value = node.characters || "";
+  $("sandboxOpenChapterBtn").classList.toggle("hidden", !node.chapter_id);
+  $("sandboxAdoptBtn").classList.toggle("hidden", !!node.chapter_id); renderSandboxCandidates();
+}
+function updateSelectedSandboxNode() {
+  const node = selectedSandboxNode(); if (!node) return;
+  node.title = $("sandboxNodeTitle").value; node.summary = $("sandboxNodeSummary").value;
+  node.kind = $("sandboxNodeKind").value; node.characters = $("sandboxNodeCharacters").value;
+  const el = [...$("sandboxNodes").querySelectorAll(".sandbox-node")].find(item => item.dataset.nodeId === node.id);
+  if (el) {
+    el.className = `sandbox-node kind-${node.kind} selected`;
+    el.querySelector(".sandbox-node-title").textContent = node.title || "未命名情节点";
+    el.querySelector(".sandbox-node-summary").textContent = node.summary || "点击填写这个情节点会发生什么";
+    el.querySelector(".sandbox-node-meta").textContent = `${node.chapter_id ? "已关联正文章节" : "沙盘草案"}${node.characters ? ` · ${node.characters}` : ""}`;
+  }
+  scheduleSandboxSave();
+}
+
+function addSandboxRoot() {
+  if (!currentSandbox) return;
+  const viewport = $("sandboxViewport");
+  const node = { id: sandboxNodeId("root"), title: "新的情节起点", summary: "", kind: "plot", direction: "",
+    characters: "", chapter_id: null, x: viewport.scrollLeft + 70, y: viewport.scrollTop + 80, collapsed: false };
+  sandboxData().nodes.push(node); renderOutlineSandbox(); selectSandboxNode(node.id); scheduleSandboxSave();
+}
+function addSandboxBranch(candidate = null) {
+  const parent = selectedSandboxNode();
+  if (!parent) { showToast("先选择一个父节点", "err"); return; }
+  const siblings = sandboxData().edges.filter(edge => edge.from === parent.id).length;
+  const node = { id: sandboxNodeId("branch"), title: candidate?.title || "新的分支", summary: candidate?.summary || "",
+    kind: "choice", direction: candidate?.direction || "发散", characters: candidate?.characters || "", chapter_id: null,
+    x: (+parent.x || 0) + 290, y: (+parent.y || 0) + siblings * 135, collapsed: false };
+  sandboxData().nodes.push(node);
+  sandboxData().edges.push({ id: sandboxNodeId("edge"), from: parent.id, to: node.id, label: node.direction });
+  sandboxAiCandidates = []; renderOutlineSandbox(); selectSandboxNode(node.id); scheduleSandboxSave();
+}
+function deleteSelectedSandboxNode() {
+  const node = selectedSandboxNode(); if (!node) return;
+  sandboxData().nodes = sandboxData().nodes.filter(item => item.id !== node.id);
+  sandboxData().edges = sandboxData().edges.filter(edge => edge.from !== node.id && edge.to !== node.id);
+  selectedSandboxNodeId = null; renderOutlineSandbox(); renderSandboxInspector(); scheduleSandboxSave();
+}
+function syncSandboxChapters(feedback = true) {
+  if (!currentSandbox) return;
+  const data = sandboxData(), byChapter = new Map(data.nodes.filter(node => node.chapter_id).map(node => [node.chapter_id, node]));
+  const mains = chapters.filter(chapter => !chapter.branch_of_chapter_id);
+  let previous = null, added = 0;
+  mains.forEach((chapter, index) => {
+    let node = byChapter.get(chapter.id);
+    if (!node) {
+      node = { id: `chapter-${chapter.id}`, title: chapter.title || `第${chapter.ord}章`, summary: chapter.workflow_summary || chapter.workflow_goal || "",
+        kind: "chapter", direction: "推进", characters: "", chapter_id: chapter.id, x: 70 + index * 280, y: 90, collapsed: false };
+      data.nodes.push(node); byChapter.set(chapter.id, node); added++;
+    } else node.title = chapter.title || node.title;
+    if (previous && !data.edges.some(edge => edge.from === previous.id && edge.to === node.id)) {
+      data.edges.push({ id: sandboxNodeId("edge"), from: previous.id, to: node.id, label: "主线" });
+    }
+    previous = node;
+  });
+  chapters.filter(chapter => chapter.branch_of_chapter_id).forEach((chapter, index) => {
+    if (byChapter.has(chapter.id)) return;
+    const parent = byChapter.get(chapter.branch_of_chapter_id);
+    const node = { id: `chapter-${chapter.id}`, title: chapter.title || "章节分支", summary: chapter.workflow_summary || "",
+      kind: "chapter", direction: "发散", characters: "", chapter_id: chapter.id,
+      x: (parent?.x || 70) + 280, y: (parent?.y || 90) + 150 + index * 120, collapsed: false };
+    data.nodes.push(node); byChapter.set(chapter.id, node); added++;
+    if (parent) data.edges.push({ id: sandboxNodeId("edge"), from: parent.id, to: node.id, label: "正文分支" });
+  });
+  if (data.nodes.length) autoLayoutSandbox(false); else renderOutlineSandbox();
+  scheduleSandboxSave();
+  if (feedback) showToast(added ? `已同步 ${added} 个章节节点` : "章节节点已是最新", added ? "ok" : "");
+}
+function autoLayoutSandbox(feedback = true) {
+  if (!currentSandbox) return;
+  const data = sandboxData(), byId = new Map(data.nodes.map(node => [node.id, node]));
+  const children = new Map(data.nodes.map(node => [node.id, []])), incoming = new Set();
+  data.edges.forEach(edge => { if (byId.has(edge.from) && byId.has(edge.to)) { children.get(edge.from).push(edge.to); incoming.add(edge.to); } });
+  const roots = data.nodes.filter(node => !incoming.has(node.id)); let row = 0; const placed = new Set();
+  function place(node, depth) {
+    if (!node || placed.has(node.id)) return;
+    placed.add(node.id); node.x = 70 + depth * 290; node.y = 70 + row * 135; row++;
+    (children.get(node.id) || []).forEach(id => place(byId.get(id), depth + 1));
+  }
+  roots.forEach(node => place(node, 0)); data.nodes.forEach(node => place(node, 0));
+  renderOutlineSandbox(); scheduleSandboxSave(); if (feedback) showToast("布局已整理", "ok");
+}
+function startSandboxDrag(event) {
+  if (event.button !== 0) return;
+  const element = event.currentTarget, node = sandboxData().nodes.find(item => item.id === element.dataset.nodeId);
+  if (!node) return;
+  selectSandboxNode(node.id);
+  sandboxDrag = { element, node, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY,
+    x: +node.x || 0, y: +node.y || 0 };
+  element.setPointerCapture?.(event.pointerId);
+}
+document.addEventListener("pointermove", event => {
+  if (!sandboxDrag || event.pointerId !== sandboxDrag.pointerId) return;
+  sandboxDrag.node.x = Math.max(0, sandboxDrag.x + event.clientX - sandboxDrag.startX);
+  sandboxDrag.node.y = Math.max(0, sandboxDrag.y + event.clientY - sandboxDrag.startY);
+  sandboxDrag.element.style.left = `${sandboxDrag.node.x}px`; sandboxDrag.element.style.top = `${sandboxDrag.node.y}px`;
+  renderSandboxEdges();
+});
+document.addEventListener("pointerup", event => {
+  if (!sandboxDrag || event.pointerId !== sandboxDrag.pointerId) return;
+  sandboxDrag = null; scheduleSandboxSave();
+});
+async function expandSandboxNode() {
+  const node = selectedSandboxNode(); if (!node) return;
+  const button = $("sandboxAiBtn"); busy(button, true, "展开中");
+  try {
+    const result = await api(`/api/sandboxes/${currentSandbox.id}/expand`, { body: { node_id: node.id, instruction: $("sandboxAiInstruction").value.trim() } });
+    sandboxAiCandidates = result.candidates || []; renderSandboxCandidates();
+  } catch (e) { showToast(e.message, "err"); }
+  finally { busy(button, false, "AI 展开三个候选"); }
+}
+function renderSandboxCandidates() {
+  const host = $("sandboxCandidates"); if (!host) return;
+  host.innerHTML = sandboxAiCandidates.map((item, index) => `
+    <div class="sandbox-candidate" data-direction="${esc(item.direction)}"><b>${esc(item.direction)} · ${esc(item.title)}</b><p>${esc(item.summary)}</p><button data-candidate-index="${index}">加入为子节点</button></div>`).join("");
+  host.querySelectorAll("[data-candidate-index]").forEach(button => button.addEventListener("click", () => addSandboxBranch(sandboxAiCandidates[+button.dataset.candidateIndex])));
+}
+async function adoptSandboxNode() {
+  const node = selectedSandboxNode(); if (!node || node.chapter_id) return;
+  try {
+    const chapter = await api(`/api/works/${currentWorkId}/chapters`, { body: { title: node.title || "沙盘章节" } });
+    node.chapter_id = chapter.id; node.kind = "chapter";
+    await saveOutlineSandbox(false); await loadChapters(); renderOutlineSandbox(); renderSandboxInspector();
+    showToast("已采纳为正文章节，沙盘草案仍保留", "ok");
+  } catch (e) { showToast(e.message, "err"); }
+}
+async function openSandboxChapter() {
+  const node = selectedSandboxNode(); if (!node?.chapter_id) return;
+  const chapterId = node.chapter_id;
+  await closeOutlineSandbox(); await selectChapter(chapterId);
+}
+
+/* ---------- 拆书引擎 ---------- */
+
+let disassemblyJobs = [];
+let currentDisassemblyJob = null;
+let disassemblyRunning = false;
+
+function disassemblyStatusLabel(status) {
+  return ({ ready: "已切章，等待开始", running: "分析中", paused: "已暂停", partial: "已停止并保存", completed: "已完成", cancelled: "已取消" })[status] || status;
+}
+function updateDisassemblyMode() {
+  $("disassemblyTitleRow").classList.toggle("hidden", $("disassemblyMode").value !== "new");
+}
+function previewDisassemblyFile() {
+  const file = $("disassemblyFile").files?.[0];
+  $("disassemblyFileMeta").textContent = file ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB` : "选择文件后自动识别章节；开始前会显示切章结果。";
+  if (file && !$("disassemblyTitle").value) $("disassemblyTitle").value = file.name.replace(/\.[^.]+$/, "");
+}
+async function openDisassembly() {
+  $("disassemblyOverlay").classList.remove("hidden");
+  $("disassemblyMode").value = currentWorkId ? "merge" : "new";
+  updateDisassemblyMode();
+  try {
+    disassemblyJobs = await api("/api/disassembly/jobs", { method: "GET" });
+    renderDisassemblyJobSwitch();
+    if (disassemblyJobs.length) await switchDisassemblyJob(disassemblyJobs[0].id);
+    else renderDisassemblyJob();
+  } catch (e) { $("disassemblyPrepareMsg").textContent = e.message; }
+}
+async function closeDisassembly() {
+  if (disassemblyRunning && currentDisassemblyJob) {
+    disassemblyRunning = false;
+    await api(`/api/disassembly/jobs/${currentDisassemblyJob.id}/pause`, { body: {} }).catch(() => {});
+  }
+  $("disassemblyOverlay").classList.add("hidden");
+}
+function renderDisassemblyJobSwitch() {
+  $("disassemblyJobSwitch").innerHTML = disassemblyJobs.length
+    ? disassemblyJobs.map(job => `<option value="${job.id}" ${currentDisassemblyJob?.id === job.id ? "selected" : ""}>${esc(job.source_name)} · ${esc(disassemblyStatusLabel(job.status))}</option>`).join("")
+    : '<option value="">暂无任务</option>';
+}
+async function switchDisassemblyJob(jobId) {
+  if (!jobId) { currentDisassemblyJob = null; renderDisassemblyJob(); return; }
+  disassemblyRunning = false;
+  try {
+    currentDisassemblyJob = await api(`/api/disassembly/jobs/${+jobId}`, { method: "GET" });
+    renderDisassemblyJobSwitch(); renderDisassemblyJob();
+  } catch (e) { showToast(e.message, "err"); }
+}
+function renderDisassemblyJob() {
+  const job = currentDisassemblyJob;
+  $("disassemblyEmpty").classList.toggle("hidden", !!job);
+  $("disassemblyJob").classList.toggle("hidden", !job);
+  if (!job) return;
+  $("disassemblyJobName").textContent = job.source_name;
+  $("disassemblyJobStatus").textContent = `${disassemblyStatusLabel(job.status)} · ${job.processed_chapters}/${job.total_chapters} 章`;
+  $("disassemblyProgressBar").style.width = `${job.total_chapters ? Math.round(job.processed_chapters / job.total_chapters * 100) : 0}%`;
+  const stats = job.stats || {};
+  $("disassemblyStats").innerHTML = [["人物", stats.characters], ["地点", stats.locations], ["物品", stats.items], ["组织", stats.organizations], ["关系", stats.relations]]
+    .map(([label, value]) => `<span class="disassembly-stat">${label} ${value || 0}</span>`).join("");
+  const terminal = ["completed", "partial", "cancelled"].includes(job.status);
+  $("disassemblyStartBtn").disabled = terminal || disassemblyRunning;
+  $("disassemblyPauseBtn").disabled = !disassemblyRunning;
+  $("disassemblyFinishBtn").disabled = terminal;
+  $("disassemblyChapters").innerHTML = (job.chapters || []).map(chapter => {
+    const summary = chapter.result?.summary || chapter.excerpt || "";
+    const styleNotes = chapter.result?.style_notes || "";
+    const status = chapter.status === "done" ? "已分析" : chapter.status === "error" ? "出错" : chapter.status === "running" ? "分析中" : "等待";
+    return `<div class="disassembly-chapter ${esc(chapter.status)}">
+      <div class="disassembly-chapter-head"><b>${chapter.ord}. ${esc(chapter.title)}</b><span>${status} · ${chapter.chars || 0} 字</span></div>
+      ${summary ? `<p>${esc(summary.slice(0, 280))}${summary.length > 280 ? "…" : ""}</p>` : ""}
+      ${styleNotes ? `<p>文风 / 技法：${esc(styleNotes.slice(0, 180))}${styleNotes.length > 180 ? "…" : ""}</p>` : ""}
+      ${chapter.error ? `<p class="error-text">${esc(chapter.error)} <button class="ic" data-retry-chapter="${chapter.id}">重试本章</button></p>` : ""}
+    </div>`;
+  }).join("");
+  $("disassemblyChapters").querySelectorAll("[data-retry-chapter]").forEach(button => button.addEventListener("click", () => retryDisassemblyChapter(+button.dataset.retryChapter)));
+}
+async function prepareDisassembly() {
+  const file = $("disassemblyFile").files?.[0];
+  if (!file) { $("disassemblyPrepareMsg").textContent = "请先选择书稿文件"; return; }
+  const mode = $("disassemblyMode").value;
+  if (mode === "merge" && !currentWorkId) { $("disassemblyPrepareMsg").textContent = "当前没有可合入的作品，请选择新建作品"; return; }
+  const button = $("disassemblyPrepareBtn"); busy(button, true, "切章中");
+  $("disassemblyPrepareMsg").textContent = "正在读取并自动切章…";
+  try {
+    const headers = {
+      "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name),
+      "X-Disassembly-Mode": mode, "X-Disassembly-Strategy": $("disassemblyStrategy").value,
+      "X-Target-Work-Id": String(currentWorkId || ""), "X-Project-Title": encodeURIComponent($("disassemblyTitle").value.trim()),
+      ...(token ? { Authorization: "Bearer " + token } : {}),
+    };
+    const response = await fetch("/api/disassembly/prepare", { method: "POST", headers, body: file });
+    if (!response.ok) throw new Error(await responseError(response));
+    const prepared = await response.json();
+    currentDisassemblyJob = prepared.job;
+    disassemblyJobs = [prepared.job, ...disassemblyJobs.filter(job => job.id !== prepared.job.id)];
+    if (prepared.created_work) {
+      await loadWorks();
+      if (currentWorkId !== prepared.created_work.id) await selectWork(prepared.created_work.id);
+    } else await loadChapters();
+    renderDisassemblyJobSwitch(); renderDisassemblyJob();
+    $("disassemblyPrepareMsg").textContent = `已识别 ${prepared.chapter_count} 章、${prepared.source_chars} 字；请检查右侧切章结果后开始分析。`;
+  } catch (e) { $("disassemblyPrepareMsg").textContent = e.message; }
+  finally { busy(button, false, "上传并自动切章"); }
+}
+async function startDisassembly() {
+  if (!currentDisassemblyJob || disassemblyRunning) return;
+  disassemblyRunning = true; renderDisassemblyJob();
+  try {
+    while (disassemblyRunning) {
+      const step = await api(`/api/disassembly/jobs/${currentDisassemblyJob.id}/step`, { body: {} });
+      currentDisassemblyJob = step.job;
+      const row = disassemblyJobs.find(job => job.id === currentDisassemblyJob.id);
+      if (row) Object.assign(row, currentDisassemblyJob);
+      renderDisassemblyJobSwitch(); renderDisassemblyJob();
+      if (!step.ok) { showToast(`拆到《${(currentDisassemblyJob.chapters || []).find(item => item.id === step.chapter_id)?.title || "本章"}》时暂停：${step.error}`, "err"); break; }
+      if (["completed", "partial", "cancelled"].includes(currentDisassemblyJob.status)) break;
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
+  } catch (e) { showToast("拆书中断：" + e.message, "err"); }
+  finally {
+    if (!disassemblyRunning && currentDisassemblyJob && currentDisassemblyJob.status === "running") {
+      currentDisassemblyJob = await api(`/api/disassembly/jobs/${currentDisassemblyJob.id}/pause`, { body: {} }).catch(() => currentDisassemblyJob);
+    }
+    disassemblyRunning = false; renderDisassemblyJob();
+    if (currentDisassemblyJob?.target_work_id === currentWorkId) await Promise.all([loadChapters(), loadWikiEntities()]);
+    if (currentDisassemblyJob?.status === "completed") showToast("拆书完成，设定与章节已写入作品", "ok");
+  }
+}
+async function pauseDisassembly() {
+  if (!currentDisassemblyJob) return;
+  disassemblyRunning = false;
+  currentDisassemblyJob = await api(`/api/disassembly/jobs/${currentDisassemblyJob.id}/pause`, { body: {} });
+  renderDisassemblyJob(); showToast("已暂停，当前完成的章节都已保存", "ok");
+}
+async function finishDisassembly() {
+  if (!currentDisassemblyJob) return;
+  disassemblyRunning = false;
+  currentDisassemblyJob = await api(`/api/disassembly/jobs/${currentDisassemblyJob.id}/finish`, { body: {} });
+  renderDisassemblyJob();
+  if (currentDisassemblyJob.target_work_id === currentWorkId) await Promise.all([loadChapters(), loadWikiEntities()]);
+  showToast("已停止；现有拆书结果已保留", "ok");
+}
+async function retryDisassemblyChapter(chapterId) {
+  if (!currentDisassemblyJob) return;
+  currentDisassemblyJob = await api(`/api/disassembly/jobs/${currentDisassemblyJob.id}/chapters/${chapterId}/retry`, { body: {} });
+  renderDisassemblyJob(); showToast("已放回待分析队列", "ok");
 }
 
 /* ---------- AI 写作工具（校验/摘要，不污染正文） ---------- */
@@ -2252,6 +2681,9 @@ let characterStateEntityId = null;
 let characterStateChapterId = null;
 let characterStateProposalId = null;
 let characterStateData = null;
+let entityImageEntityId = null;
+let semanticPopTimer = null;
+const entityImageObjectUrls = new Map();
 const characterStateFields = [
   ["location", "所在地点", "characterStateLocation"],
   ["goal", "当前目标", "characterStateGoal"],
@@ -2264,12 +2696,200 @@ const characterStateFields = [
   ["notes", "补充", "characterStateNotes"],
 ];
 
+function semanticKindClass(kind) {
+  return ({ 人物: "person", 地点: "place", 物品: "item", 组织: "org", 概念: "concept" })[kind] || "concept";
+}
+function regexEscape(value) { return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function renderSemanticEditor() {
+  const editor = $("content"), textHost = $("semanticText"), layer = $("semanticLayer");
+  if (!editor || !textHost || !layer) return;
+  const text = editor.value || "";
+  const seen = new Set();
+  const entities = entitiesCache
+    .filter(entity => entity && entity.name && !seen.has(entity.name.toLocaleLowerCase()) && seen.add(entity.name.toLocaleLowerCase()))
+    .sort((a, b) => b.name.length - a.name.length);
+  if (!text || !entities.length) {
+    textHost.textContent = "";
+    layer.classList.add("hidden");
+    editor.classList.remove("semantic-active");
+    return;
+  }
+  const byName = new Map(entities.map(entity => [entity.name.toLocaleLowerCase(), entity]));
+  const pattern = entities.map(entity => regexEscape(entity.name)).join("|");
+  let regex;
+  try { regex = new RegExp(pattern, "giu"); }
+  catch (e) { textHost.textContent = text; return; }
+  let html = "", last = 0, match;
+  while ((match = regex.exec(text))) {
+    const value = match[0];
+    const entity = byName.get(value.toLocaleLowerCase());
+    if (!entity || (value.length === 1 && text[match.index - 1] !== "@")) continue;
+    html += esc(text.slice(last, match.index));
+    html += `<mark class="semantic-token semantic-${semanticKindClass(entity.kind)}" data-entity-id="${entity.id}" tabindex="-1">${esc(value)}</mark>`;
+    last = match.index + value.length;
+  }
+  html += esc(text.slice(last));
+  textHost.innerHTML = html;
+  layer.classList.remove("hidden");
+  editor.classList.add("semantic-active");
+  syncSemanticEditor();
+}
+function syncSemanticEditor() {
+  const editor = $("content"), textHost = $("semanticText");
+  if (!editor || !textHost) return;
+  textHost.style.width = `${editor.clientWidth}px`;
+  textHost.style.transform = `translate(${-editor.scrollLeft}px, ${-editor.scrollTop}px)`;
+}
+function hideSemanticPop(delay = 100) {
+  clearTimeout(semanticPopTimer);
+  semanticPopTimer = setTimeout(() => $("semanticPop")?.classList.add("hidden"), delay);
+}
+function showSemanticPop(eid, anchor) {
+  clearTimeout(semanticPopTimer);
+  const entity = entitiesCache.find(item => item.id === eid);
+  const pop = $("semanticPop");
+  if (!entity || !pop || !anchor) return;
+  const state = entity.kind === "人物" ? characterStateBrief(entity.current_state) : "";
+  pop.innerHTML = `
+    <div class="mp-head"><b>${esc(entity.name)}</b> · ${esc(entity.kind)}</div>
+    ${entity.summary ? `<div class="mp-sum">${esc(entity.summary)}</div>` : ""}
+    ${state ? `<div class="mp-state">${esc(state)}</div>` : ""}
+    ${entity.detail ? `<div class="mp-det">${esc(entity.detail.slice(0, 180))}${entity.detail.length > 180 ? "…" : ""}</div>` : ""}
+    <div class="semantic-pop-actions"><button onclick="openSemanticEntity(${entity.id})">${entity.kind === "人物" ? "打开动态 / 关系 / 历史" : "打开设定卡"}</button></div>`;
+  pop.classList.remove("hidden");
+  const rect = anchor.getBoundingClientRect();
+  const width = pop.offsetWidth, height = pop.offsetHeight;
+  pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`;
+  pop.style.top = `${Math.max(8, rect.bottom + height + 8 > window.innerHeight ? rect.top - height - 8 : rect.bottom + 8)}px`;
+}
+async function openSemanticEntity(eid) {
+  $("semanticPop")?.classList.add("hidden");
+  const entity = entitiesCache.find(item => item.id === eid);
+  if (!entity) return;
+  if (entity.kind === "人物") await openCharacterState(eid);
+  else { await openWiki(); startEditEntity(eid); }
+}
+
+function entityInitial(entity) { return Array.from((entity?.name || "?").trim())[0] || "?"; }
+function clearEntityImageCache() {
+  entityImageObjectUrls.forEach(url => URL.revokeObjectURL(url));
+  entityImageObjectUrls.clear();
+}
+function entityPortraitHtml(entity, large = false) {
+  return `<div class="character-portrait${large ? " character-portrait-lg" : ""}">
+    <span>${esc(entityInitial(entity))}</span>
+    ${entity?.has_image ? `<img class="hidden" data-entity-image="${entity.id}" alt="${esc(entity.name)}的角色图">` : ""}
+  </div>`;
+}
+async function entityImageUrl(eid, force = false) {
+  if (force && entityImageObjectUrls.has(eid)) {
+    URL.revokeObjectURL(entityImageObjectUrls.get(eid));
+    entityImageObjectUrls.delete(eid);
+  }
+  if (entityImageObjectUrls.has(eid)) return entityImageObjectUrls.get(eid);
+  const response = await fetch(`/api/entities/${eid}/image`, {
+    headers: token ? { Authorization: "Bearer " + token } : {}, cache: "no-store",
+  });
+  if (!response.ok) return "";
+  const url = URL.createObjectURL(await response.blob());
+  entityImageObjectUrls.set(eid, url);
+  return url;
+}
+async function hydrateEntityImages(root = document, force = false) {
+  const nodes = [...root.querySelectorAll("img[data-entity-image]")];
+  const ids = [...new Set(nodes.map(node => +node.dataset.entityImage).filter(Boolean))];
+  await Promise.all(ids.map(async eid => {
+    const url = await entityImageUrl(eid, force).catch(() => "");
+    if (!url) return;
+    root.querySelectorAll(`img[data-entity-image="${eid}"]`).forEach(img => {
+      img.src = url; img.classList.remove("hidden");
+      const initial = img.previousElementSibling;
+      if (initial) initial.classList.add("hidden");
+      const loading = img.nextElementSibling;
+      if (loading) loading.classList.add("hidden");
+    });
+  }));
+}
+function defaultCharacterImagePrompt(entity) {
+  const parts = ["小说角色设定图，单人角色肖像，主体清晰，构图完整，统一美术设定，无文字、无水印。", `角色名：${entity.name}。`];
+  if (entity.summary) parts.push(`人物摘要：${entity.summary}。`);
+  if (entity.detail) parts.push(`外貌、性格与背景设定：${entity.detail}。`);
+  const state = entity.current_state || characterStateData?.current_state || {};
+  const live = [["所在地点", state.location], ["情绪", state.emotion], ["身体状态", state.physical], ["能力与物品", state.assets]]
+    .filter(([, value]) => value).map(([label, value]) => `${label}：${value}`).join("；");
+  if (live) parts.push(`当前剧情状态：${live}。`);
+  return parts.join("\n");
+}
+function renderEntityImagePreview(entity) {
+  const host = $("entityImagePreview");
+  if (!host) return;
+  host.innerHTML = entity?.has_image
+    ? `<img class="hidden" data-entity-image="${entity.id}" alt="${esc(entity.name)}的角色图"><span>正在载入角色图…</span>`
+    : "尚未生成角色图";
+  if (entity?.has_image) hydrateEntityImages(host);
+  $("entityImageDeleteBtn").classList.toggle("hidden", !entity?.has_image);
+}
+async function openEntityImage(eid) {
+  const entity = entitiesCache.find(item => item.id === eid) || (characterStateData?.entity?.id === eid ? characterStateData.entity : null);
+  if (!entity) { showToast("人物卡尚未载入", "err"); return; }
+  entityImageEntityId = eid;
+  $("entityImageTitle").textContent = `${entity.name} · 角色形象`;
+  $("entityImagePrompt").value = entity.image_prompt || defaultCharacterImagePrompt(entity);
+  $("entityImageStyle").value = "";
+  $("entityImageMsg").textContent = "";
+  try {
+    const settings = await api("/api/settings", { method: "GET" });
+    $("entityImageSize").value = settings.image_size || "1024x1024";
+  } catch (e) { $("entityImageSize").value = "1024x1024"; }
+  renderEntityImagePreview(entity);
+  $("entityImageOverlay").classList.remove("hidden");
+}
+function closeEntityImage() { $("entityImageOverlay").classList.add("hidden"); entityImageEntityId = null; }
+async function generateEntityImage() {
+  if (!entityImageEntityId) return;
+  const button = $("entityImageGenerateBtn");
+  $("entityImageMsg").textContent = "";
+  busy(button, true, "生成中");
+  try {
+    const result = await api(`/api/entities/${entityImageEntityId}/image/generate`, {
+      body: { prompt: $("entityImagePrompt").value.trim(), style: $("entityImageStyle").value.trim(),
+        size: $("entityImageSize").value, chapter_id: currentChapterId },
+    });
+    const entity = entitiesCache.find(item => item.id === entityImageEntityId);
+    if (entity) Object.assign(entity, result);
+    if (characterStateData?.entity?.id === entityImageEntityId) Object.assign(characterStateData.entity, result);
+    await entityImageUrl(entityImageEntityId, true);
+    renderEntityImagePreview(entity || characterStateData?.entity);
+    if (!$("wikiOverlay").classList.contains("hidden")) renderWikiList();
+    if (!$("characterStateOverlay").classList.contains("hidden") && characterStateData) renderCharacterState(characterStateData);
+    $("entityImageMsg").textContent = "角色图已生成并保存";
+    showToast("角色图已生成", "ok");
+  } catch (e) { $("entityImageMsg").textContent = e.message; }
+  finally { busy(button, false, "生成角色图"); }
+}
+async function deleteEntityImage() {
+  if (!entityImageEntityId || !await askCard({ title: "删除这张角色图？", msg: "人物设定和历史不会删除。", okText: "删除", danger: true })) return;
+  try {
+    await api(`/api/entities/${entityImageEntityId}/image`, { method: "DELETE" });
+    if (entityImageObjectUrls.has(entityImageEntityId)) URL.revokeObjectURL(entityImageObjectUrls.get(entityImageEntityId));
+    entityImageObjectUrls.delete(entityImageEntityId);
+    const entity = entitiesCache.find(item => item.id === entityImageEntityId);
+    if (entity) entity.has_image = false;
+    if (characterStateData?.entity?.id === entityImageEntityId) characterStateData.entity.has_image = false;
+    renderEntityImagePreview(entity || characterStateData?.entity);
+    if (!$("wikiOverlay").classList.contains("hidden")) renderWikiList();
+    if (!$("characterStateOverlay").classList.contains("hidden") && characterStateData) renderCharacterState(characterStateData);
+    showToast("角色图已删除", "ok");
+  } catch (e) { $("entityImageMsg").textContent = e.message; }
+}
+
 function entityChapterQuery() { return currentChapterId ? `?chapter_id=${currentChapterId}` : ""; }
 async function loadWikiEntities() {
-  if (!currentWorkId) { entitiesCache = []; entitiesCacheWorkId = null; entitiesCacheChapterId = null; return; }
+  if (!currentWorkId) { entitiesCache = []; entitiesCacheWorkId = null; entitiesCacheChapterId = null; renderSemanticEditor(); return; }
   entitiesCache = await api(`/api/works/${currentWorkId}/entities${entityChapterQuery()}`, { method: "GET" });
   entitiesCacheWorkId = currentWorkId;
   entitiesCacheChapterId = currentChapterId || null;
+  renderSemanticEditor();
 }
 
 async function openWiki() {
@@ -2298,16 +2918,22 @@ function characterStateSnapshot(state) {
 function renderWikiList() {
   $("wikiList").innerHTML = entitiesCache.length ? entitiesCache.map(e => `
     <div class="ent">
-      <div class="ent-h"><b>${esc(e.kind)}</b> · ${esc(e.name)}</div>
-      ${e.summary ? `<div class="ent-s">${esc(e.summary)}</div>` : ""}
-      ${e.detail ? `<div class="ent-d">${esc(e.detail)}</div>` : ""}
-      ${e.kind === "人物" && currentChapterId ? `<div class="ent-state">${esc(characterStateBrief(e.current_state) || "截至本章未记录动态状态")}</div>` : ""}
-      <div class="ent-a">
-        ${e.kind === "人物" ? `<button class="ic" onclick="openCharacterState(${e.id})">状态${e.pending_count ? ` · 待确认 ${e.pending_count}` : ""}</button>` : ""}
-        <button class="ic" onclick="startEditEntity(${e.id})">编辑</button>
-        <button class="ic" onclick="delEntity(${e.id})">删除</button>
+      <div class="ent-main">
+        ${e.kind === "人物" ? entityPortraitHtml(e) : ""}
+        <div class="ent-copy">
+          <div class="ent-h"><b>${esc(e.kind)}</b> · ${esc(e.name)}</div>
+          ${e.summary ? `<div class="ent-s">${esc(e.summary)}</div>` : ""}
+          ${e.detail ? `<div class="ent-d">${esc(e.detail)}</div>` : ""}
+          ${e.kind === "人物" && currentChapterId ? `<div class="ent-state">${esc(characterStateBrief(e.current_state) || "截至本章未记录动态状态")}</div>` : ""}
+          <div class="ent-a">
+            ${e.kind === "人物" ? `<button class="ic" onclick="openCharacterState(${e.id})">档案${e.pending_count ? ` · 待确认 ${e.pending_count}` : ""}</button><button class="ic" onclick="openEntityImage(${e.id})">${e.has_image ? "管理形象" : "生成形象"}</button>` : ""}
+            <button class="ic" onclick="startEditEntity(${e.id})">编辑</button>
+            <button class="ic" onclick="delEntity(${e.id})">删除</button>
+          </div>
+        </div>
       </div>
     </div>`).join("") : '<div class="empty">还没有人物/设定卡片</div>';
+  hydrateEntityImages($("wikiList"));
 }
 function resetEntityForm() {
   editingEntityId = null;
@@ -2348,6 +2974,8 @@ function startEditEntity(eid) {
 async function delEntity(eid) {
   if (!await askCard({ title: "删除这张卡片？", okText: "删除", danger: true })) return;
   await api(`/api/entities/${eid}`, { method: "DELETE" });
+  if (entityImageObjectUrls.has(eid)) URL.revokeObjectURL(entityImageObjectUrls.get(eid));
+  entityImageObjectUrls.delete(eid);
   await loadWikiEntities();
   if (editingEntityId === eid) resetEntityForm();
   renderWikiList();
@@ -2412,6 +3040,7 @@ function renderCharacterState(data) {
   $("characterStateBase").innerHTML = `
     <div><b>基础设定</b>${entity.summary ? ` · ${esc(entity.summary)}` : ""}</div>
     ${entity.detail ? `<div>${esc(entity.detail)}</div>` : ""}`;
+  $("characterStatePortrait").innerHTML = `<span>${esc(entityInitial(entity))}</span>${entity.has_image ? `<img class="hidden" data-entity-image="${entity.id}" alt="${esc(entity.name)}的角色图">` : ""}`;
   const version = data.state_version;
   $("characterStateSource").textContent = version
     ? `${characterStateSource(version.source)} · 生效于${characterStateLabel({ ord: version.chapter_ord, title: version.chapter_title })}`
@@ -2429,6 +3058,12 @@ function renderCharacterState(data) {
         <button class="danger-lite" onclick="rejectCharacterStateProposal(${p.id})">忽略</button>
       </div>
     </div>`).join("");
+  const relations = data.relations || [];
+  $("characterStateRelations").innerHTML = relations.length ? relations.map(item => {
+    const outgoing = item.from_entity_id === entity.id;
+    const other = outgoing ? item.to_name : item.from_name;
+    return `<div class="character-relation"><b>${outgoing ? "→" : "←"} ${esc(other)}</b> · ${esc(item.relation)}${item.detail ? `<small>${esc(item.detail)}</small>` : ""}</div>`;
+  }).join("") : '<div class="empty">尚未记录人物关系；可在“故事资料 → 人物关系”中添加。</div>';
   const history = data.history || [];
   $("characterStateHistory").innerHTML = history.length ? history.map(item => `
     <div class="character-state-history-item">
@@ -2437,6 +3072,7 @@ function renderCharacterState(data) {
       ${item.evidence ? `<small>${esc(item.evidence)}</small>` : ""}
       ${characterStateSnapshot(item.state)}
     </div>`).join("") : '<div class="empty">尚无成长记录</div>';
+  if (entity.has_image) hydrateEntityImages($("characterStateOverlay"));
 }
 async function loadCharacterState() {
   if (!characterStateEntityId || !characterStateChapterId) return;
@@ -3927,10 +4563,27 @@ document.addEventListener("keydown", (e) => {
   }
 });
 $("content").addEventListener("input", onContentInput);
+$("content").addEventListener("scroll", syncSemanticEditor, { passive: true });
 $("content").addEventListener("keyup", () => { typewriterCenter(); updateSelectionTools(); });
 $("content").addEventListener("click", () => { typewriterCenter(); updateSelectionTools(); });
 $("content").addEventListener("mouseup", updateSelectionTools);
 $("content").addEventListener("select", updateSelectionTools);
+$("semanticText").addEventListener("pointerover", e => {
+  const tokenEl = e.target.closest(".semantic-token");
+  if (tokenEl) showSemanticPop(+tokenEl.dataset.entityId, tokenEl);
+});
+$("semanticText").addEventListener("pointerout", e => {
+  if (e.target.closest(".semantic-token")) hideSemanticPop(140);
+});
+$("semanticText").addEventListener("click", e => {
+  const tokenEl = e.target.closest(".semantic-token");
+  if (!tokenEl) return;
+  e.preventDefault(); e.stopPropagation();
+  openSemanticEntity(+tokenEl.dataset.entityId);
+});
+$("semanticPop").addEventListener("pointerenter", () => clearTimeout(semanticPopTimer));
+$("semanticPop").addEventListener("pointerleave", () => hideSemanticPop(100));
+window.addEventListener("resize", syncSemanticEditor, { passive: true });
 $("notes").addEventListener("input", onNotesInput);
 $("chapTitle").addEventListener("input", () => { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); });
 plotStateFields.map(([, , id]) => id).concat(["plotStateSummary", "plotStateEvidence"])
@@ -3943,6 +4596,7 @@ document.addEventListener("click", (e) => {
       && !e.target.closest(".inspiration-detail-actions")) {
     inspirationActions.classList.add("hidden");
   }
+  if (!e.target.closest(".semantic-token") && !e.target.closest("#semanticPop")) hideSemanticPop(0);
 });
 
 /* ---------- 启动 ---------- */
