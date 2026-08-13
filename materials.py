@@ -222,6 +222,19 @@ def list_documents(user_id, work_id, include_content=False):
     return [{**dict(row), "enabled": bool(row["enabled"]), "pinned": bool(row["pinned"])} for row in rows]
 
 
+def get_document(user_id, work_id, document_id):
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM work_reference_documents WHERE id=? AND work_id=? AND user_id=?",
+            (document_id, work_id, user_id),
+        ).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["enabled"], item["pinned"] = bool(item["enabled"]), bool(item["pinned"])
+    return item
+
+
 def save_document(user_id, work_id, payload):
     payload = payload if isinstance(payload, dict) else {}
     name = " ".join(str(payload.get("name") or "长期参考资料").replace("\\", "/").rsplit("/", 1)[-1].split())[:240]

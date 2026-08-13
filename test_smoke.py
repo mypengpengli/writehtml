@@ -414,11 +414,13 @@ _sandbox = c.post(f"/api/works/{wid}/sandboxes", json={"name": "主线推演", "
 ok(_sandbox["name"] == "主线推演" and _sandbox["data"]["nodes"][0]["chapter_id"] == cid,
    "情节沙盘可保存关联正文章节的节点")
 _sandbox_saved = c.put(f"/api/sandboxes/{_sandbox['id']}", json={"data": {
-    "nodes": _sandbox["data"]["nodes"] + [{"id": "branch-a", "title": "追向旧码头", "summary": "选择追击", "kind": "choice", "x": 360, "y": 90}],
-    "edges": [{"id": "edge-a", "from": "chapter-root", "to": "branch-a", "label": "发散"}],
+    "nodes": [{**_sandbox["data"]["nodes"][0], "collapsed": True}] + [{"id": "branch-a", "title": "追向旧码头", "summary": "选择追击", "kind": "choice", "direction": "主线", "x": 360, "y": 90}],
+    "edges": [{"id": "edge-a", "from": "chapter-root", "to": "branch-a", "label": "主线"}],
 }}, headers=H(tokA)).json()
-ok(len(_sandbox_saved["data"]["nodes"]) == 2 and len(c.get(f"/api/works/{wid}/sandboxes", headers=H(tokA)).json()) == 1,
-   "沙盘节点与分支连线可持久保存")
+ok(len(_sandbox_saved["data"]["nodes"]) == 2 and _sandbox_saved["data"]["nodes"][0]["collapsed"]
+   and _sandbox_saved["data"]["nodes"][1]["direction"] == "主线"
+   and len(c.get(f"/api/works/{wid}/sandboxes", headers=H(tokA)).json()) == 1,
+   "沙盘节点、折叠状态、语义走向与分支连线可持久保存")
 ok(c.get(f"/api/sandboxes/{_sandbox['id']}", headers=H(tokB)).status_code == 404,
    "其他用户无法读取情节沙盘")
 _orig_sandbox_chat = llm.chat
@@ -493,6 +495,10 @@ _long_doc = c.post(f"/api/works/{wid}/materials/documents", json={
     "tags": "规则,悬疑", "enabled": True, "pinned": True,
 }, headers=H(tokA)).json()["document"]
 ok(_long_doc["pinned"] and _long_doc["chars"] > 10, "本轮附件可另存为长期参考资料")
+_long_doc_preview = c.get(f"/api/works/{wid}/materials/documents/{_long_doc['id']}", headers=H(tokA))
+ok(_long_doc_preview.status_code == 200 and "蓝鲸协议" in _long_doc_preview.json()["content"]
+   and c.get(f"/api/works/{wid}/materials/documents/{_long_doc['id']}", headers=H(tokB)).status_code == 404,
+   "作者可预览长期资料全文且他人不可读取")
 ok(c.put(f"/api/works/{wid}/materials/documents/{_long_doc['id']}", json={"pinned": False}, headers=H(tokB)).status_code == 404,
    "他人不能修改长期参考资料")
 _reference_work_id = c.post("/api/works", json={"title": "只读参考工程"}, headers=H(tokA)).json()["id"]
@@ -506,6 +512,10 @@ _mount = c.post(f"/api/works/{wid}/materials/references", json={
 }, headers=H(tokA)).json()["mount"]
 ok(_mount["reference_title"] == "只读参考工程" and not _mount["use_world"],
    "参考工程可按文风、桥段、世界观三个方向选择性挂载")
+_mount_updated = c.post(f"/api/works/{wid}/materials/references", json={
+    "reference_work_id": _reference_work_id, "use_style": True, "use_plot": False, "use_world": True,
+}, headers=H(tokA)).json()["mount"]
+ok(not _mount_updated["use_plot"] and _mount_updated["use_world"], "参考工程挂载后仍可随时调整借鉴方向")
 _orig_material_chat = llm.chat
 llm.chat = lambda *args, **kwargs: json.dumps({
     "style_profile": {
@@ -526,6 +536,9 @@ _extracted_materials = c.post(f"/api/disassembly/jobs/{_book_job['id']}/material
 }, headers=H(tokA))
 ok(_extracted_materials.status_code == 200 and len(_extracted_materials.json()["inspiration_ids"]) == 1,
    "整本拆书可提炼语言指纹并把桥段机制加入灵感库")
+_extraction_history = c.get(f"/api/works/{wid}/materials", headers=H(tokA)).json()["extractions"]
+ok(len(_extraction_history) == 1 and len(_extraction_history[0]["result"]["plot_devices"]) == 1,
+   "资料中心保留每次整本提炼的状态与产出统计")
 llm.chat = _orig_material_chat
 _material_context = context_builder.build_context(
     uidA, "continue_writing", wid, cid, instruction="按蓝鲸协议续写钟声后的等待，并保持本书语气",

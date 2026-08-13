@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=materials-images-20260813-1">
+  <link rel="stylesheet" href="style.css?v=ux-details-20260813-2">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -436,6 +436,11 @@
         </section>
 
         <section class="material-section">
+          <div class="settings-section-head"><b>整本拆书提炼记录</b><span>可核对本次实际产出</span></div>
+          <div id="materialExtractionList" class="material-list"></div>
+        </section>
+
+        <section class="material-section">
           <div class="settings-section-head"><b>只读参考工程</b><span>最多 5 本</span></div>
           <div class="material-reference-add">
             <select id="materialReferenceWork"></select>
@@ -455,6 +460,13 @@
           <div id="materialDocumentList" class="material-list"></div>
         </section>
       </div>
+    </div>
+  </div>
+
+  <div id="materialDocumentPreviewOverlay" class="overlay hidden" onclick="if(event.target===this)closeMaterialDocumentPreview()">
+    <div class="overlay-card material-preview-card">
+      <div class="overlay-head"><span id="materialDocumentPreviewTitle">长期资料</span><button class="ic" data-ic="x" onclick="closeMaterialDocumentPreview()"></button></div>
+      <pre id="materialDocumentPreviewContent"></pre>
     </div>
   </div>
 
@@ -521,6 +533,7 @@
           <button class="ic" onclick="addSandboxRoot()">新增根节点</button>
           <button class="ic" onclick="addSandboxBranch()">添加分支</button>
           <button class="ic" onclick="autoLayoutSandbox()">整理布局</button>
+          <button class="ic" onclick="exportSandboxTree()">导出整树</button>
           <button id="sandboxSaveBtn" onclick="saveOutlineSandbox()">保存</button>
           <button class="ic" data-ic="x" onclick="closeOutlineSandbox()" title="关闭"></button>
         </span>
@@ -544,10 +557,12 @@
             <label>标题<input id="sandboxNodeTitle" maxlength="160" oninput="updateSelectedSandboxNode()"></label>
             <label>摘要<textarea id="sandboxNodeSummary" rows="7" maxlength="4000" oninput="updateSelectedSandboxNode()"></textarea></label>
             <label>层级<select id="sandboxNodeKind" onchange="updateSelectedSandboxNode()"><option value="volume">卷</option><option value="chapter">章</option><option value="plot">情节点</option><option value="choice">选择</option><option value="ending">结局</option></select></label>
+            <label>走向<select id="sandboxNodeDirection" onchange="updateSelectedSandboxNode()"><option value="">未指定</option><option value="推进">推进 · 绿色</option><option value="发散">发散 · 橙色</option><option value="收束">收束 · 青色</option><option value="主线">主线 · 蓝色</option></select></label>
             <label>涉及角色<input id="sandboxNodeCharacters" maxlength="1000" oninput="updateSelectedSandboxNode()" placeholder="林晚、顾川"></label>
             <div class="set-actions">
               <button id="sandboxOpenChapterBtn" class="ic" onclick="openSandboxChapter()">打开章节</button>
               <button id="sandboxAdoptBtn" onclick="adoptSandboxNode()">采纳为新章节</button>
+              <button class="ic" onclick="exportSandboxTree(selectedSandboxNodeId)">导出此分支</button>
               <button class="ic danger-lite" onclick="deleteSelectedSandboxNode()">删除节点</button>
             </div>
             <hr class="sep">
@@ -592,6 +607,7 @@
               <button id="disassemblyExtractBtn" class="ic" onclick="extractDisassemblyMaterials()">提炼整本资料</button>
             </div>
             <p class="set-hint">每分析完一章就立即保存摘要、人物、地点、物品和关系；“提炼整本资料”会综合已完成章节，生成语言指纹、人物声音与可改编桥段，桥段进入灵感库。</p>
+            <div id="disassemblyExtractionSummary" class="material-extraction-summary hidden"></div>
             <div id="disassemblyChapters" class="disassembly-chapters"></div>
           </div>
         </section>
@@ -748,7 +764,11 @@
   <div id="imageLightbox" class="image-lightbox hidden" onclick="if(event.target===this)closeImageLightbox()">
     <div class="image-lightbox-card">
       <img id="imageLightboxImg" alt="角色大图">
-      <div><b id="imageLightboxTitle"></b><p id="imageLightboxPrompt"></p></div>
+      <div><b id="imageLightboxTitle"></b><p id="imageLightboxPrompt"></p><div class="image-lightbox-actions">
+        <button class="ic" onclick="copyLightboxPrompt()">复制提示词</button>
+        <button class="ic" onclick="reuseLightboxPrompt()">用此提示词再生成</button>
+        <button class="ic" onclick="downloadLightboxImage()">下载原图</button>
+      </div></div>
       <button class="ic image-lightbox-close" data-ic="x" onclick="closeImageLightbox()" title="关闭"></button>
     </div>
   </div>
@@ -937,6 +957,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=materials-images-20260813-1"></script>
+  <script src="app.js?v=ux-details-20260813-2"></script>
 </body>
 </html>

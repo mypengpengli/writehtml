@@ -125,6 +125,7 @@ const ICONS = {
   image:    `<svg ${_W}><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>`,
   music:    `<svg ${_W}><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>`,
   film:     `<svg ${_W}><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 4v16M17 4v16M2 9h5M17 9h5M2 15h5M17 15h5"/></svg>`,
+  copy:     `<svg ${_W}><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`,
 };
 function svg(n) { return ICONS[n] || ""; }
 // 把图标注入 [data-ic] 元素；data-label 存在则图标后跟文字（移动端更易用）
@@ -1363,10 +1364,16 @@ async function loadOutlineSandbox(sid) {
 function renderSandboxList() {
   const host = $("sandboxList"); if (!host) return;
   host.innerHTML = sandboxList.map(item => `
-    <button class="sandbox-list-item ${currentSandbox?.id === item.id ? "active" : ""}" data-sandbox-id="${item.id}">
-      <span>${esc(item.name)}</span><small>${item.node_count || 0} 节点</small>
-    </button>`).join("") || '<div class="empty">暂无沙盘</div>';
-  host.querySelectorAll("[data-sandbox-id]").forEach(button => button.addEventListener("click", () => loadOutlineSandbox(+button.dataset.sandboxId)));
+    <div class="sandbox-list-item ${currentSandbox?.id === item.id ? "active" : ""}">
+      <button class="sandbox-list-main" data-sandbox-open="${item.id}"><span>${esc(item.name)}</span><small>${item.node_count || 0} 节点</small></button>
+      <span class="sandbox-list-actions">
+        <button data-sandbox-rename="${item.id}" title="重命名">✎</button>
+        <button data-sandbox-delete="${item.id}" title="删除">×</button>
+      </span>
+    </div>`).join("") || '<div class="empty">暂无沙盘</div>';
+  host.querySelectorAll("[data-sandbox-open]").forEach(button => button.addEventListener("click", () => loadOutlineSandbox(+button.dataset.sandboxOpen)));
+  host.querySelectorAll("[data-sandbox-rename]").forEach(button => button.addEventListener("click", () => renameOutlineSandbox(+button.dataset.sandboxRename)));
+  host.querySelectorAll("[data-sandbox-delete]").forEach(button => button.addEventListener("click", () => deleteOutlineSandbox(+button.dataset.sandboxDelete)));
 }
 async function newOutlineSandbox() {
   const name = await askCard({ title: "新建情节沙盘", input: "沙盘名称", def: `情节假设 ${sandboxList.length + 1}`, okText: "新建" });
@@ -1374,6 +1381,35 @@ async function newOutlineSandbox() {
   const created = await api(`/api/works/${currentWorkId}/sandboxes`, { body: { name, data: { nodes: [], edges: [] } } });
   sandboxList.unshift({ id: created.id, name: created.name, node_count: 0, edge_count: 0 });
   await loadOutlineSandbox(created.id);
+}
+async function renameOutlineSandbox(sid) {
+  const row = sandboxList.find(item => item.id === sid); if (!row) return;
+  const name = await askCard({ title: "重命名沙盘", input: "沙盘名称", def: row.name, okText: "保存" });
+  if (!name || name === row.name) return;
+  try {
+    const saved = await api(`/api/sandboxes/${sid}`, { method: "PUT", body: { name } });
+    row.name = saved.name;
+    if (currentSandbox?.id === sid) currentSandbox.name = saved.name;
+    renderSandboxList(); showToast("沙盘已重命名", "ok");
+  } catch (e) { showToast("重命名失败：" + e.message, "err"); }
+}
+async function deleteOutlineSandbox(sid) {
+  const row = sandboxList.find(item => item.id === sid); if (!row) return;
+  if (!await askCard({ title: `删除“${row.name}”？`, msg: "该沙盘中的情节推演会被删除，不影响已经采纳的正文章节。", okText: "删除", danger: true })) return;
+  try {
+    await api(`/api/sandboxes/${sid}`, { method: "DELETE" });
+    sandboxList = sandboxList.filter(item => item.id !== sid);
+    if (currentSandbox?.id === sid) {
+      currentSandbox = null; selectedSandboxNodeId = null;
+      if (sandboxList.length) await loadOutlineSandbox(sandboxList[0].id);
+      else {
+        currentSandbox = await api(`/api/works/${currentWorkId}/sandboxes`, { body: { name: "主线推演", data: { nodes: [], edges: [] } } });
+        sandboxList = [{ id: currentSandbox.id, name: currentSandbox.name, node_count: 0, edge_count: 0 }];
+        renderOutlineSandbox(); renderSandboxInspector();
+      }
+    }
+    renderSandboxList(); showToast("沙盘已删除", "ok");
+  } catch (e) { showToast("删除失败：" + e.message, "err"); }
 }
 function scheduleSandboxSave() {
   clearTimeout(sandboxSaveTimer);
@@ -1397,37 +1433,72 @@ async function saveOutlineSandbox(feedback = true) {
 function sandboxKindLabel(kind) {
   return ({ volume: "卷", chapter: "章", plot: "情节", choice: "选择", ending: "结局" })[kind] || "情节";
 }
+function sandboxDirectionClass(direction) {
+  return ({ "主线": "dir-main", "推进": "dir-advance", "发散": "dir-diverge", "收束": "dir-converge" })[direction] || "";
+}
+function sandboxHiddenNodeIds() {
+  const data = sandboxData(), children = new Map();
+  data.edges.forEach(edge => {
+    if (!children.has(edge.from)) children.set(edge.from, []);
+    children.get(edge.from).push(edge.to);
+  });
+  const hidden = new Set();
+  function hideDescendants(nodeId, trail = new Set([nodeId])) {
+    (children.get(nodeId) || []).forEach(childId => {
+      if (trail.has(childId)) return;
+      hidden.add(childId);
+      const nextTrail = new Set(trail); nextTrail.add(childId);
+      hideDescendants(childId, nextTrail);
+    });
+  }
+  data.nodes.filter(node => node.collapsed).forEach(node => hideDescendants(node.id));
+  return hidden;
+}
 function renderOutlineSandbox() {
   if (!currentSandbox) return;
   const data = sandboxData(), nodesHost = $("sandboxNodes"), edgeHost = $("sandboxEdges"), world = $("sandboxWorld");
+  const hidden = sandboxHiddenNodeIds();
+  const visibleNodes = data.nodes.filter(node => !hidden.has(node.id));
+  const parents = new Set(data.edges.map(edge => edge.from));
   const maxX = Math.max(2200, ...data.nodes.map(node => (+node.x || 0) + 360));
   const maxY = Math.max(1400, ...data.nodes.map(node => (+node.y || 0) + 260));
   world.style.width = `${maxX}px`; world.style.height = `${maxY}px`;
   edgeHost.setAttribute("width", maxX); edgeHost.setAttribute("height", maxY);
-  nodesHost.innerHTML = data.nodes.map(node => `
-    <article class="sandbox-node kind-${esc(node.kind)} ${node.id === selectedSandboxNodeId ? "selected" : ""}"
+  nodesHost.innerHTML = visibleNodes.map(node => `
+    <article class="sandbox-node kind-${esc(node.kind)} ${sandboxDirectionClass(node.direction)} ${node.id === selectedSandboxNodeId ? "selected" : ""}"
       data-node-id="${esc(node.id)}" style="left:${+node.x || 0}px;top:${+node.y || 0}px">
       <div class="sandbox-node-dir">${esc(node.direction || sandboxKindLabel(node.kind))}</div>
       <div class="sandbox-node-title">${esc(node.title)}</div>
       <div class="sandbox-node-summary">${esc(node.summary || "点击填写这个情节点会发生什么")}</div>
       <div class="sandbox-node-meta">${node.chapter_id ? "已关联正文章节" : "沙盘草案"}${node.characters ? ` · ${esc(node.characters)}` : ""}</div>
+      ${parents.has(node.id) ? `<button class="sandbox-node-collapse" data-collapse-node="${esc(node.id)}" title="${node.collapsed ? "展开子节点" : "收起子节点"}">${node.collapsed ? "+" : "−"}</button>` : ""}
     </article>`).join("");
   nodesHost.querySelectorAll(".sandbox-node").forEach(element => {
     element.addEventListener("pointerdown", startSandboxDrag);
     element.addEventListener("click", () => selectSandboxNode(element.dataset.nodeId));
+  });
+  nodesHost.querySelectorAll("[data-collapse-node]").forEach(button => {
+    button.addEventListener("pointerdown", event => event.stopPropagation());
+    button.addEventListener("click", event => { event.stopPropagation(); toggleSandboxCollapse(button.dataset.collapseNode); });
   });
   renderSandboxEdges();
 }
 function renderSandboxEdges() {
   if (!currentSandbox) return;
   const data = sandboxData(), byId = new Map(data.nodes.map(node => [node.id, node]));
+  const hidden = sandboxHiddenNodeIds();
   $("sandboxEdges").innerHTML = data.edges.map(edge => {
-    const from = byId.get(edge.from), to = byId.get(edge.to); if (!from || !to) return "";
+    const from = byId.get(edge.from), to = byId.get(edge.to); if (!from || !to || hidden.has(edge.from) || hidden.has(edge.to)) return "";
     const x1 = (+from.x || 0) + 220, y1 = (+from.y || 0) + 48, x2 = +to.x || 0, y2 = (+to.y || 0) + 48;
     const bend = Math.max(50, Math.abs(x2 - x1) * .45);
     const path = `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
-    return `<path class="sandbox-edge" d="${path}"></path>${edge.label ? `<text class="sandbox-edge-label" x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 6}">${esc(edge.label)}</text>` : ""}`;
+    const direction = ["主线", "推进", "发散", "收束"].includes(edge.label) ? edge.label : to.direction;
+    return `<path class="sandbox-edge ${sandboxDirectionClass(direction)}" d="${path}"></path>${edge.label ? `<text class="sandbox-edge-label" x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 6}">${esc(edge.label)}</text>` : ""}`;
   }).join("");
+}
+function toggleSandboxCollapse(nodeId) {
+  const node = sandboxData().nodes.find(item => item.id === nodeId); if (!node) return;
+  node.collapsed = !node.collapsed; renderOutlineSandbox(); scheduleSandboxSave();
 }
 function selectSandboxNode(nodeId) {
   selectedSandboxNodeId = nodeId; sandboxAiCandidates = [];
@@ -1442,21 +1513,28 @@ function renderSandboxInspector() {
   if (!node) return;
   $("sandboxNodeBadge").textContent = node.direction || sandboxKindLabel(node.kind);
   $("sandboxNodeTitle").value = node.title || ""; $("sandboxNodeSummary").value = node.summary || "";
-  $("sandboxNodeKind").value = node.kind || "plot"; $("sandboxNodeCharacters").value = node.characters || "";
+  $("sandboxNodeKind").value = node.kind || "plot"; $("sandboxNodeDirection").value = node.direction || "";
+  $("sandboxNodeCharacters").value = node.characters || "";
   $("sandboxOpenChapterBtn").classList.toggle("hidden", !node.chapter_id);
   $("sandboxAdoptBtn").classList.toggle("hidden", !!node.chapter_id); renderSandboxCandidates();
 }
 function updateSelectedSandboxNode() {
   const node = selectedSandboxNode(); if (!node) return;
   node.title = $("sandboxNodeTitle").value; node.summary = $("sandboxNodeSummary").value;
-  node.kind = $("sandboxNodeKind").value; node.characters = $("sandboxNodeCharacters").value;
+  node.kind = $("sandboxNodeKind").value; node.direction = $("sandboxNodeDirection").value;
+  node.characters = $("sandboxNodeCharacters").value;
+  const incoming = sandboxData().edges.find(edge => edge.to === node.id);
+  if (incoming && node.direction) incoming.label = node.direction;
+  $("sandboxNodeBadge").textContent = node.direction || sandboxKindLabel(node.kind);
   const el = [...$("sandboxNodes").querySelectorAll(".sandbox-node")].find(item => item.dataset.nodeId === node.id);
   if (el) {
-    el.className = `sandbox-node kind-${node.kind} selected`;
+    el.className = `sandbox-node kind-${node.kind} ${sandboxDirectionClass(node.direction)} selected`;
+    el.querySelector(".sandbox-node-dir").textContent = node.direction || sandboxKindLabel(node.kind);
     el.querySelector(".sandbox-node-title").textContent = node.title || "未命名情节点";
     el.querySelector(".sandbox-node-summary").textContent = node.summary || "点击填写这个情节点会发生什么";
     el.querySelector(".sandbox-node-meta").textContent = `${node.chapter_id ? "已关联正文章节" : "沙盘草案"}${node.characters ? ` · ${node.characters}` : ""}`;
   }
+  renderSandboxEdges();
   scheduleSandboxSave();
 }
 
@@ -1470,6 +1548,7 @@ function addSandboxRoot() {
 function addSandboxBranch(candidate = null) {
   const parent = selectedSandboxNode();
   if (!parent) { showToast("先选择一个父节点", "err"); return; }
+  parent.collapsed = false;
   const siblings = sandboxData().edges.filter(edge => edge.from === parent.id).length;
   const node = { id: sandboxNodeId("branch"), title: candidate?.title || "新的分支", summary: candidate?.summary || "",
     kind: "choice", direction: candidate?.direction || "发散", characters: candidate?.characters || "", chapter_id: null,
@@ -1477,9 +1556,11 @@ function addSandboxBranch(candidate = null) {
   sandboxData().nodes.push(node);
   sandboxData().edges.push({ id: sandboxNodeId("edge"), from: parent.id, to: node.id, label: node.direction });
   sandboxAiCandidates = []; renderOutlineSandbox(); selectSandboxNode(node.id); scheduleSandboxSave();
+  return node;
 }
-function deleteSelectedSandboxNode() {
+async function deleteSelectedSandboxNode() {
   const node = selectedSandboxNode(); if (!node) return;
+  if (!await askCard({ title: `删除“${node.title || "未命名节点"}”？`, msg: "只删除这个节点；它的子节点会保留为新的起点。", okText: "删除", danger: true })) return;
   sandboxData().nodes = sandboxData().nodes.filter(item => item.id !== node.id);
   sandboxData().edges = sandboxData().edges.filter(edge => edge.from !== node.id && edge.to !== node.id);
   selectedSandboxNodeId = null; renderOutlineSandbox(); renderSandboxInspector(); scheduleSandboxSave();
@@ -1560,8 +1641,48 @@ async function expandSandboxNode() {
 function renderSandboxCandidates() {
   const host = $("sandboxCandidates"); if (!host) return;
   host.innerHTML = sandboxAiCandidates.map((item, index) => `
-    <div class="sandbox-candidate" data-direction="${esc(item.direction)}"><b>${esc(item.direction)} · ${esc(item.title)}</b><p>${esc(item.summary)}</p><button data-candidate-index="${index}">加入为子节点</button></div>`).join("");
+    <div class="sandbox-candidate" data-direction="${esc(item.direction)}"><b>${esc(item.direction)} · ${esc(item.title)}</b><p>${esc(item.summary)}</p><div class="set-actions"><button data-candidate-index="${index}">保留</button><button class="ic" data-candidate-expand="${index}">保留并继续展开</button></div></div>`).join("");
   host.querySelectorAll("[data-candidate-index]").forEach(button => button.addEventListener("click", () => addSandboxBranch(sandboxAiCandidates[+button.dataset.candidateIndex])));
+  host.querySelectorAll("[data-candidate-expand]").forEach(button => button.addEventListener("click", async () => {
+    const candidate = sandboxAiCandidates[+button.dataset.candidateExpand];
+    if (!candidate || !addSandboxBranch(candidate)) return;
+    await expandSandboxNode();
+  }));
+}
+function sandboxExportMarkdown(rootId = null) {
+  const data = sandboxData(), byId = new Map(data.nodes.map(node => [node.id, node]));
+  const children = new Map(data.nodes.map(node => [node.id, []])), incoming = new Set();
+  data.edges.forEach(edge => {
+    if (!byId.has(edge.from) || !byId.has(edge.to)) return;
+    children.get(edge.from).push({ node: byId.get(edge.to), label: edge.label || "" }); incoming.add(edge.to);
+  });
+  const roots = rootId && byId.has(rootId) ? [byId.get(rootId)] : data.nodes.filter(node => !incoming.has(node.id));
+  const lines = [`# ${currentSandbox?.name || "情节沙盘"}`, ""]; const seen = new Set();
+  function append(node, depth, edgeLabel = "") {
+    if (!node || seen.has(node.id)) return;
+    seen.add(node.id);
+    const prefix = "  ".repeat(depth);
+    const direction = node.direction || edgeLabel || sandboxKindLabel(node.kind);
+    lines.push(`${prefix}- **${node.title || "未命名节点"}**（${direction}）`);
+    if (node.summary) lines.push(`${prefix}  ${String(node.summary).replace(/\r?\n/g, `\n${prefix}  `)}`);
+    if (node.characters) lines.push(`${prefix}  - 角色：${node.characters}`);
+    if (node.chapter_id) lines.push(`${prefix}  - 正文章节 ID：${node.chapter_id}`);
+    (children.get(node.id) || []).forEach(child => append(child.node, depth + 1, child.label));
+  }
+  roots.forEach(root => append(root, 0));
+  if (!rootId) data.nodes.forEach(node => append(node, 0));
+  return lines.join("\n");
+}
+async function exportSandboxTree(rootId = null) {
+  if (!currentSandbox) return;
+  const markdown = sandboxExportMarkdown(rootId);
+  const base = (rootId ? selectedSandboxNode()?.title : currentSandbox.name) || "情节沙盘";
+  const filename = `${base.replace(/[\\/:*?"<>|]+/g, "-")}.md`;
+  const url = URL.createObjectURL(new Blob([markdown], { type: "text/markdown;charset=utf-8" }));
+  const anchor = document.createElement("a"); anchor.href = url; anchor.download = filename; anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  await navigator.clipboard?.writeText(markdown).catch(() => {});
+  showToast(rootId ? "此分支已导出，并复制为 Markdown" : "整棵沙盘已导出，并复制为 Markdown", "ok");
 }
 async function adoptSandboxNode() {
   const node = selectedSandboxNode(); if (!node || node.chapter_id) return;
@@ -1619,6 +1740,8 @@ function renderDisassemblyJobSwitch() {
     : '<option value="">暂无任务</option>';
 }
 async function switchDisassemblyJob(jobId) {
+  $("disassemblyExtractionSummary").classList.add("hidden");
+  $("disassemblyExtractionSummary").textContent = "";
   if (!jobId) { currentDisassemblyJob = null; renderDisassemblyJob(); return; }
   disassemblyRunning = false;
   try {
@@ -1785,10 +1908,25 @@ function renderMaterialHub() {
     : '<option value="">没有可挂载的其他作品</option>';
   $("materialReferenceList").innerHTML = (materialData.mounts || []).length ? materialData.mounts.map(item => {
     const uses = [item.use_style && "文风", item.use_plot && "桥段", item.use_world && "世界观"].filter(Boolean).join("、") || "未启用参考方向";
-    return `<article class="material-list-item"><div><b>${esc(item.reference_title)}</b><small>${esc(uses)} · 只读参考，不作为本书事实</small></div><button class="ic danger-lite" onclick="removeMaterialReference(${item.id})">卸载</button></article>`;
+    return `<article class="material-list-item"><div><b>${esc(item.reference_title)}</b><small>${esc(uses)} · 只读参考，不作为本书事实</small></div>
+      <div class="material-reference-directions">
+        <label><input type="checkbox" ${item.use_style ? "checked" : ""} onchange="updateMaterialReference(${item.id},'use_style',this.checked)">文风</label>
+        <label><input type="checkbox" ${item.use_plot ? "checked" : ""} onchange="updateMaterialReference(${item.id},'use_plot',this.checked)">桥段</label>
+        <label><input type="checkbox" ${item.use_world ? "checked" : ""} onchange="updateMaterialReference(${item.id},'use_world',this.checked)">世界观</label>
+      </div><button class="ic danger-lite" onclick="removeMaterialReference(${item.id})">卸载</button></article>`;
   }).join("") : '<div class="empty">尚未挂载参考工程。</div>';
+  $("materialExtractionList").innerHTML = (materialData.extractions || []).length ? materialData.extractions.map(item => {
+    const profile = item.result?.style_profile || {}, voices = Array.isArray(profile.character_voices) ? profile.character_voices.length : 0;
+    const crafts = Array.isArray(profile.description_craft) ? profile.description_craft.length : 0;
+    const plots = Array.isArray(item.result?.plot_devices) ? item.result.plot_devices.length : 0;
+    const time = item.updated_at ? new Date(item.updated_at * 1000).toLocaleString() : "";
+    const status = item.status === "completed" ? "已完成" : item.status === "failed" ? "失败" : item.status;
+    const detail = item.status === "completed" ? `${voices} 份人物声音 · ${crafts} 条描写技法 · ${plots} 个桥段 · ${(item.inspiration_ids || []).length} 条已入灵感库` : (item.error || "未完成");
+    return `<article class="material-list-item material-extraction-card" data-status="${esc(item.status)}"><div><b>${esc(item.source_name || "拆书任务")} · ${esc(status)}</b><small>${esc(detail)}${time ? ` · ${esc(time)}` : ""}</small></div></article>`;
+  }).join("") : '<div class="empty">还没有整本提炼记录。完成拆书分析后，可在拆书页点击“提炼整本资料”。</div>';
   $("materialDocumentList").innerHTML = (materialData.documents || []).length ? materialData.documents.map(item => `
     <article class="material-list-item"><div><b>${esc(item.name)}</b><small>${Number(item.chars || 0).toLocaleString()} 字${item.tags ? ` · ${esc(item.tags)}` : ""}</small></div>
+      <button class="ic" onclick="openMaterialDocumentPreview(${item.id})">查看</button>
       <label><input type="checkbox" ${item.enabled ? "checked" : ""} onchange="updateMaterialDocument(${item.id},{enabled:this.checked})">启用</label>
       <label><input type="checkbox" ${item.pinned ? "checked" : ""} onchange="updateMaterialDocument(${item.id},{pinned:this.checked})">置顶</label>
       <button class="ic danger-lite" onclick="deleteMaterialDocument(${item.id})">删除</button></article>`).join("") : '<div class="empty">还没有长期资料。本轮附件不会自动长期保存。</div>';
@@ -1816,6 +1954,17 @@ async function addMaterialReference() {
     await loadMaterialHub(); showToast("参考工程已挂载", "ok");
   } catch (e) { showToast(e.message, "err"); }
 }
+async function updateMaterialReference(mountId, key, checked) {
+  const item = materialData?.mounts?.find(row => row.id === mountId); if (!item) return;
+  item[key] = checked;
+  try {
+    await api(`/api/works/${currentWorkId}/materials/references`, { body: {
+      reference_work_id: item.reference_work_id, enabled: item.enabled !== false,
+      use_style: !!item.use_style, use_plot: !!item.use_plot, use_world: !!item.use_world,
+    }});
+    await loadMaterialHub(); showToast("参考方向已更新", "ok");
+  } catch (e) { await loadMaterialHub(); showToast(e.message, "err"); }
+}
 async function removeMaterialReference(mountId) {
   try { await api(`/api/works/${currentWorkId}/materials/references/${mountId}`, { method: "DELETE" }); await loadMaterialHub(); }
   catch (e) { showToast(e.message, "err"); }
@@ -1839,6 +1988,15 @@ async function updateMaterialDocument(documentId, changes) {
   try { await api(`/api/works/${currentWorkId}/materials/documents/${documentId}`, { method: "PUT", body: changes }); await loadMaterialHub(); }
   catch (e) { showToast(e.message, "err"); }
 }
+async function openMaterialDocumentPreview(documentId) {
+  try {
+    const item = await api(`/api/works/${currentWorkId}/materials/documents/${documentId}`, { method: "GET" });
+    $("materialDocumentPreviewTitle").textContent = item.name || "长期资料";
+    $("materialDocumentPreviewContent").textContent = item.content || "";
+    $("materialDocumentPreviewOverlay").classList.remove("hidden");
+  } catch (e) { showToast("资料打开失败：" + e.message, "err"); }
+}
+function closeMaterialDocumentPreview() { $("materialDocumentPreviewOverlay").classList.add("hidden"); }
 async function deleteMaterialDocument(documentId) {
   if (!await askCard({ title: "删除这份长期资料？", msg: "仅删除资料中心副本，不影响原文件。", okText: "删除", danger: true })) return;
   try { await api(`/api/works/${currentWorkId}/materials/documents/${documentId}`, { method: "DELETE" }); await loadMaterialHub(); }
@@ -1859,8 +2017,11 @@ async function extractDisassemblyMaterials() {
   const button = $("disassemblyExtractBtn"); busy(button, true, "提炼中");
   try {
     const result = await api(`/api/disassembly/jobs/${currentDisassemblyJob.id}/materials/extract`, { body: { create_inspirations: true } });
-    showToast(`整本资料已提炼：语言指纹已保存，${(result.inspiration_ids || []).length} 个桥段已加入灵感库`, "ok");
-    if (currentDisassemblyJob.target_work_id === currentWorkId && !$("materialOverlay").classList.contains("hidden")) await loadMaterialHub();
+    const plots = (result.plot_devices || []).length, saved = (result.inspiration_ids || []).length;
+    $("disassemblyExtractionSummary").textContent = `提炼完成：语言指纹已保存，识别 ${plots} 个桥段，其中 ${saved} 个已加入灵感库。可到“创作资料中心”核对和启停。`;
+    $("disassemblyExtractionSummary").classList.remove("hidden");
+    showToast(`整本资料已提炼：语言指纹已保存，${saved} 个桥段已加入灵感库`, "ok");
+    if (currentDisassemblyJob.target_work_id === currentWorkId) await loadMaterialHub();
   } catch (e) { showToast(e.message, "err"); }
   finally { busy(button, false, "提炼整本资料"); }
 }
@@ -2225,6 +2386,76 @@ function updateAgentReplyStream(event) {
   }
   scheduleAgentReplyRender();
 }
+function renderAgentInlineMarkdown(value) {
+  return esc(String(value || ""))
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+}
+function renderAgentMarkdown(value) {
+  const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
+  let html = "", list = "", inCode = false, code = [];
+  const closeList = () => { if (list) { html += `</${list}>`; list = ""; } };
+  const closeCode = () => {
+    if (!inCode) return;
+    html += `<pre><code>${esc(code.join("\n"))}</code></pre>`;
+    inCode = false; code = [];
+  };
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) { if (inCode) closeCode(); else { closeList(); inCode = true; } continue; }
+    if (inCode) { code.push(line); continue; }
+    let match;
+    if (!line.trim()) { closeList(); continue; }
+    if ((match = line.match(/^\s*(#{1,3})\s+(.+)$/))) {
+      closeList(); const level = Math.min(5, match[1].length + 2); html += `<h${level}>${renderAgentInlineMarkdown(match[2])}</h${level}>`; continue;
+    }
+    if ((match = line.match(/^\s*[-*]\s+(.+)$/))) {
+      if (list !== "ul") { closeList(); list = "ul"; html += "<ul>"; }
+      html += `<li>${renderAgentInlineMarkdown(match[1])}</li>`; continue;
+    }
+    if ((match = line.match(/^\s*\d+[.)、]\s*(.+)$/))) {
+      if (list !== "ol") { closeList(); list = "ol"; html += "<ol>"; }
+      html += `<li>${renderAgentInlineMarkdown(match[1])}</li>`; continue;
+    }
+    closeList();
+    if ((match = line.match(/^\s*>\s*(.+)$/))) html += `<blockquote>${renderAgentInlineMarkdown(match[1])}</blockquote>`;
+    else html += `<p>${renderAgentInlineMarkdown(line)}</p>`;
+  }
+  closeList(); closeCode();
+  return html;
+}
+function agentToolMeta(name) {
+  const value = String(name || "tool");
+  if (value === "web_search" || /search|find/i.test(value)) return { tone: "search", icon: "search", label: "搜索" };
+  if (/read|list|get|context|inspect/i.test(value)) return { tone: "read", icon: "eye", label: "读取" };
+  if (/delete|remove|purge/i.test(value)) return { tone: "danger", icon: "trash", label: "删除" };
+  if (/write|replace|update|save|create|add|restore|edit/i.test(value)) return { tone: "write", icon: "pen", label: "写入" };
+  return { tone: "neutral", icon: "settings", label: "工具" };
+}
+async function copyAgentMessage(index) {
+  const content = agentMsgs[index]?.content || "";
+  if (!content) return;
+  try { await navigator.clipboard.writeText(content); showToast("AI 回复已复制", "ok"); }
+  catch (e) { showToast("复制失败，请长按文字复制", "err"); }
+}
+function insertAgentMessage(index) {
+  const content = agentMsgs[index]?.content || "";
+  if (!currentChapterId || !content) { showToast("先打开一个正文章节", "err"); return; }
+  const editor = $("content"), start = editor.selectionStart, end = editor.selectionEnd;
+  const prefix = start > 0 && editor.value[start - 1] !== "\n" ? "\n" : "";
+  editor.setRangeText(prefix + content, start, end, "end");
+  onContentInput(); editor.focus(); showToast("已插入正文，可继续编辑或撤销", "ok");
+}
+function retryAgentMessage(index) {
+  for (let i = index - 1; i >= 0; i--) {
+    if (agentMsgs[i]?.role === "user") {
+      if (agentMsgs[i].content === "[voice] 语音指令") {
+        showToast("直发模式不会在浏览器保留原始录音，请重新录音；转写模式的文字可以直接重试", "err"); return;
+      }
+      $("agentInput").value = agentMsgs[i].content || ""; sendAgent(); return;
+    }
+  }
+  showToast("没有找到可重新发送的文字指令", "err");
+}
 function renderAgent() {
   const el = $("agentMsgs");
   if (agentConversationLoading) {
@@ -2237,7 +2468,8 @@ function renderAgent() {
   }
   let html = "";
   let temporaryLabelShown = false;
-  for (const m of agentMsgs) {
+  for (let messageIndex = 0; messageIndex < agentMsgs.length; messageIndex++) {
+    const m = agentMsgs[messageIndex];
     if (m.temporary && !temporaryLabelShown) {
       html += '<div class="chat-temporary-label">临时一问 · 不保存</div>';
       temporaryLabelShown = true;
@@ -2245,14 +2477,24 @@ function renderAgent() {
     const temporaryClass = m.temporary ? " temporary" : "";
     if (m.role === "user") {
       html += m.content === "[voice] 语音指令"
-        ? `<div class="cm user voice${temporaryClass}">${svg("mic")} 语音指令</div>`
-        : `<div class="cm user${temporaryClass}">${esc(m.content)}</div>`;
+        ? `<div class="cm user voice${temporaryClass}">${svg("mic")}<span><b>你 · 语音</b><br>语音指令</span></div>`
+        : `<div class="cm user${temporaryClass}"><div class="agent-message-label">你</div><div>${esc(m.content)}</div></div>`;
     } else if (m.role === "assistant") {
-      if (m.content) html += `<div class="cm assistant${temporaryClass}">${esc(m.content)}</div>`;
+      if (m.content) {
+        const isError = /^(出错|失败|请求失败|网络错误|语音直发失败)[:：]/.test(m.content.trim());
+        html += `<div class="cm assistant${isError ? " error-message" : ""}${temporaryClass}">
+          <div class="agent-message-label">${svg(isError ? "alert" : "bot")}<span>${isError ? "请求出错" : "AI"}</span></div>
+          <div class="agent-message-body">${renderAgentMarkdown(m.content)}</div>
+          <div class="agent-message-actions">
+            <button onclick="copyAgentMessage(${messageIndex})" title="复制回复">${svg("copy")}复制</button>
+            ${isError ? `<button onclick="retryAgentMessage(${messageIndex})" title="不用重新输入，重新发送上一条文字指令">${svg("refresh")}重新发送</button>` : `<button onclick="insertAgentMessage(${messageIndex})" title="插入当前章节光标位置">${svg("enter")}插入正文</button>`}
+          </div>
+        </div>`;
+      }
     } else if (m.role === "tool") {
       let r = {}; try { r = JSON.parse(m.content); } catch (e) {}
       if (r.error) {
-        html += `<div class="cm err">${esc(r.error)}</div>`;
+        html += `<div class="cm action tool-danger"><div class="act-bar"><span class="act-txt">${svg("alert")}<b>工具出错</b><span>${esc(r.error)}</span></span></div></div>`;
       } else {
         const sum = r.summary || "已执行操作";
         const rid = r.undo_rid;
@@ -2262,18 +2504,18 @@ function renderAgent() {
           ? `<span class="done-tag">已撤销</span>`
           : (rid && actionChapterId ? `<button class="undo-btn" onclick="undoAgentAction(${rid},${actionChapterId})">撤销</button>` : "");
         const sources = renderAgentSources(r.sources);
-        const actionIcon = m.name === "web_search" ? "search" : "pen";
-        html += `<div class="cm action${undone ? " done" : ""}${temporaryClass}"><div class="act-bar"><span class="act-txt">${svg(actionIcon)} ${esc(sum)}</span>${card}</div>${sources}</div>`;
+        const meta = agentToolMeta(m.name);
+        html += `<div class="cm action tool-${meta.tone}${undone ? " done" : ""}${temporaryClass}"><div class="act-bar"><span class="act-txt">${svg(meta.icon)}<b>${meta.label}</b><span>${esc(sum)}</span></span>${card || '<span class="agent-step-status">✓ 完成</span>'}</div>${sources}</div>`;
       }
     }
   }
   if (agentBusy && agentReplyDraft) {
-    html += `<div id="agentStreamBubble" class="cm assistant streaming"><span id="agentStreamText">${esc(agentReplyDraft)}</span><span class="stream-caret"></span></div>`;
+    html += `<div id="agentStreamBubble" class="cm assistant streaming"><div class="agent-message-label">${svg("bot")}<span>AI · 生成中</span></div><span id="agentStreamText">${esc(agentReplyDraft)}</span><span class="stream-caret"></span></div>`;
   }
   if (agentBusy && agentReplyStatus) {
     html += `<div class="agent-stream-status"><span class="spinner"></span><span id="agentStreamStatusText">${esc(agentReplyStatus)}</span></div>`;
   } else if (agentBusy && !agentReplyDraft) {
-    html += '<div class="cm assistant">… 思考中</div>';
+    html += `<div class="cm assistant"><div class="agent-message-label">${svg("sparkles")}<span>AI</span></div>… 思考中</div>`;
   }
   el.innerHTML = html;
   el.scrollTop = el.scrollHeight;
@@ -2841,6 +3083,7 @@ const imageAssetObjectUrls = new Map();
 let entityImageHistory = [];
 let characterImageLibraryItems = [];
 let characterImageFilter = "all";
+let currentLightboxImageId = null;
 const characterStateFields = [
   ["location", "所在地点", "characterStateLocation"],
   ["goal", "当前目标", "characterStateGoal"],
@@ -3130,9 +3373,31 @@ async function openImageAssetLightbox(imageId) {
   $("imageLightboxImg").src = url;
   $("imageLightboxTitle").textContent = `${item.entity_name || "角色形象"}${item.selected ? " · 当前主图" : ""}`;
   $("imageLightboxPrompt").textContent = item.prompt || "没有保存提示词";
+  currentLightboxImageId = imageId;
   $("imageLightbox").classList.remove("hidden");
 }
-function closeImageLightbox() { $("imageLightbox").classList.add("hidden"); }
+function lightboxImageItem() {
+  return [...entityImageHistory, ...characterImageLibraryItems].find(row => row.id === currentLightboxImageId);
+}
+async function copyLightboxPrompt() {
+  const prompt = lightboxImageItem()?.prompt || "";
+  if (!prompt) { showToast("这张图没有保存提示词", "err"); return; }
+  await navigator.clipboard?.writeText(prompt).catch(() => {}); showToast("提示词已复制", "ok");
+}
+async function reuseLightboxPrompt() {
+  const item = lightboxImageItem(); if (!item) return;
+  closeImageLightbox(); closeCharacterImageLibrary();
+  await openEntityImage(item.entity_id);
+  $("entityImagePrompt").value = item.prompt || $("entityImagePrompt").value;
+  $("entityImageMsg").textContent = "已载入这张历史图的提示词，可调整后再次生成";
+}
+async function downloadLightboxImage() {
+  const item = lightboxImageItem(); if (!item) return;
+  const url = await imageAssetUrl(item.id).catch(() => ""); if (!url) return;
+  const anchor = document.createElement("a"); anchor.href = url;
+  anchor.download = `${(item.entity_name || "角色形象").replace(/[\\/:*?"<>|]+/g, "-")}-${item.id}.png`; anchor.click();
+}
+function closeImageLightbox() { $("imageLightbox").classList.add("hidden"); currentLightboxImageId = null; }
 async function openCharacterImageLibrary(entityId = null) {
   if (!currentWorkId) { showToast("先选择作品", "err"); return; }
   characterImageFilter = entityId ? String(entityId) : "all";

@@ -556,7 +556,7 @@ def _normalize_sandbox_data(data, wid, uid):
         if chapter_id not in chapter_ids:
             chapter_id = None
         kind = raw.get("kind") if raw.get("kind") in {"volume", "chapter", "plot", "choice", "ending"} else "plot"
-        direction = raw.get("direction") if raw.get("direction") in {"发散", "收束", "推进", ""} else ""
+        direction = raw.get("direction") if raw.get("direction") in {"发散", "收束", "推进", "主线", ""} else ""
         characters = raw.get("characters")
         if isinstance(characters, list):
             characters = "、".join(str(item).strip() for item in characters if str(item).strip())
@@ -2264,6 +2264,14 @@ async def save_reference_document(wid: int, request: Request):
     if result is None:
         raise HTTPException(404, "作品不存在")
     return {"ok": True, "document": result}
+
+
+@app.get("/api/works/{wid}/materials/documents/{document_id}")
+async def get_reference_document(wid: int, document_id: int, request: Request):
+    result = materials.get_document(_auth(request), wid, document_id)
+    if result is None:
+        raise HTTPException(404, "长期资料不存在")
+    return result
 
 
 @app.put("/api/works/{wid}/materials/documents/{document_id}")
