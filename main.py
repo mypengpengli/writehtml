@@ -746,11 +746,34 @@ def _default_character_image_prompt(entity, state=None):
         parts.append(f"Canonical appearance, personality and background details (source language): {entity['detail']}")
     state = state if isinstance(state, dict) else {}
     live = "；".join(f"{key}：{value}" for key, value in {
-        "所在地点": state.get("location"), "情绪": state.get("emotion"),
-        "身体状态": state.get("physical"), "能力与物品": state.get("assets"),
+        "所在地点": state.get("location"), "当前目标": state.get("goal"),
+        "情绪": state.get("emotion"), "身体状态": state.get("physical"),
+        "能力与物品": state.get("assets"), "补充状态": state.get("notes"),
     }.items() if value)
     if live:
         parts.append(f"Current story-state cues (source language; use only visually relevant details): {live}")
+    return "\n".join(parts)[:8000]
+
+
+def _compose_character_image_prompt(entity, state=None, direction="", style=""):
+    """Canonical character facts are always present and always outrank reusable image directions."""
+    canonical = _default_character_image_prompt(entity, state).strip()
+    direction = str(direction or "").strip()
+    style = str(style or "").strip()
+    extras = []
+    if direction and direction != canonical:
+        extras.append(
+            "Additional author or historical-image direction follows. Use it only where it does not conflict "
+            "with the latest canonical character facts above; the latest canonical facts always win:\n"
+            + direction[:2000]
+        )
+    if style:
+        extras.append("Additional visual-style request (source language): " + style[:1000])
+    extra_text = "\n".join(extras)
+    canonical_budget = max(4800, 8000 - len(extra_text) - (1 if extra_text else 0))
+    parts = [canonical[:canonical_budget]]
+    if extra_text:
+        parts.append(extra_text)
     return "\n".join(parts)[:8000]
 
 
@@ -770,7 +793,8 @@ async def polish_entity_image_prompt(eid: int, request: Request):
         overview = db.get_entity_state_overview(eid, uid, chapter_id)
         if overview and not overview.get("invalid_chapter"):
             state = overview.get("current_state")
-    draft = str(body.get("prompt") or _default_character_image_prompt(entity, state)).strip()[:8000]
+    canonical = _default_character_image_prompt(entity, state)
+    draft = str(body.get("prompt") or canonical).strip()[:8000]
     style = str(body.get("style") or "").strip()[:1000]
     cfg = _material_llm_config(uid)
     instruction = {
@@ -778,12 +802,14 @@ async def polish_entity_image_prompt(eid: int, request: Request):
         "rules": [
             "Return only the final English prompt, without Markdown or explanation.",
             "Preserve canonical physical traits and identity. Do not add facts that conflict with the source.",
+            "The latest canonical_character_facts override any conflicting detail in draft_prompt or older image prompts.",
             "Include visual style, full-body vertical composition, camera, lighting, color palette, costume materials, expression, pose and background.",
             "A character illustration should be 3:4 or 2:3 and contain one person unless the source explicitly requires otherwise.",
             "End with negative constraints: no text, watermark, logo, duplicate figure, extra limbs, cropped feet or malformed hands.",
             "Do not imitate a living artist or reproduce a copyrighted character; describe visual properties instead.",
         ],
         "character": {"name": entity["name"], "summary": entity.get("summary") or "", "detail": entity.get("detail") or "", "state": state or {}},
+        "canonical_character_facts": canonical,
         "author_style_request": style,
         "draft_prompt": draft,
     }
@@ -845,11 +871,8 @@ async def generate_entity_image(eid: int, request: Request):
         overview = db.get_entity_state_overview(eid, uid, chapter_id)
         if overview and not overview.get("invalid_chapter"):
             state = overview.get("current_state")
-    prompt = (body.get("prompt") or entity.get("image_prompt") or
-              _default_character_image_prompt(entity, state)).strip()[:8000]
     style = (body.get("style") or "").strip()[:1000]
-    if style:
-        prompt = f"{prompt}\nAdditional visual-style request (source language): {style}"[:8000]
+    prompt = _compose_character_image_prompt(entity, state, body.get("prompt"), style)
     provider = _image_provider_settings(uid)
     size = (body.get("size") or provider["size"]).strip()[:32]
     try:

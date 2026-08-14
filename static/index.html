@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ux-details-20260813-2">
+  <link rel="stylesheet" href="style.css?v=character-profile-images-20260814">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -96,7 +96,7 @@
             <div class="menu-label">创作资料</div>
             <button data-ic="archive" data-label="资料中心" onclick="openMaterialHub();closeMoreMenu()"></button>
             <button data-ic="bulb" data-label="灵感库" onclick="openInspirationLibrary();closeMoreMenu()"></button>
-            <button data-ic="image" data-label="角色图库" onclick="openCharacterImageLibrary();closeMoreMenu()"></button>
+            <button data-ic="image" data-label="全书角色图库" onclick="openCharacterImageLibrary();closeMoreMenu()"></button>
             <button data-ic="branch" data-label="情节沙盘" onclick="openOutlineSandbox();closeMoreMenu()"></button>
             <button data-ic="book" data-label="拆书引擎" onclick="openDisassembly();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI Skills" onclick="openSkills();closeMoreMenu()"></button>
@@ -656,93 +656,98 @@
     </div>
   </div>
 
-  <!-- 人物动态卡：基础设定不覆盖；状态按章节版本查看、确认和回溯 -->
+  <!-- 人物档案：设定、动态、关系、历史与角色形象统一在一个入口 -->
   <div id="characterStateOverlay" class="overlay hidden">
     <div class="overlay-card character-state-card">
       <div class="overlay-head">
-        <span id="characterStateTitle">人物动态卡</span>
+        <span id="characterStateTitle">人物档案</span>
         <span class="overlay-head-actions">
           <button id="characterStateAnalyzeBtn" onclick="analyzeCharacterState()">提取本章变化</button>
           <button class="ic" data-ic="x" onclick="closeCharacterState()" title="关闭"></button>
         </span>
       </div>
+      <div class="character-detail-tabs" role="tablist" aria-label="人物档案区域">
+        <button id="characterProfileTab" class="active" role="tab" onclick="switchCharacterDetailTab('profile')">设定与动态</button>
+        <button id="characterImagesTab" role="tab" onclick="switchCharacterDetailTab('images')">形象 <span id="characterImagesTabCount">0</span></button>
+      </div>
       <div class="character-state-body">
-        <div class="character-state-context">
-          <label>查看时点<select id="characterStateChapter" onchange="changeCharacterStateChapter()"></select></label>
-          <span id="characterStateMeta" class="character-state-meta"></span>
-        </div>
-        <div class="character-profile">
-          <div id="characterStatePortrait" class="character-portrait character-portrait-lg"></div>
-          <div class="character-profile-main">
-            <div id="characterStateBase" class="character-state-base"></div>
-            <div class="character-profile-actions">
-              <button class="ic" data-ic="image" onclick="openEntityImage(characterStateEntityId)">生成 / 管理角色图</button>
+        <section id="characterProfilePanel" class="character-detail-panel">
+          <div class="character-state-context">
+            <label>查看时点<select id="characterStateChapter" onchange="changeCharacterStateChapter()"></select></label>
+            <span id="characterStateMeta" class="character-state-meta"></span>
+          </div>
+          <div class="character-profile">
+            <div id="characterStatePortrait" class="character-portrait character-portrait-lg"></div>
+            <div class="character-profile-main">
+              <div id="characterStateBase" class="character-state-base"></div>
+              <div id="characterBaseEditor" class="character-base-editor hidden">
+                <label>人物姓名<input id="characterBaseName" maxlength="100"></label>
+                <label>一句话设定<input id="characterBaseSummary" maxlength="1000"></label>
+                <label>详细设定<textarea id="characterBaseDetail" maxlength="10000" placeholder="外貌、年龄、服装、身份、性格、背景等"></textarea></label>
+                <div class="set-actions"><button onclick="saveCharacterBaseProfile()">保存人物设定</button><button class="ic" onclick="cancelCharacterBaseProfile()">取消</button></div>
+                <span id="characterBaseMsg" class="msg"></span>
+              </div>
+              <div class="character-profile-actions">
+                <button class="ic" data-ic="edit" onclick="editCharacterBaseProfile()">编辑人物设定</button>
+                <button class="ic" data-ic="image" onclick="switchCharacterDetailTab('images')">查看形象</button>
+              </div>
             </div>
           </div>
-        </div>
-        <div id="characterStateProposals" class="character-state-proposals"></div>
-        <section class="character-state-section">
-          <div class="character-state-section-head"><b>当前状态</b><span id="characterStateSource" class="character-state-meta"></span></div>
-          <div class="character-state-grid">
-            <label>所在地点<input id="characterStateLocation"></label>
-            <label>当前目标<input id="characterStateGoal"></label>
-            <label>当前情绪<input id="characterStateEmotion"></label>
-            <label>身体状态<input id="characterStatePhysical"></label>
-            <label>已知信息<textarea id="characterStateInformation"></textarea></label>
-            <label>关系变化<textarea id="characterStateRelationships"></textarea></label>
-            <label>能力 / 物品<textarea id="characterStateAssets"></textarea></label>
-            <label>秘密 / 承诺<textarea id="characterStateSecrets"></textarea></label>
-          </div>
-          <label class="character-state-wide">补充状态<textarea id="characterStateNotes"></textarea></label>
-          <label>本章变化摘要<input id="characterStateSummary"></label>
-          <label>剧情依据<textarea id="characterStateEvidence"></textarea></label>
-          <div class="set-actions">
-            <button id="characterStateSaveBtn" onclick="saveCharacterState()">保存为本章状态</button>
-          </div>
-          <span id="characterStateMsg" class="msg"></span>
+          <div id="characterStateProposals" class="character-state-proposals"></div>
+          <section class="character-state-section">
+            <div class="character-state-section-head"><b>当前状态</b><span id="characterStateSource" class="character-state-meta"></span></div>
+            <div class="character-state-grid">
+              <label>所在地点<input id="characterStateLocation"></label>
+              <label>当前目标<input id="characterStateGoal"></label>
+              <label>当前情绪<input id="characterStateEmotion"></label>
+              <label>身体状态<input id="characterStatePhysical"></label>
+              <label>已知信息<textarea id="characterStateInformation"></textarea></label>
+              <label>关系变化<textarea id="characterStateRelationships"></textarea></label>
+              <label>能力 / 物品<textarea id="characterStateAssets"></textarea></label>
+              <label>秘密 / 承诺<textarea id="characterStateSecrets"></textarea></label>
+            </div>
+            <label class="character-state-wide">补充状态<textarea id="characterStateNotes"></textarea></label>
+            <label>本章变化摘要<input id="characterStateSummary"></label>
+            <label>剧情依据<textarea id="characterStateEvidence"></textarea></label>
+            <div class="set-actions"><button id="characterStateSaveBtn" onclick="saveCharacterState()">保存为本章状态</button></div>
+            <span id="characterStateMsg" class="msg"></span>
+          </section>
+          <section class="character-state-section">
+            <div class="character-state-section-head"><b>人物关系</b><span class="character-state-meta">随人物档案一起查看</span></div>
+            <div id="characterStateRelations" class="character-relations"></div>
+          </section>
+          <section class="character-state-section">
+            <div class="character-state-section-head"><b>成长记录</b></div>
+            <div id="characterStateHistory" class="character-state-history"></div>
+          </section>
         </section>
-        <section class="character-state-section">
-          <div class="character-state-section-head"><b>人物关系</b><span class="character-state-meta">随人物档案一起查看</span></div>
-          <div id="characterStateRelations" class="character-relations"></div>
-        </section>
-        <section class="character-state-section">
-          <div class="character-state-section-head"><b>成长记录</b></div>
-          <div id="characterStateHistory" class="character-state-history"></div>
+        <section id="characterImagesPanel" class="character-detail-panel hidden">
+          <div class="entity-image-body">
+            <div>
+              <button id="entityImagePreview" class="entity-image-preview" onclick="openCurrentEntityImageLightbox()" title="点击查看大图"></button>
+              <div class="entity-image-preview-hint">人物主形象 · 点击查看大图</div>
+            </div>
+            <div class="entity-image-controls">
+              <div class="entity-image-prompt-head"><b>生成这个人物的新形象</b><span class="entity-image-prompt-actions"><button class="ic" onclick="refreshEntityImagePromptFromLatest(true)">读取最新设定</button><button id="entityImagePolishBtn" class="ic" data-ic="sparkles" onclick="polishEntityImagePrompt()">AI 整理英文生图词</button></span></div>
+              <textarea id="entityImagePrompt" rows="9" maxlength="8000" oninput="markEntityImagePromptCustom()" placeholder="自动读取最新人物设定和当前状态；也可以补充构图与画风要求…"></textarea>
+              <div id="entityImagePromptStatus" class="entity-image-prompt-status">已读取最新人物设定</div>
+              <label>补充画风<input id="entityImageStyle" maxlength="1000" placeholder="例如：电影感写实、东方奇幻、柔和侧光"></label>
+              <label>图片尺寸<select id="entityImageSize"><option>1024x1536</option><option>1024x1024</option><option>1536x1024</option><option>512x512</option><option>auto</option></select></label>
+              <p class="set-hint">生成时会再次读取人物最新的外貌、年龄、服装和本章状态；即使复用旧提示词，也以最新人物设定为准。每次结果都会绑定此人物并保留在下方。</p>
+              <div class="set-actions">
+                <button id="entityImageGenerateBtn" onclick="generateEntityImage()">生成角色图</button>
+                <button class="ic" onclick="openCharacterImageLibrary(entityImageEntityId)">浏览全书图库</button>
+                <button id="entityImageDeleteBtn" class="ic danger-lite" onclick="deleteEntityImage()">删除当前主图</button>
+              </div>
+              <span id="entityImageMsg" class="msg"></span>
+            </div>
+          </div>
+          <section class="entity-image-history-section">
+            <div class="settings-section-head"><b>全部历史形象</b><span id="entityImageHistoryCount"></span></div>
+            <div id="entityImageHistory" class="image-asset-grid compact"></div>
+          </section>
         </section>
       </div>
-    </div>
-  </div>
-
-  <!-- 角色形象生成 -->
-  <div id="entityImageOverlay" class="overlay hidden" onclick="if(event.target===this)closeEntityImage()">
-    <div class="overlay-card entity-image-card">
-      <div class="overlay-head">
-        <span id="entityImageTitle">角色形象</span>
-        <button class="ic" data-ic="x" onclick="closeEntityImage()" title="关闭"></button>
-      </div>
-      <div class="entity-image-body">
-        <div>
-          <button id="entityImagePreview" class="entity-image-preview" onclick="openCurrentEntityImageLightbox()" title="点击查看大图"></button>
-          <div class="entity-image-preview-hint">点击当前形象查看大图</div>
-        </div>
-        <div class="entity-image-controls">
-          <div class="entity-image-prompt-head"><b>角色形象提示词</b><button id="entityImagePolishBtn" class="ic" data-ic="sparkles" onclick="polishEntityImagePrompt()">AI 整理为英文生图词</button></div>
-          <textarea id="entityImagePrompt" rows="9" maxlength="8000" placeholder="会根据人物卡生成；也可以自己补充外貌、服装、神态、构图和画风…"></textarea>
-          <label>补充画风<input id="entityImageStyle" maxlength="1000" placeholder="例如：电影感写实、东方奇幻、柔和侧光"></label>
-          <label>图片尺寸<select id="entityImageSize"><option>1024x1536</option><option>1024x1024</option><option>1536x1024</option><option>512x512</option><option>auto</option></select></label>
-          <p class="set-hint">参考 DeepWrite 的人物立绘流程：英文提示词包含画风、竖版构图、光线、色调和角色细节。新图会进入历史图库，不再覆盖删除旧图；可随时切换主形象。</p>
-          <div class="set-actions">
-            <button id="entityImageGenerateBtn" onclick="generateEntityImage()">生成角色图</button>
-            <button class="ic" onclick="openCharacterImageLibrary(entityImageEntityId)">打开角色图库</button>
-            <button id="entityImageDeleteBtn" class="ic danger-lite" onclick="deleteEntityImage()">删除当前图</button>
-          </div>
-          <span id="entityImageMsg" class="msg"></span>
-        </div>
-      </div>
-      <section class="entity-image-history-section">
-        <div class="settings-section-head"><b>这个角色的历史形象</b><span id="entityImageHistoryCount"></span></div>
-        <div id="entityImageHistory" class="image-asset-grid compact"></div>
-      </section>
     </div>
   </div>
 
@@ -750,13 +755,14 @@
   <div id="characterImageLibraryOverlay" class="overlay hidden">
     <div class="overlay-card image-library-card">
       <div class="overlay-head">
-        <span>角色图库</span>
+        <span>全书角色图库</span>
         <span class="overlay-head-actions"><button class="ic" data-ic="refresh" onclick="loadCharacterImageLibrary()"></button><button class="ic" data-ic="x" onclick="closeCharacterImageLibrary()"></button></span>
       </div>
       <div class="image-library-toolbar">
         <button class="active" data-image-filter="all" onclick="setCharacterImageFilter('all')">全部</button>
         <div id="characterImageFilters" class="image-character-filters"></div>
       </div>
+      <div class="image-library-hint">这里用于集中浏览；点击任意图片会进入它绑定的人物档案。</div>
       <div id="characterImageLibraryGrid" class="image-asset-grid library"></div>
     </div>
   </div>
@@ -767,6 +773,7 @@
       <div><b id="imageLightboxTitle"></b><p id="imageLightboxPrompt"></p><div class="image-lightbox-actions">
         <button class="ic" onclick="copyLightboxPrompt()">复制提示词</button>
         <button class="ic" onclick="reuseLightboxPrompt()">用此提示词再生成</button>
+        <button class="ic" onclick="openLightboxCharacterProfile()">打开对应人物档案</button>
         <button class="ic" onclick="downloadLightboxImage()">下载原图</button>
       </div></div>
       <button class="ic image-lightbox-close" data-ic="x" onclick="closeImageLightbox()" title="关闭"></button>
@@ -957,6 +964,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=ux-details-20260813-2"></script>
+  <script src="app.js?v=character-profile-images-20260814"></script>
 </body>
 </html>

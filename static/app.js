@@ -3077,6 +3077,9 @@ let characterStateChapterId = null;
 let characterStateProposalId = null;
 let characterStateData = null;
 let entityImageEntityId = null;
+let characterDetailTab = "profile";
+let entityImagePromptMode = "latest";
+let entityImageSettingsLoaded = false;
 let semanticPopTimer = null;
 const entityImageObjectUrls = new Map();
 const imageAssetObjectUrls = new Map();
@@ -3223,7 +3226,7 @@ function defaultCharacterImagePrompt(entity) {
   if (entity.summary) parts.push(`Canonical character summary (source language): ${entity.summary}`);
   if (entity.detail) parts.push(`Canonical appearance, personality and background details (source language): ${entity.detail}`);
   const state = entity.current_state || characterStateData?.current_state || {};
-  const live = [["所在地点", state.location], ["情绪", state.emotion], ["身体状态", state.physical], ["能力与物品", state.assets]]
+  const live = [["所在地点", state.location], ["当前目标", state.goal], ["情绪", state.emotion], ["身体状态", state.physical], ["能力与物品", state.assets], ["补充状态", state.notes]]
     .filter(([, value]) => value).map(([label, value]) => `${label}：${value}`).join("；");
   if (live) parts.push(`Current story-state cues (source language; use only visually relevant details): ${live}`);
   return parts.join("\n");
@@ -3250,13 +3253,17 @@ async function hydrateImageAssets(root = document) {
     if (url) { img.src = url; img.classList.remove("hidden"); }
   }));
 }
-function imageAssetCard(item) {
+function imageAssetCard(item, context = "person") {
   const time = item.created_at ? new Date(item.created_at * 1000).toLocaleString() : "";
-  return `<article class="image-asset-card${item.selected ? " selected" : ""}" onclick="openImageAssetLightbox(${item.id})" title="${esc(item.prompt || "点击查看大图")}">
+  const openAction = context === "library" ? `openCharacterFromImageLibrary(${item.entity_id})` : `openImageAssetLightbox(${item.id})`;
+  const title = context === "library" ? `进入 ${item.entity_name || "人物"} 的人物档案` : (item.prompt || "点击查看大图");
+  return `<article class="image-asset-card${item.selected ? " selected" : ""}" onclick="${openAction}" title="${esc(title)}">
     <div class="image-asset-thumb"><img class="hidden" data-image-asset="${item.id}" alt="${esc(item.entity_name || "角色")}的形象"><span>${svg("image")}</span>${item.selected ? '<b class="image-selected-badge">当前主图</b>' : ""}</div>
     <div class="image-asset-meta"><b>${esc(item.entity_name || "角色形象")}</b><small>${esc([item.size, item.model, time].filter(Boolean).join(" · "))}</small></div>
     <div class="image-asset-actions">
       ${item.selected ? '<span>正在使用</span>' : `<button onclick="event.stopPropagation();selectCharacterImage(${item.id})">设为主图</button>`}
+      <button onclick="event.stopPropagation();reuseCharacterImagePrompt(${item.id})">复用</button>
+      <button onclick="event.stopPropagation();downloadCharacterImageAsset(${item.id})">下载</button>
       <button class="danger-lite" onclick="event.stopPropagation();deleteCharacterImageAsset(${item.id})">删除</button>
     </div>
   </article>`;
@@ -3265,7 +3272,8 @@ function renderEntityImageHistory() {
   const host = $("entityImageHistory");
   if (!host) return;
   $("entityImageHistoryCount").textContent = `${entityImageHistory.length} 张`;
-  host.innerHTML = entityImageHistory.length ? entityImageHistory.map(imageAssetCard).join("") : '<div class="empty">生成后的图片会保存在这里，不会覆盖旧图。</div>';
+  $("characterImagesTabCount").textContent = entityImageHistory.length;
+  host.innerHTML = entityImageHistory.length ? entityImageHistory.map(item => imageAssetCard(item, "person")).join("") : '<div class="empty">生成后的图片会保存在这里，不会覆盖旧图。</div>';
   hydrateImageAssets(host);
 }
 async function loadEntityImageHistory() {
@@ -3284,24 +3292,52 @@ function renderEntityImagePreview(entity) {
   if (entity?.has_image) hydrateEntityImages(host);
   $("entityImageDeleteBtn").classList.toggle("hidden", !entity?.has_image);
 }
-async function openEntityImage(eid) {
-  const entity = entitiesCache.find(item => item.id === eid) || (characterStateData?.entity?.id === eid ? characterStateData.entity : null);
-  if (!entity) { showToast("人物卡尚未载入", "err"); return; }
-  entityImageEntityId = eid;
-  $("entityImageTitle").textContent = `${entity.name} · 角色形象`;
-  $("entityImagePrompt").value = entity.image_prompt || defaultCharacterImagePrompt(entity);
-  $("entityImageStyle").value = "";
-  $("entityImageMsg").textContent = "";
-  try {
-    const settings = await api("/api/settings", { method: "GET" });
-    const wanted = settings.image_size || "1024x1536";
-    $("entityImageSize").value = [...$("entityImageSize").options].some(option => option.value === wanted) ? wanted : "1024x1536";
-  } catch (e) { $("entityImageSize").value = "1024x1536"; }
-  renderEntityImagePreview(entity);
-  $("entityImageOverlay").classList.remove("hidden");
-  await loadEntityImageHistory().catch(e => { $("entityImageMsg").textContent = "图库加载失败：" + e.message; });
+async function openEntityImage(eid) { await openCharacterState(eid, "images"); }
+function closeEntityImage() { switchCharacterDetailTab("profile"); }
+function markEntityImagePromptCustom() {
+  entityImagePromptMode = "custom";
+  const status = $("entityImagePromptStatus");
+  status.textContent = "已补充自定义要求；生成时仍会自动合并最新人物设定";
+  status.classList.add("custom");
 }
-function closeEntityImage() { $("entityImageOverlay").classList.add("hidden"); entityImageEntityId = null; }
+function refreshEntityImagePromptFromLatest(showFeedback = false) {
+  const entity = characterStateData?.entity || entitiesCache.find(item => item.id === entityImageEntityId);
+  if (!entity) return;
+  $("entityImagePrompt").value = defaultCharacterImagePrompt({ ...entity, current_state: characterStateData?.current_state || entity.current_state });
+  entityImagePromptMode = "latest";
+  const status = $("entityImagePromptStatus");
+  status.textContent = "已读取最新人物设定与当前章节状态";
+  status.classList.remove("custom");
+  if (showFeedback) showToast("已重新读取最新人物设定", "ok");
+}
+async function prepareEntityImagePanel(forcePrompt = false) {
+  const entity = characterStateData?.entity || entitiesCache.find(item => item.id === characterStateEntityId);
+  if (!entity) return;
+  entityImageEntityId = entity.id;
+  if (forcePrompt || !$("entityImagePrompt").value || entityImagePromptMode === "latest") refreshEntityImagePromptFromLatest(false);
+  $("entityImageMsg").textContent = "";
+  if (!entityImageSettingsLoaded) {
+    try {
+      const settings = await api("/api/settings", { method: "GET" });
+      const wanted = settings.image_size || "1024x1536";
+      $("entityImageSize").value = [...$("entityImageSize").options].some(option => option.value === wanted) ? wanted : "1024x1536";
+    } catch (e) { $("entityImageSize").value = "1024x1536"; }
+    entityImageSettingsLoaded = true;
+  }
+  renderEntityImagePreview(entity);
+  await loadEntityImageHistory().catch(e => { $("entityImageMsg").textContent = "人物形象加载失败：" + e.message; });
+}
+async function switchCharacterDetailTab(tab = "profile") {
+  characterDetailTab = tab === "images" ? "images" : "profile";
+  $("characterProfilePanel").classList.toggle("hidden", characterDetailTab !== "profile");
+  $("characterImagesPanel").classList.toggle("hidden", characterDetailTab !== "images");
+  $("characterProfileTab").classList.toggle("active", characterDetailTab === "profile");
+  $("characterImagesTab").classList.toggle("active", characterDetailTab === "images");
+  $("characterProfileTab").setAttribute("aria-selected", String(characterDetailTab === "profile"));
+  $("characterImagesTab").setAttribute("aria-selected", String(characterDetailTab === "images"));
+  $("characterStateAnalyzeBtn").classList.toggle("hidden", characterDetailTab === "images" || !characterStateChapterId);
+  if (characterDetailTab === "images") await prepareEntityImagePanel();
+}
 async function polishEntityImagePrompt() {
   if (!entityImageEntityId) return;
   const button = $("entityImagePolishBtn");
@@ -3309,9 +3345,12 @@ async function polishEntityImagePrompt() {
   busy(button, true, "正在整理");
   try {
     const result = await api(`/api/entities/${entityImageEntityId}/image/prompt`, { body: {
-      prompt: $("entityImagePrompt").value.trim(), style: $("entityImageStyle").value.trim(), chapter_id: currentChapterId,
+      prompt: $("entityImagePrompt").value.trim(), style: $("entityImageStyle").value.trim(), chapter_id: characterStateChapterId || currentChapterId,
     }});
     $("entityImagePrompt").value = result.prompt || $("entityImagePrompt").value;
+    entityImagePromptMode = "custom";
+    $("entityImagePromptStatus").textContent = "已结合最新人物档案整理，可继续修改";
+    $("entityImagePromptStatus").classList.add("custom");
     $("entityImageMsg").textContent = "已结合人物卡整理成英文生图提示词，你仍可继续修改";
     showToast("角色提示词已整理", "ok");
   } catch (e) { $("entityImageMsg").textContent = e.message; }
@@ -3325,7 +3364,7 @@ async function generateEntityImage() {
   try {
     const result = await api(`/api/entities/${entityImageEntityId}/image/generate`, {
       body: { prompt: $("entityImagePrompt").value.trim(), style: $("entityImageStyle").value.trim(),
-        size: $("entityImageSize").value, chapter_id: currentChapterId },
+        size: $("entityImageSize").value, chapter_id: characterStateChapterId || currentChapterId },
     });
     const entity = entitiesCache.find(item => item.id === entityImageEntityId);
     if (entity) Object.assign(entity, result);
@@ -3347,8 +3386,6 @@ async function deleteEntityImage() {
     if (entityImageObjectUrls.has(entityImageEntityId)) URL.revokeObjectURL(entityImageObjectUrls.get(entityImageEntityId));
     entityImageObjectUrls.delete(entityImageEntityId);
     const items = await loadEntityImageHistory();
-    const selected = items.find(item => item.selected);
-    if (selected?.prompt) $("entityImagePrompt").value = selected.prompt;
     const entity = entitiesCache.find(item => item.id === entityImageEntityId);
     if (entity) entity.has_image = items.length > 0;
     if (characterStateData?.entity?.id === entityImageEntityId) characterStateData.entity.has_image = items.length > 0;
@@ -3386,18 +3423,42 @@ async function copyLightboxPrompt() {
 }
 async function reuseLightboxPrompt() {
   const item = lightboxImageItem(); if (!item) return;
-  closeImageLightbox(); closeCharacterImageLibrary();
-  await openEntityImage(item.entity_id);
-  $("entityImagePrompt").value = item.prompt || $("entityImagePrompt").value;
-  $("entityImageMsg").textContent = "已载入这张历史图的提示词，可调整后再次生成";
+  closeImageLightbox();
+  await reuseCharacterImagePrompt(item.id);
 }
 async function downloadLightboxImage() {
   const item = lightboxImageItem(); if (!item) return;
-  const url = await imageAssetUrl(item.id).catch(() => ""); if (!url) return;
+  await downloadCharacterImageAsset(item.id);
+}
+async function reuseCharacterImagePrompt(imageId) {
+  const item = [...entityImageHistory, ...characterImageLibraryItems].find(row => row.id === imageId);
+  if (!item) return;
+  closeCharacterImageLibrary();
+  await openCharacterState(item.entity_id, "images");
+  $("entityImagePrompt").value = item.prompt || $("entityImagePrompt").value;
+  entityImagePromptMode = "custom";
+  $("entityImagePromptStatus").textContent = "已复用历史提示词；生成时会以最新人物设定覆盖其中的冲突信息";
+  $("entityImagePromptStatus").classList.add("custom");
+  $("entityImageMsg").textContent = "可以调整后再次生成";
+}
+async function downloadCharacterImageAsset(imageId) {
+  const item = [...entityImageHistory, ...characterImageLibraryItems].find(row => row.id === imageId);
+  if (!item) return;
+  const url = await imageAssetUrl(item.id).catch(() => "");
+  if (!url) { showToast("图片载入失败", "err"); return; }
   const anchor = document.createElement("a"); anchor.href = url;
   anchor.download = `${(item.entity_name || "角色形象").replace(/[\\/:*?"<>|]+/g, "-")}-${item.id}.png`; anchor.click();
 }
+async function openLightboxCharacterProfile() {
+  const item = lightboxImageItem(); if (!item) return;
+  closeImageLightbox(); closeCharacterImageLibrary();
+  await openCharacterState(item.entity_id, "profile");
+}
 function closeImageLightbox() { $("imageLightbox").classList.add("hidden"); currentLightboxImageId = null; }
+async function openCharacterFromImageLibrary(entityId) {
+  closeCharacterImageLibrary();
+  await openCharacterState(entityId, "images");
+}
 async function openCharacterImageLibrary(entityId = null) {
   if (!currentWorkId) { showToast("先选择作品", "err"); return; }
   characterImageFilter = entityId ? String(entityId) : "all";
@@ -3415,7 +3476,7 @@ function renderCharacterImageLibrary() {
   if (allButton) allButton.classList.toggle("active", characterImageFilter === "all");
   const visible = characterImageFilter === "all" ? characterImageLibraryItems : characterImageLibraryItems.filter(item => String(item.entity_id) === characterImageFilter);
   const host = $("characterImageLibraryGrid");
-  host.innerHTML = visible.length ? visible.map(imageAssetCard).join("") : '<div class="empty">这里还没有角色图片。先从人物档案生成一张吧。</div>';
+  host.innerHTML = visible.length ? visible.map(item => imageAssetCard(item, "library")).join("") : '<div class="empty">这里还没有角色图片。先从人物档案生成一张吧。</div>';
   hydrateImageAssets(host);
 }
 async function loadCharacterImageLibrary() {
@@ -3438,7 +3499,6 @@ async function selectCharacterImage(imageId) {
     if (characterStateData?.entity?.id === eid) characterStateData.entity.has_image = true;
     if (entityImageEntityId === eid) {
       await loadEntityImageHistory();
-      if (result.image?.prompt) $("entityImagePrompt").value = result.image.prompt;
       renderEntityImagePreview(entity || characterStateData?.entity);
     }
     if (!$("characterImageLibraryOverlay").classList.contains("hidden")) await loadCharacterImageLibrary();
@@ -3460,8 +3520,6 @@ async function deleteCharacterImageAsset(imageId) {
     if (characterStateData?.entity?.id === result.entity_id) characterStateData.entity.has_image = !!result.has_image;
     if (entityImageEntityId === result.entity_id) {
       await loadEntityImageHistory();
-      const selected = entityImageHistory.find(item => item.selected);
-      if (selected?.prompt) $("entityImagePrompt").value = selected.prompt;
       renderEntityImagePreview(entity || characterStateData?.entity);
     }
     if (!$("characterImageLibraryOverlay").classList.contains("hidden")) await loadCharacterImageLibrary();
@@ -3515,7 +3573,7 @@ function renderWikiList() {
           ${e.detail ? `<div class="ent-d">${esc(e.detail)}</div>` : ""}
           ${e.kind === "人物" && currentChapterId ? `<div class="ent-state">${esc(characterStateBrief(e.current_state) || "截至本章未记录动态状态")}</div>` : ""}
           <div class="ent-a">
-            ${e.kind === "人物" ? `<button class="ic" onclick="openCharacterState(${e.id})">档案${e.pending_count ? ` · 待确认 ${e.pending_count}` : ""}</button><button class="ic" onclick="openEntityImage(${e.id})">${e.has_image ? "管理形象" : "生成形象"}</button>` : ""}
+            ${e.kind === "人物" ? `<button class="ic" onclick="openCharacterState(${e.id})">人物档案${e.pending_count ? ` · 待确认 ${e.pending_count}` : ""}</button>` : ""}
             <button class="ic" onclick="startEditEntity(${e.id})">编辑</button>
             <button class="ic" onclick="delEntity(${e.id})">删除</button>
           </div>
@@ -3597,23 +3655,38 @@ function characterStateFormValue() {
   return state;
 }
 function characterStateOptions() {
+  if (!chapters.length) return '<option value="">尚未创建章节（仍可编辑设定和形象）</option>';
   return chapters.map(chapter =>
     `<option value="${chapter.id}" ${chapter.id === characterStateChapterId ? "selected" : ""}>${esc(characterStateLabel(chapter))}</option>`
   ).join("");
 }
-async function openCharacterState(eid) {
-  if (!chapters.length) { showToast("请先创建章节", "err"); return; }
+async function openCharacterState(eid, tab = "profile") {
+  const changedPerson = characterStateEntityId !== eid;
+  cancelCharacterBaseProfile();
   characterStateEntityId = eid;
-  characterStateChapterId = currentChapterId || chapters[chapters.length - 1].id;
+  entityImageEntityId = eid;
+  characterStateChapterId = currentChapterId || chapters[chapters.length - 1]?.id || null;
   characterStateProposalId = null;
+  if (changedPerson) {
+    entityImageHistory = [];
+    $("entityImagePrompt").value = "";
+    $("entityImageStyle").value = "";
+    entityImagePromptMode = "latest";
+    renderEntityImageHistory();
+  }
   $("characterStateOverlay").classList.remove("hidden");
   await loadCharacterState();
+  await switchCharacterDetailTab(tab);
+  if (characterDetailTab === "profile") await loadEntityImageHistory().catch(() => {});
 }
 function closeCharacterState() {
+  cancelCharacterBaseProfile();
   $("characterStateOverlay").classList.add("hidden");
   characterStateEntityId = null;
+  entityImageEntityId = null;
   characterStateData = null;
   characterStateProposalId = null;
+  characterDetailTab = "profile";
 }
 async function changeCharacterStateChapter() {
   characterStateChapterId = +$("characterStateChapter").value || null;
@@ -3623,20 +3696,26 @@ async function changeCharacterStateChapter() {
 function renderCharacterState(data) {
   characterStateData = data;
   const entity = data.entity;
-  $("characterStateTitle").textContent = `${entity.name} · 动态卡`;
+  $("characterStateTitle").textContent = `${entity.name} · 人物档案`;
   $("characterStateChapter").innerHTML = characterStateOptions();
+  $("characterStateChapter").disabled = !chapters.length;
   $("characterStateMeta").textContent = characterStateLabel(data.target_chapter);
   $("characterStateBase").innerHTML = `
     <div><b>基础设定</b>${entity.summary ? ` · ${esc(entity.summary)}` : ""}</div>
     ${entity.detail ? `<div>${esc(entity.detail)}</div>` : ""}`;
   $("characterStatePortrait").innerHTML = `<span>${esc(entityInitial(entity))}</span>${entity.has_image ? `<img class="hidden" data-entity-image="${entity.id}" alt="${esc(entity.name)}的角色图">` : ""}`;
-  $("characterStatePortrait").onclick = () => openEntityImage(entity.id);
-  $("characterStatePortrait").title = "打开角色形象与历史图库";
+  $("characterStatePortrait").onclick = () => switchCharacterDetailTab("images");
+  $("characterStatePortrait").title = "查看这个人物的主形象与全部历史图片";
   const version = data.state_version;
   $("characterStateSource").textContent = version
     ? `${characterStateSource(version.source)} · 生效于${characterStateLabel({ ord: version.chapter_ord, title: version.chapter_title })}`
     : "尚无已确认状态";
   setCharacterStateForm(data.current_state || {});
+  for (const [, , id] of characterStateFields) $(id).disabled = !characterStateChapterId;
+  $("characterStateSummary").disabled = !characterStateChapterId;
+  $("characterStateEvidence").disabled = !characterStateChapterId;
+  $("characterStateSaveBtn").disabled = !characterStateChapterId;
+  $("characterStateAnalyzeBtn").classList.toggle("hidden", characterDetailTab === "images" || !characterStateChapterId);
   const proposals = (data.proposals || []).filter(p => p.status === "pending");
   $("characterStateProposals").innerHTML = proposals.map(p => `
     <div class="character-state-proposal">
@@ -3666,13 +3745,44 @@ function renderCharacterState(data) {
   if (entity.has_image) hydrateEntityImages($("characterStateOverlay"));
 }
 async function loadCharacterState() {
-  if (!characterStateEntityId || !characterStateChapterId) return;
+  if (!characterStateEntityId) return;
   try {
-    const data = await api(`/api/entities/${characterStateEntityId}/state-history?chapter_id=${characterStateChapterId}`, { method: "GET" });
+    const query = characterStateChapterId ? `?chapter_id=${characterStateChapterId}` : "";
+    const data = await api(`/api/entities/${characterStateEntityId}/state-history${query}`, { method: "GET" });
     renderCharacterState(data);
   } catch (e) {
     $("characterStateMsg").textContent = e.message;
   }
+}
+function editCharacterBaseProfile() {
+  const entity = characterStateData?.entity;
+  if (!entity) return;
+  $("characterBaseName").value = entity.name || "";
+  $("characterBaseSummary").value = entity.summary || "";
+  $("characterBaseDetail").value = entity.detail || "";
+  $("characterBaseMsg").textContent = "";
+  $("characterStateBase").classList.add("hidden");
+  $("characterBaseEditor").classList.remove("hidden");
+  $("characterBaseName").focus();
+}
+function cancelCharacterBaseProfile() {
+  $("characterBaseEditor").classList.add("hidden");
+  $("characterStateBase").classList.remove("hidden");
+}
+async function saveCharacterBaseProfile() {
+  const name = $("characterBaseName").value.trim();
+  if (!name) { $("characterBaseMsg").textContent = "人物姓名不能为空"; return; }
+  try {
+    await api(`/api/entities/${characterStateEntityId}`, { method: "PUT", body: {
+      name, kind: "人物", summary: $("characterBaseSummary").value.trim(), detail: $("characterBaseDetail").value.trim(),
+    }});
+    cancelCharacterBaseProfile();
+    await refreshCharacterCards();
+    await loadCharacterState();
+    refreshEntityImagePromptFromLatest(false);
+    $("entityImagePromptStatus").textContent = "人物设定已更新，生图提示词已同步刷新";
+    showToast("人物设定与生图信息已同步更新", "ok");
+  } catch (e) { $("characterBaseMsg").textContent = e.message; }
 }
 async function refreshCharacterCards() {
   if (currentWorkId) {

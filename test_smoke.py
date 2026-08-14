@@ -376,10 +376,17 @@ _first_image_id = _generated_image.json()["image"]["id"]
 ok(_image_call["base_url"] == "https://image.test/v1" and _image_call["model"] == "image-test"
    and _image_call["size"] == "1024x1536" and "电影感" in _image_call["prompt"],
    "角色图请求使用独立 Base URL、模型、尺寸和可编辑画风")
+ok(c.put(f"/api/entities/{ent['id']}", json={
+    "name": "林晚", "kind": "人物", "summary": "29岁调查员",
+    "detail": "银白短发，左眼疤痕，穿深蓝长风衣",
+}, headers=H(tokA)).status_code == 200, "人物形象生成前可更新人物档案")
 _second_image = c.post(f"/api/entities/{ent['id']}/image/generate", json={
-    "prompt": "林晚第二套冬季服装", "style": "概念设计", "size": "1024x1536",
+    "prompt": "旧图提示：黑色长发，第二套冬季服装", "style": "概念设计", "size": "1024x1536",
 }, headers=H(tokA)).json()
 _second_image_id = _second_image["image"]["id"]
+ok("银白短发" in _image_call["prompt"] and "左眼疤痕" in _image_call["prompt"]
+   and "latest canonical facts always win" in _image_call["prompt"],
+   "复用旧提示词生图时会重新合并最新人物设定，并以最新设定为准")
 _image_history = c.get(f"/api/entities/{ent['id']}/images", headers=H(tokA)).json()["items"]
 ok(len(_image_history) == 2 and _image_history[0]["id"] == _second_image_id and _image_history[0]["selected"],
    "连续生图保留历史，并把最新图片设为主形象")
