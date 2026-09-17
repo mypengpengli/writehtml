@@ -187,6 +187,27 @@ ok(c.post(
 ).status_code == 400, "附件拒绝未支持格式")
 
 # AI Skills：通用/作品专用 CRUD、作用域和用户隔离
+_alice_builtin_skills = c.get("/api/agent/skills", headers=H(tokA)).json()
+_bob_builtin_skills = c.get("/api/agent/skills", headers=H(tokB)).json()
+novel_writer_skill = next((item for item in _alice_builtin_skills if item["name"] == "novel-writer"), None)
+_bob_novel_writer = next((item for item in _bob_builtin_skills if item["name"] == "novel-writer"), None)
+ok(novel_writer_skill and novel_writer_skill["source_kind"] == "builtin" and novel_writer_skill["enabled"]
+   and novel_writer_skill["resource_count"] == 12, "新账号默认拥有内置 novel-writer 和完整 references")
+ok(_bob_novel_writer and _bob_novel_writer["id"] != novel_writer_skill["id"], "内置 Skill 按用户隔离")
+ok(c.put(f"/api/agent/skills/{novel_writer_skill['id']}", json={
+    "name": "hack", "instruction": "hack", "work_id": None,
+}, headers=H(tokA)).status_code == 409, "内置 Skill 不能编辑")
+ok(c.delete(f"/api/agent/skills/{novel_writer_skill['id']}", headers=H(tokA)).status_code == 409,
+   "内置 Skill 不能删除")
+uidA = db.verify_user("alice", "pw1234")["id"]
+_builtin_reference = db.get_agent_skill_resource(
+    uidA, novel_writer_skill["id"], "references/chapter-guide.md"
+)
+ok(_builtin_reference and "前 20%" in _builtin_reference["content"], "内置 Skill 可按需读取写作参考资料")
+_builtin_turn = db.get_agent_skills_for_turn(uidA, wid, [novel_writer_skill["id"]])
+ok(_builtin_turn and "WriteHTML 运行适配" in _builtin_turn[0]["instruction"]
+   and any(item["id"] == novel_writer_skill["id"] for item in db.list_agent_skill_catalog(uidA, wid)),
+   "内置 novel-writer 会进入 Agent 可发现目录并能在本轮激活")
 ok(c.post("/api/agent/skills", json={"name": "", "instruction": "规则"}, headers=H(tokA)).status_code == 400, "Skill 空名称 400")
 ok(c.post("/api/agent/skills", json={"name": "坏范围", "instruction": "规则", "work_id": "x"}, headers=H(tokA)).status_code == 400, "Skill 非法范围 400")
 global_skill = c.post("/api/agent/skills", json={
@@ -197,8 +218,10 @@ work_skill = c.post("/api/agent/skills", json={
     "name": "本书悬疑节奏", "instruction": "每段结尾保留一个未解信息。", "work_id": wid,
 }, headers=H(tokA)).json()
 _skills = c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokA)).json()
-ok({x["id"] for x in _skills} == {global_skill["id"], work_skill["id"]}, "Skill 列表含通用和作品专用")
-ok(c.get("/api/agent/skills", headers=H(tokA)).json()[0]["id"] == global_skill["id"], "无作品时只列通用 Skill")
+ok({novel_writer_skill["id"], global_skill["id"], work_skill["id"]}.issubset({x["id"] for x in _skills}),
+   "Skill 列表含内置、通用和作品专用 Skill")
+ok({x["id"] for x in c.get("/api/agent/skills", headers=H(tokA)).json()}
+   == {novel_writer_skill["id"], global_skill["id"]}, "无作品时只列内置和用户通用 Skill")
 ok(c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokB)).status_code == 404, "bob 看 alice 作品 Skill 404")
 ok(c.put(f"/api/agent/skills/{global_skill['id']}", json={
     "name": "hack", "instruction": "hack", "work_id": None,
@@ -207,7 +230,8 @@ ok(c.put(f"/api/agent/skills/{global_skill['id']}", json={
     "name": "克制叙事", "description": "少形容词", "instruction": "使用克制、具体的叙事，避免空泛形容词。",
     "work_id": None, "enabled": False,
 }, headers=H(tokA)).status_code == 200, "Skill 可停用")
-ok(not c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokA)).json()[0]["enabled"], "Skill 停用状态读回")
+ok(not next(item for item in c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokA)).json()
+            if item["id"] == global_skill["id"])["enabled"], "Skill 停用状态读回")
 ok(c.put(f"/api/agent/skills/{global_skill['id']}", json={
     "name": "克制叙事", "description": "少形容词", "instruction": "使用克制、具体的叙事，避免空泛形容词。",
     "work_id": None, "enabled": True,

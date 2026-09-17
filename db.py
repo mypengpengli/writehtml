@@ -10,6 +10,7 @@ from datetime import datetime
 from contextlib import contextmanager
 
 import config
+import builtin_skills
 
 DB_PATH = config.DB_PATH
 
@@ -1129,6 +1130,7 @@ def init_db():
                 instruction TEXT NOT NULL,
                 source_kind TEXT DEFAULT 'manual',
                 source_markdown TEXT DEFAULT '',
+                builtin_key TEXT DEFAULT '',
                 enabled INTEGER DEFAULT 1,
                 created_at REAL,
                 updated_at REAL,
@@ -1174,6 +1176,11 @@ def init_db():
         _add_col(conn, "users", "is_admin", "INTEGER DEFAULT 0")  # 后台管理员标记
         _add_col(conn, "agent_skills", "source_kind", "TEXT DEFAULT 'manual'")
         _add_col(conn, "agent_skills", "source_markdown", "TEXT DEFAULT ''")
+        _add_col(conn, "agent_skills", "builtin_key", "TEXT DEFAULT ''")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_user_builtin "
+            "ON agent_skills(user_id,builtin_key) WHERE builtin_key<>''"
+        )
         _add_col(conn, "chapters", "workflow_status", "TEXT DEFAULT 'drafting'")
         _add_col(conn, "chapters", "workflow_goal", "TEXT DEFAULT ''")
         _add_col(conn, "chapters", "workflow_summary", "TEXT DEFAULT ''")
@@ -1183,6 +1190,7 @@ def init_db():
         _add_col(conn, "chapter_revisions", "label", "TEXT DEFAULT ''")
         _run_migrations(conn, had_database, backup_done=backup_done)
         _bootstrap_admin(conn)
+        _sync_builtin_agent_skills(conn)
 
 
 def _bootstrap_admin(conn):
@@ -1238,6 +1246,7 @@ def create_user(username, password):
             )
         except sqlite3.IntegrityError:
             return None
+        _sync_builtin_agent_skills(conn, cur.lastrowid)
         return {"id": cur.lastrowid, "username": username}
 
 
@@ -3743,6 +3752,77 @@ def get_relationship_digest(wid, user_id):
 
 # ---------- AI Skills（用户可复用的 agent 指令模板）----------
 
+def _sync_builtin_agent_skills(conn, user_id=None):
+    """Install/update repository-owned Skills for existing users and newly registered accounts."""
+    packages = builtin_skills.load_builtin_skills()
+    if not packages:
+        return
+    if user_id is None:
+        user_ids = [row["id"] for row in conn.execute("SELECT id FROM users")]
+    else:
+        user_ids = [user_id]
+    now = time.time()
+    for uid in user_ids:
+        for package in packages:
+            row = conn.execute(
+                "SELECT id,name,description,instruction,source_kind,source_markdown,enabled "
+                "FROM agent_skills WHERE user_id=? AND builtin_key=?",
+                (uid, package["builtin_key"]),
+            ).fetchone()
+            changed = not row or any((
+                row["name"] != package["name"],
+                row["description"] != package["description"],
+                row["instruction"] != package["instruction"],
+                row["source_kind"] != "builtin",
+                row["source_markdown"] != package["source_markdown"],
+                not row["enabled"],
+            ))
+            if row:
+                skill_id = row["id"]
+                existing_resources = {
+                    item["path"]: item["content"] for item in conn.execute(
+                        "SELECT path,content FROM agent_skill_resources WHERE skill_id=?", (skill_id,)
+                    )
+                }
+                wanted_resources = {item["path"]: item["content"] for item in package["resources"]}
+                resources_changed = existing_resources != wanted_resources
+                if changed:
+                    conn.execute(
+                        "UPDATE agent_skills SET work_id=NULL,name=?,description=?,instruction=?,source_kind='builtin',"
+                        "source_markdown=?,enabled=1,updated_at=? WHERE id=?",
+                        (package["name"], package["description"], package["instruction"],
+                         package["source_markdown"], now, skill_id),
+                    )
+                if resources_changed:
+                    conn.execute("DELETE FROM agent_skill_resources WHERE skill_id=?", (skill_id,))
+                    for resource in package["resources"]:
+                        conn.execute(
+                            "INSERT INTO agent_skill_resources(skill_id,path,content,created_at) VALUES(?,?,?,?)",
+                            (skill_id, resource["path"], resource["content"], now),
+                        )
+                    if not changed:
+                        conn.execute("UPDATE agent_skills SET updated_at=? WHERE id=?", (now, skill_id))
+            else:
+                cur = conn.execute(
+                    "INSERT INTO agent_skills(user_id,work_id,name,description,instruction,source_kind,"
+                    "source_markdown,builtin_key,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (uid, None, package["name"], package["description"], package["instruction"], "builtin",
+                     package["source_markdown"], package["builtin_key"], 1, now, now),
+                )
+                for resource in package["resources"]:
+                    conn.execute(
+                        "INSERT INTO agent_skill_resources(skill_id,path,content,created_at) VALUES(?,?,?,?)",
+                        (cur.lastrowid, resource["path"], resource["content"], now),
+                    )
+
+
+def is_builtin_agent_skill(skill_id, user_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT source_kind FROM agent_skills WHERE id=? AND user_id=?", (skill_id, user_id)
+        ).fetchone()
+        return bool(row and row["source_kind"] == "builtin")
+
 def list_agent_skills(user_id, work_id=None):
     """取用户可见的 Skill：通用 Skill 加当前作品专用 Skill。"""
     with get_conn() as conn:
@@ -3752,7 +3832,8 @@ def list_agent_skills(user_id, work_id=None):
             rows = conn.execute(
                 "SELECT s.id, s.user_id, s.work_id, s.name, s.description, s.instruction, s.source_kind, s.enabled, s.created_at, s.updated_at, "
                 "(SELECT COUNT(*) FROM agent_skill_resources r WHERE r.skill_id=s.id) AS resource_count "
-                "FROM agent_skills s WHERE s.user_id=? AND s.work_id IS NULL ORDER BY s.updated_at DESC, s.id DESC",
+                "FROM agent_skills s WHERE s.user_id=? AND s.work_id IS NULL "
+                "ORDER BY CASE WHEN s.source_kind='builtin' THEN 0 ELSE 1 END, s.updated_at DESC, s.id DESC",
                 (user_id,),
             )
         else:
@@ -3760,7 +3841,8 @@ def list_agent_skills(user_id, work_id=None):
                 "SELECT s.id, s.user_id, s.work_id, s.name, s.description, s.instruction, s.source_kind, s.enabled, s.created_at, s.updated_at, "
                 "(SELECT COUNT(*) FROM agent_skill_resources r WHERE r.skill_id=s.id) AS resource_count "
                 "FROM agent_skills s WHERE s.user_id=? AND (s.work_id IS NULL OR s.work_id=?) "
-                "ORDER BY CASE WHEN s.work_id IS NULL THEN 0 ELSE 1 END, s.updated_at DESC, s.id DESC",
+                "ORDER BY CASE WHEN s.source_kind='builtin' THEN 0 ELSE 1 END, "
+                "CASE WHEN s.work_id IS NULL THEN 0 ELSE 1 END, s.updated_at DESC, s.id DESC",
                 (user_id, work_id),
             )
         return [dict(r) for r in rows]
@@ -3796,10 +3878,17 @@ def _agent_skill_owned(conn, skill_id, user_id):
     ).fetchone() is not None
 
 
+def _agent_skill_mutable(conn, skill_id, user_id):
+    row = conn.execute(
+        "SELECT source_kind FROM agent_skills WHERE id=? AND user_id=?", (skill_id, user_id)
+    ).fetchone()
+    return bool(row and row["source_kind"] != "builtin")
+
+
 def update_agent_skill(skill_id, user_id, work_id, name, description, instruction, enabled):
     now = time.time()
     with get_conn() as conn:
-        if not _agent_skill_owned(conn, skill_id, user_id):
+        if not _agent_skill_mutable(conn, skill_id, user_id):
             return False
         if work_id is not None and not _work_owned(conn, work_id, user_id):
             return False
@@ -3812,7 +3901,7 @@ def update_agent_skill(skill_id, user_id, work_id, name, description, instructio
 
 def delete_agent_skill(skill_id, user_id):
     with get_conn() as conn:
-        if not _agent_skill_owned(conn, skill_id, user_id):
+        if not _agent_skill_mutable(conn, skill_id, user_id):
             return False
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id=?", (skill_id,))
         conn.execute("DELETE FROM agent_skills WHERE id=?", (skill_id,))
@@ -3849,14 +3938,15 @@ def list_agent_skill_catalog(user_id, work_id, limit=30):
             rows = conn.execute(
                 "SELECT id, name, description, source_kind FROM agent_skills "
                 "WHERE user_id=? AND enabled=1 AND work_id IS NULL "
-                "ORDER BY updated_at DESC, id DESC LIMIT ?",
+                "ORDER BY CASE WHEN source_kind='builtin' THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT ?",
                 (user_id, limit),
             )
         else:
             rows = conn.execute(
                 "SELECT id, name, description, source_kind FROM agent_skills "
                 "WHERE user_id=? AND enabled=1 AND (work_id IS NULL OR work_id=?) "
-                "ORDER BY CASE WHEN work_id IS NULL THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT ?",
+                "ORDER BY CASE WHEN source_kind='builtin' THEN 0 ELSE 1 END, "
+                "CASE WHEN work_id IS NULL THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT ?",
                 (user_id, work_id, limit),
             )
         return [dict(r) for r in rows]

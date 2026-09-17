@@ -556,11 +556,16 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .skill-row-head b { color: var(--accent-text); }
 .skill-scope, .skill-source, .skill-off { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 1px 5px; color: var(--muted); font-size: 12px; line-height: 1.35; white-space: nowrap; }
 .skill-source { color: var(--accent-text); border-color: var(--accent); }
+.skill-source.builtin { color: #7b4ab5; border-color: #9a6bc8; background: color-mix(in srgb, #9a6bc8 10%, transparent); }
 .skill-off { color: var(--danger); border-color: var(--danger); }
 .skill-desc { margin-top: 2px; color: var(--muted); font-size: 13px; line-height: 1.45; }
 .skill-rule { margin-top: 5px; color: var(--ink); font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 4.5em; overflow: hidden; }
 .skill-row-actions { display: flex; gap: 2px; }
 .skill-row-actions .ic { min-width: 32px; min-height: 32px; padding: 6px; }
+.skill-import-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--side-bg); }
+.skill-import-bar > div { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.skill-import-bar small { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.skill-import-bar > span { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
 .skill-edit { display: flex; flex-direction: column; gap: 6px; }
 .skill-edit textarea { min-height: 126px; resize: vertical; }
 .skill-pick-row { display: flex; align-items: center; gap: 9px; padding: 10px 2px; border-bottom: 1px solid var(--line); cursor: pointer; }
@@ -846,6 +851,9 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .mp-det { margin-top: 6px; white-space: pre-wrap; word-break: break-word; }
 
 @media (max-width: 700px) {
+  .skill-import-bar { align-items: stretch; flex-direction: column; }
+  .skill-import-bar > span { align-items: stretch; flex-direction: column; }
+  .skill-import-bar > span > * { width: 100%; }
   .character-state-card { max-height: 92vh; }
   .character-detail-tabs { padding-left: 10px; padding-right: 10px; }
   .character-detail-tabs button { flex: 1; }

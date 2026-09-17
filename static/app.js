@@ -2140,7 +2140,7 @@ function renderSkillPickerList() {
     <label class="skill-pick-row">
       <input type="checkbox" ${activeAgentSkillIds.has(s.id) ? "checked" : ""} onchange="toggleActiveSkill(${s.id})">
       <span class="skill-pick-copy"><b>${esc(s.name)}</b>${s.description ? `<small>${esc(s.description)}</small>` : ""}</span>
-      <span class="skill-pick-tags"><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "skill_md" ? '<span class="skill-source">MD</span>' : ""}</span>
+      <span class="skill-pick-tags"><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "builtin" ? '<span class="skill-source builtin">内置</span>' : (s.source_kind === "skill_md" ? '<span class="skill-source">MD</span>' : "")}</span>
     </label>`).join("") : '<div class="empty">还没有可用的 Skill。点右上角设置图标新建。</div>';
 }
 
@@ -2149,6 +2149,9 @@ async function openSkills() {
   await loadAgentSkills();
   renderSkillList();
   resetSkillForm();
+  const importScope = $("skillImportScope");
+  importScope.querySelector('option[value="work"]').disabled = !currentWorkId;
+  if (!currentWorkId && importScope.value === "work") importScope.value = "global";
   $("skillsOverlay").classList.remove("hidden");
 }
 function closeSkills() { $("skillsOverlay").classList.add("hidden"); }
@@ -2160,7 +2163,7 @@ function chooseSkillImport() {
 async function importSkillFile() {
   const input = $("skillImportInput"), file = input.files?.[0];
   if (!file) return;
-  const workScope = $("skillScope").value === "work";
+  const workScope = $("skillImportScope").value === "work";
   if (workScope && !currentWorkId) { $("skillMsg").textContent = "当前没有可关联的作品"; return; }
   if (file.size > 2 * 1024 * 1024) { $("skillMsg").textContent = "Skill 文件不能超过 2MB"; return; }
   $("skillMsg").textContent = "正在导入…";
@@ -2182,13 +2185,13 @@ function renderSkillList() {
   host.innerHTML = agentSkills.length ? agentSkills.map(s => `
     <div class="skill-row${Number(s.enabled) ? "" : " disabled"}">
       <div class="skill-row-main">
-        <div class="skill-row-head"><b>${esc(s.name)}</b><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "skill_md" ? '<span class="skill-source">SKILL.md</span>' : ""}${Number(s.resource_count) ? `<span class="skill-source">${Number(s.resource_count)} 资料</span>` : ""}${Number(s.enabled) ? "" : '<span class="skill-off">已停用</span>'}</div>
+        <div class="skill-row-head"><b>${esc(s.name)}</b><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "builtin" ? '<span class="skill-source builtin">内置</span>' : (s.source_kind === "skill_md" ? '<span class="skill-source">SKILL.md</span>' : "")}${Number(s.resource_count) ? `<span class="skill-source">${Number(s.resource_count)} 资料</span>` : ""}${Number(s.enabled) ? "" : '<span class="skill-off">已停用</span>'}</div>
         ${s.description ? `<div class="skill-desc">${esc(s.description)}</div>` : ""}
         <div class="skill-rule">${esc(s.instruction)}</div>
       </div>
-      <div class="skill-row-actions">
+      <div class="skill-row-actions">${s.source_kind === "builtin" ? '<span class="set-hint">系统维护</span>' : `
         <button class="ic" onclick="startEditSkill(${s.id})" title="编辑 Skill">${svg("pen")}</button>
-        <button class="ic" onclick="delSkill(${s.id})" title="删除 Skill">${svg("trash")}</button>
+        <button class="ic" onclick="delSkill(${s.id})" title="删除 Skill">${svg("trash")}</button>`}
       </div>
     </div>`).join("") : '<div class="empty">还没有 Skill。先为常用写作要求建一个模板。</div>';
 }
@@ -2208,6 +2211,7 @@ function resetSkillForm() {
 function startEditSkill(skillId) {
   const s = agentSkills.find(x => x.id === skillId);
   if (!s) return;
+  if (s.source_kind === "builtin") { showToast("内置 Skill 由系统维护，不能编辑", "err"); return; }
   editingSkillId = skillId;
   $("skillName").value = s.name || "";
   $("skillDescription").value = s.description || "";
@@ -2243,6 +2247,8 @@ async function saveSkill() {
   finally { busy(btn, false, editingSkillId ? "保存修改" : "新增 Skill"); }
 }
 async function delSkill(skillId) {
+  const skill = agentSkills.find(item => item.id === skillId);
+  if (skill?.source_kind === "builtin") { showToast("内置 Skill 不能删除", "err"); return; }
   if (!await askCard({ title: "删除这个 Skill？", msg: "已删除的规则不能恢复。", okText: "删除", danger: true })) return;
   try {
     await api(`/api/agent/skills/${skillId}`, { method: "DELETE" });

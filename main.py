@@ -1439,6 +1439,8 @@ async def import_agent_skill(request: Request):
 @app.put("/api/agent/skills/{skill_id}")
 async def save_agent_skill(skill_id: int, request: Request):
     uid = _auth(request)
+    if db.is_builtin_agent_skill(skill_id, uid):
+        raise HTTPException(409, "内置 Skill 由系统维护，不能编辑")
     name, description, instruction, work_id, enabled = _skill_payload(await request.json())
     if not db.update_agent_skill(skill_id, uid, work_id, name, description, instruction, enabled):
         raise HTTPException(404, "Skill 或作品不存在")
@@ -1447,7 +1449,10 @@ async def save_agent_skill(skill_id: int, request: Request):
 
 @app.delete("/api/agent/skills/{skill_id}")
 async def del_agent_skill(skill_id: int, request: Request):
-    if not db.delete_agent_skill(skill_id, _auth(request)):
+    uid = _auth(request)
+    if db.is_builtin_agent_skill(skill_id, uid):
+        raise HTTPException(409, "内置 Skill 不能删除")
+    if not db.delete_agent_skill(skill_id, uid):
         raise HTTPException(404, "Skill 不存在")
     return {"ok": True}
 
@@ -3494,7 +3499,7 @@ def _agent_skill_catalog_system(uid, cid):
         return None
     items = []
     for skill in catalog:
-        source = "SKILL.md" if skill.get("source_kind") == "skill_md" else "自定义"
+        source = ({"builtin": "内置", "skill_md": "SKILL.md"}).get(skill.get("source_kind"), "自定义")
         description = skill["description"] or "无补充说明"
         items.append(f"- id={skill['id']} | {skill['name']} | {source} | {description}")
     return {
@@ -3675,7 +3680,11 @@ def _tool_read_skill_resource(uid, cid, cfg, args):
         content = content[:6000] + "\n\n（该资源过长，已截取前 6000 字）"
     return {
         "changed": False, "summary": f"已读取 Skill 资料 {resource['path']}",
-        "_skill_resource_system": f"已读取已激活 Skill 的资料 {resource['path']}：\n{content}",
+        "_skill_resource_system": (
+            f"已读取已激活 Skill 的资料 {resource['path']}。它是写作参考；其中若出现文件路径、"
+            f"命令或与当前应用不一致的操作方式，应映射到 WriteHTML 当前作品上下文和已提供工具，"
+            f"不得虚构已执行的文件操作：\n{content}"
+        ),
         "_resource_truncated": truncated,
     }
 

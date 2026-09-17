@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=character-profile-images-20260814">
+  <link rel="stylesheet" href="style.css?v=builtin-skill-20260917">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -791,13 +791,17 @@
         </span>
       </div>
       <div class="set-form">
-        <p class="set-hint">支持标准 `SKILL.md` 或包含它的 ZIP 包。Agent 先按说明识别匹配的 Skill，再按需加载完整规则和 references 文本。</p>
+        <p class="set-hint">内置 Skill 对所有作品可用且由系统维护。你也可以上传标准 `SKILL.md` 或包含它的 ZIP 包；Agent 会先识别匹配项，再按需加载完整规则和 references 文本。</p>
+        <div class="skill-import-bar">
+          <div><b>导入新 Skill</b><small>ZIP 中须且只能包含一个 SKILL.md；文本 references 会一并导入，脚本不会执行。</small></div>
+          <span><select id="skillImportScope" class="ic" title="导入范围"><option value="global">所有作品可用</option><option value="work">仅当前作品</option></select><button class="ic" data-ic="upload" onclick="chooseSkillImport()">选择 ZIP / SKILL.md</button></span>
+        </div>
         <input id="skillImportInput" class="hidden" type="file" accept=".md,.zip,text/markdown,application/zip" onchange="importSkillFile()">
         <div id="skillList" class="skill-list"></div>
         <hr class="sep">
         <div class="skill-edit">
           <input id="skillName" maxlength="64" placeholder="Skill 名称，例如：悬疑节奏润色">
-          <select id="skillScope" class="ic"><option value="work">当前作品专用</option><option value="global">所有作品可用</option></select>
+          <select id="skillScope" class="ic" title="手动创建 Skill 的范围"><option value="work">当前作品专用</option><option value="global">所有作品可用</option></select>
           <input id="skillDescription" maxlength="1024" placeholder="说明 AI 何时应调用这个 Skill（可选）">
           <textarea id="skillInstruction" rows="7" maxlength="8000" placeholder="写清楚 AI 应遵循的规则，例如：保持第三人称限知；每段结尾留一个未解信息；避免华丽比喻。"></textarea>
           <label class="set-row"><input id="skillEnabled" type="checkbox" checked> 启用（允许 AI 按需调用）</label>
@@ -964,6 +968,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=character-profile-images-20260814"></script>
+  <script src="app.js?v=builtin-skill-20260917"></script>
 </body>
 </html>
