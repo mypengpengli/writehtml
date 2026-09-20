@@ -2548,17 +2548,22 @@ async function applyAgentResult(r, selection, baseMessages = null) {
     await loadAgentSessions(false);
   }
   if (r.compacted) showToast("已按上下文预算压缩早期对话", "ok");
-  let contentChanged = false, sidebarDirty = false;
+  let contentChanged = false, sidebarDirty = false, entitiesDirty = false;
   const changedChapterIds = new Set();
   for (const m of resultMessages) {
     if (m.role === "tool") {
       let rr = {}; try { rr = JSON.parse(m.content); } catch (e) {}
       if (rr.changed) contentChanged = true;
       if (rr.sidebar_dirty) sidebarDirty = true;
+      if (rr.entities_dirty) entitiesDirty = true;
       if (rr.changed && Number.isInteger(rr.chapter_id)) changedChapterIds.add(rr.chapter_id);
     }
   }
   if (sidebarDirty) await loadChapters();
+  if (entitiesDirty) {
+    await loadWikiEntities();
+    if (!$('wikiOverlay').classList.contains('hidden')) renderWikiList();
+  }
   if (contentChanged && currentChapterId && (!changedChapterIds.size || changedChapterIds.has(currentChapterId))) {
     await loadChapter();
   }

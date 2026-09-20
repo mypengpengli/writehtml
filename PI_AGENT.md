@@ -33,6 +33,14 @@ The inspiration-library tools (`save_inspiration`, `search_inspirations`,
 same bridge. Inspirations remain candidate creative material and never become
 story facts merely because Pi retrieved them.
 
+`list_characters` and `save_character_card` let Pi read, create, and partially
+update canonical character profiles in the current work. Story memories remain
+separate evidence-backed facts and are not a substitute for character cards.
+
+The bridge does not set a tool-call, step, or iteration count limit. By default
+`PI_AGENT_TIMEOUT_SECONDS=0`, so the application also imposes no whole-turn
+deadline. Operators can opt into a positive timeout for their deployment.
+
 ## Conversation Sessions
 
 Each chapter or work scope can own multiple durable conversations. The active

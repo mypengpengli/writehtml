@@ -30,7 +30,7 @@ def _write_command(process, command):
 
 def run_turn(request, execute_tool, timeout=None, on_event=None):
     """Run one isolated official Pi Coding Agent process and broker app tools."""
-    timeout = float(timeout or config.PI_AGENT_TIMEOUT_SECONDS)
+    timeout = max(0.0, float(config.PI_AGENT_TIMEOUT_SECONDS if timeout is None else timeout))
     command = [config.PI_AGENT_NODE, config.PI_AGENT_BRIDGE]
     runtime_dir = os.path.dirname(config.PI_AGENT_BRIDGE)
     try:
@@ -53,15 +53,18 @@ def run_turn(request, execute_tool, timeout=None, on_event=None):
     for kind, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
         threading.Thread(target=_pump, args=(stream, kind, events), daemon=True).start()
     stderr = []
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout > 0 else None
     try:
         _write_command(process, {"type": "start", "request": request})
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise PiAgentError(f"Pi Coding Agent timed out after {int(timeout)} seconds")
+            wait_seconds = 0.5
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PiAgentError(f"Pi Coding Agent timed out after {int(timeout)} seconds")
+                wait_seconds = min(remaining, wait_seconds)
             try:
-                kind, line = events.get(timeout=min(remaining, 0.5))
+                kind, line = events.get(timeout=wait_seconds)
             except queue.Empty:
                 if process.poll() is not None:
                     detail = "".join(stderr).strip()

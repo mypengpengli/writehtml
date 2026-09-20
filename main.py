@@ -2582,6 +2582,18 @@ AGENT_TOOLS = [
         "description": "列出当前作品的所有章节（id、标题、字数）。",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "list_characters",
+        "description": "列出当前作品的正式人物卡（id、姓名、摘要、基础设定，以及当前章节时点的动态状态）。添加或更新人物卡前先调用，避免重复建卡或覆盖既有设定。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "save_character_card",
+        "description": "直接创建或更新当前作品的正式人物卡，不要用故事记忆代替。提供 entity_id 时更新指定人物；否则按姓名精确匹配，匹配到则更新，未匹配则新建。更新时仅覆盖本次明确提供的摘要或基础设定。",
+        "parameters": {"type": "object", "properties": {
+            "entity_id": {"type": "integer", "description": "可选，list_characters 返回的现有人物 id"},
+            "name": {"type": "string", "description": "人物姓名；新建时必填，按姓名更新时用于精确匹配"},
+            "summary": {"type": "string", "description": "可选的简要定位，如身份、角色功能、核心性格；更新时会替换原摘要"},
+            "detail": {"type": "string", "description": "可选的固定基础设定，如外貌、背景、欲望、恐惧、原则、能力、弱点、说话习惯和初始关系；更新时会替换原基础设定"}}}}},
+    {"type": "function", "function": {
         "name": "list_revisions",
         "description": "列出目标章节的历史版本（id、标题、字数），供回退选择。",
         "parameters": {"type": "object", "properties": {"chapter_id": _CHAPTER_ID_PROPERTY}}}},
@@ -3320,21 +3332,24 @@ def _agent_context_task(instruction, selection):
 def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
     parts = [
         "你是作者的写作 agent。你可以通过工具直接操作作者的作品：改正文、续写、"
-        "回退到历史版本、改章节标题/备注、新建章节、存版本、摘要、设定校验，也能检索、提取和确认故事记忆。"
+        "回退到历史版本、改章节标题/备注、新建章节、存版本、摘要、设定校验，也能直接创建和更新人物卡，"
+        "并检索、提取和确认故事记忆。"
         "原则：1) 要改某段文字前，先 read_chapter 读准确原文，再用 replace_text 或 edit_passage，"
         "old_text 必须与正文逐字一致；2) 每个写操作都会自动存版本，用户可一键撤销，所以放心改；"
         "3) 不要替作者下不可逆的决定；4) 通过写作工具改动正文后，系统会生成待作者确认的人物和剧情状态提议，"
-        "未确认前不改变卡片；5) 故事记忆也必须先提议再确认，不能把推测当事实；"
-        "6) 当用户问历史事实或要求保持连续性时，优先调用 search_story_memory 或 get_memory_source 核对；"
-        "7) 作者明确说“记一下、存起来、以后用”时调用 save_inspiration，工具成功前不得声称已保存；"
+        "未确认前不改变卡片；5) 用户明确要求添加、建立、整理或更新人物卡时，先调用 list_characters，"
+        "再调用 save_character_card；人物卡用于身份、背景、核心性格等相对固定设定，不能用故事记忆替代，"
+        "也不能在工具成功前声称已经建卡；6) 故事记忆也必须先提议再确认，不能把推测当事实；"
+        "7) 当用户问历史事实或要求保持连续性时，优先调用 search_story_memory 或 get_memory_source 核对；"
+        "8) 作者明确说“记一下、存起来、以后用”时调用 save_inspiration，工具成功前不得声称已保存；"
         "灵感是未来候选，不是故事事实。需要增强桥段、情绪、画面、笑点或漫剧制作时，可按需调用 "
         "search_inspirations，匹配度低就不要硬塞；实际采用后再调用 mark_inspiration_used；"
-        "8) 用户问今天、最新、当前、近期新闻或明确要求网上查时，调用 web_search 后再回答；"
+        "9) 用户问今天、最新、当前、近期新闻或明确要求网上查时，调用 web_search 后再回答；"
         "不得假装已经搜索，回答应列出实际使用的来源标题和 URL；"
-        "9) 用户可以在同一会话中要求处理当前作品的多章内容。先用 list_chapters 取得 id，"
+        "10) 用户可以在同一会话中要求处理当前作品的多章内容。先用 list_chapters 取得 id，"
         "再通过 chapter_id 操作指定章节；新章成稿可直接用 create_chapter 的 content 写入，"
         "已有章节整章写入可用 write_chapter。不要人为限制每次只能处理一章；"
-        "10) 回答简洁，做完事说一句即可。"
+        "11) 回答简洁，做完事说一句即可。"
     ]
     if cid:
         c = db.get_chapter_meta(cid, uid)
@@ -3696,6 +3711,98 @@ def _tool_list_chapters(uid, cid, cfg, args):
     lst = db.list_chapters(work_id, uid) or []
     return {"changed": False, "chapters": [
         {"id": x["id"], "title": x["title"], "chars": x["chars"]} for x in lst]}
+
+
+def _tool_list_characters(uid, cid, cfg, args):
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not work_id:
+        return _agent_err("当前没有可用作品")
+    at_chapter_id = cid if cid and db.get_chapter_meta(cid, uid) else None
+    entities = db.list_entities(work_id, uid, at_chapter_id)
+    if entities is None:
+        return _agent_err("作品不存在")
+    characters = [{
+        "id": item["id"],
+        "name": item["name"],
+        "summary": item.get("summary") or "",
+        "detail": item.get("detail") or "",
+        "current_state": item.get("current_state"),
+    } for item in entities if item.get("kind") == "人物"]
+    return {
+        "changed": False,
+        "characters": characters,
+        "summary": f"当前作品共有 {len(characters)} 张人物卡",
+    }
+
+
+def _tool_save_character_card(uid, cid, cfg, args):
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not work_id:
+        return _agent_err("当前没有可用作品")
+
+    entity_id = args.get("entity_id")
+    if entity_id is not None and (
+        not isinstance(entity_id, int) or isinstance(entity_id, bool) or entity_id <= 0
+    ):
+        return _agent_err("人物 id 无效")
+    raw_name = args.get("name")
+    if raw_name is not None and not isinstance(raw_name, str):
+        return _agent_err("人物姓名格式无效")
+    name = (raw_name or "").strip()
+    if len(name) > 120:
+        return _agent_err("人物姓名不能超过 120 字")
+    for field, limit, label in (("summary", 4000, "人物摘要"), ("detail", 20000, "人物基础设定")):
+        value = args.get(field)
+        if value is not None and not isinstance(value, str):
+            return _agent_err(f"{label}格式无效")
+        if isinstance(value, str) and len(value) > limit:
+            return _agent_err(f"{label}不能超过 {limit} 字")
+
+    existing = None
+    if entity_id is not None:
+        existing = db.get_entity(entity_id, uid)
+        if not existing or existing["work_id"] != work_id:
+            return _agent_err("人物卡不存在或不属于当前作品")
+        if existing.get("kind") != "人物":
+            return _agent_err("目标实体不是人物卡")
+    else:
+        if not name:
+            return _agent_err("新建或按姓名更新人物卡时必须提供姓名")
+        matches = [
+            item for item in (db.list_entities(work_id, uid) or [])
+            if item.get("kind") == "人物" and item.get("name", "").casefold() == name.casefold()
+        ]
+        if len(matches) > 1:
+            return _agent_err("存在多个同名人物，请先 list_characters 并提供 entity_id")
+        existing = matches[0] if matches else None
+
+    if existing:
+        final_name = name or existing["name"]
+        if not db.update_entity(
+            existing["id"], uid, final_name, "人物",
+            args.get("summary") if "summary" in args else None,
+            args.get("detail") if "detail" in args else None,
+        ):
+            return _agent_err("更新人物卡失败")
+        saved = db.get_entity(existing["id"], uid)
+        action = "更新"
+    else:
+        saved = db.create_entity(
+            work_id, uid, name, "人物", args.get("summary") or "", args.get("detail") or "",
+        )
+        if not saved:
+            return _agent_err("创建人物卡失败")
+        action = "创建"
+
+    return {
+        "changed": False,
+        "entities_dirty": True,
+        "entity": {
+            "id": saved["id"], "name": saved["name"], "kind": "人物",
+            "summary": saved.get("summary") or "", "detail": saved.get("detail") or "",
+        },
+        "summary": f"已{action}人物卡「{saved['name']}」",
+    }
 
 
 def _tool_list_revisions(uid, cid, cfg, args):
@@ -4211,6 +4318,7 @@ def _tool_web_search(uid, cid, cfg, args):
 
 _AGENT_TOOLS = {
     "read_chapter": _tool_read_chapter, "list_chapters": _tool_list_chapters,
+    "list_characters": _tool_list_characters, "save_character_card": _tool_save_character_card,
     "activate_skill": _tool_activate_skill, "read_skill_resource": _tool_read_skill_resource,
     "list_revisions": _tool_list_revisions, "replace_text": _tool_replace_text,
     "append_text": _tool_append_text, "edit_passage": _tool_edit_passage,
@@ -4707,9 +4815,10 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
     msgs.append(stored_turn)
 
     reply = ""
-    deadline = time.monotonic() + max(30.0, float(config.PI_AGENT_TIMEOUT_SECONDS))
+    timeout_seconds = max(0.0, float(config.PI_AGENT_TIMEOUT_SECONDS))
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     while True:
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             reply = "本轮运行时间已到，已完成的章节操作均已保存，可在当前会话继续。"
             break
         if on_event:

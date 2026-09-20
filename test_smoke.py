@@ -922,6 +922,36 @@ def _make_agent(stub):
         return stub[min(i, len(stub) - 1)]
     return fake
 
+# Agent 必须能直接读写正式人物卡，不能拿故事记忆冒充人物档案。
+_agent_tool_names = {item["function"]["name"] for item in main.AGENT_TOOLS}
+ok({"list_characters", "save_character_card"}.issubset(_agent_tool_names), "Agent 暴露人物卡读写工具")
+_character_tool_prompt = main._agent_system(uidA, cid, "按正文自动建立人物卡")["content"]
+ok("save_character_card" in _character_tool_prompt and "不能用故事记忆替代" in _character_tool_prompt,
+   "Agent 明确使用正式人物卡工具而非故事记忆")
+def _call_agent_tool(name, args):
+    return _retry(lambda: main._AGENT_TOOLS[name](uidA, cid, {"work_id": wid}, args))()
+
+_listed_characters = _call_agent_tool("list_characters", {})
+ok(any(item["id"] == ent["id"] and item["name"] == "林晚" for item in _listed_characters["characters"]),
+   "Agent 可列出当前作品人物卡")
+_updated_character = _call_agent_tool("save_character_card", {
+    "entity_id": ent["id"], "summary": "29岁调查员，女主角",
+})
+_updated_character_row = db.get_entity(ent["id"], uidA)
+ok(_updated_character.get("entities_dirty") and _updated_character_row["summary"] == "29岁调查员，女主角"
+   and "银白短发" in _updated_character_row["detail"], "Agent 更新人物卡且保留未传字段")
+_created_character = _call_agent_tool("save_character_card", {
+    "name": "周远", "summary": "调查组新人", "detail": "谨慎，擅长资料核验",
+})
+_call_agent_tool("save_character_card", {
+    "name": "周远", "summary": "调查组新人，负责资料核验",
+})
+_all_characters = [item for item in db.list_entities(wid, uidA) if item["kind"] == "人物"]
+ok(_created_character.get("entity", {}).get("name") == "周远"
+   and sum(item["name"] == "周远" for item in _all_characters) == 1
+   and next(item for item in _all_characters if item["name"] == "周远")["summary"] == "调查组新人，负责资料核验",
+   "Agent 可创建人物卡且同名调用执行更新而非重复建卡")
+
 def _stream_events(response):
     return [json.loads(line) for line in response.text.splitlines() if line.strip()]
 

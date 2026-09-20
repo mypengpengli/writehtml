@@ -85,7 +85,9 @@ PI_AGENT_ENABLED = os.getenv("PI_AGENT_ENABLED", "true").lower() not in {"0", "f
 PI_AGENT_NODE = os.getenv("PI_AGENT_NODE", "node")
 _pi_bridge = os.getenv("PI_AGENT_BRIDGE", os.path.join("pi_runtime", "bridge.mjs"))
 PI_AGENT_BRIDGE = _pi_bridge if os.path.isabs(_pi_bridge) else os.path.join(ROOT_DIR, _pi_bridge)
-PI_AGENT_TIMEOUT_SECONDS = float(os.getenv("PI_AGENT_TIMEOUT_SECONDS", "240"))
+# 0 disables the host-side turn deadline. Providers and reverse proxies may
+# still enforce their own transport limits, but the app does not cap agent work.
+PI_AGENT_TIMEOUT_SECONDS = float(os.getenv("PI_AGENT_TIMEOUT_SECONDS", "0"))
 # 0 means the token budget below, rather than an arbitrary message count, controls history.
 PI_AGENT_MAX_HISTORY_MESSAGES = int(os.getenv("PI_AGENT_MAX_HISTORY_MESSAGES", "0"))
 # Pi Coding Agent 的本机 Skill 目录。留空时沿用 AGENT_SKILL_DIR；它会按 Pi 的
