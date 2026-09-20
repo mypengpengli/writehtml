@@ -7,6 +7,7 @@ node_modules/
 # 运行时数据 / 密钥
 writehtml.db
 data/
+backups/
 .env
 .smoke_tmp/
 .smoke-*.png
