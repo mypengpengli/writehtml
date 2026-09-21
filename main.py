@@ -732,6 +732,135 @@ async def del_entity(eid: int, request: Request):
     return {"ok": True}
 
 
+# ---------- 创作生产画布 ----------
+
+def _production_error(result):
+    if result is None:
+        raise HTTPException(404, "作品、章节或画布对象不存在")
+    if isinstance(result, dict):
+        messages = {
+            "invalid_category": "设定卡分类无效", "invalid_name": "设定卡名称不能为空",
+            "invalid_scope": "设定卡生效范围无效", "invalid_chapter": "章节不存在",
+            "invalid_location": "地点卡不存在", "invalid_refs": "场景引用格式无效",
+            "invalid_fields": "自定义字段格式无效", "invalid_layout": "画布布局格式无效",
+            "invalid_type": "变化提议类型无效", "invalid_target": "目标卡片不存在",
+            "invalid_json": "设定卡结构化数据格式无效", "empty_state": "请填写至少一项状态",
+            "invalid": "画布数据不完整", "resolved": "该提议已经处理",
+            "stale": "正文已变化，该提议已经过期，请重新分析",
+        }
+        for key, message in messages.items():
+            if result.get(key):
+                raise HTTPException(409 if key in {"resolved", "stale"} else 400, message)
+    return result
+
+
+@app.get("/api/works/{wid}/production")
+async def get_production_overview(wid: int, request: Request):
+    return _production_error(db.get_production_overview(wid, _auth(request)))
+
+
+@app.get("/api/chapters/{cid}/production")
+async def get_chapter_production(cid: int, request: Request):
+    return _production_error(db.get_chapter_production(cid, _auth(request)))
+
+
+@app.get("/api/works/{wid}/production/cards")
+async def get_production_cards(wid: int, request: Request):
+    chapter_id = _qparam_int(request, "chapter_id")
+    return _production_error(db.list_production_cards(wid, _auth(request), chapter_id))
+
+
+@app.post("/api/works/{wid}/production/cards")
+async def new_production_card(wid: int, request: Request):
+    return _production_error(db.save_production_card(wid, _auth(request), await request.json()))
+
+
+@app.put("/api/production/cards/{card_id}")
+async def update_production_card(card_id: int, request: Request):
+    uid = _auth(request)
+    old = db.get_production_card(card_id, uid)
+    if not old:
+        raise HTTPException(404, "设定卡不存在")
+    return _production_error(db.save_production_card(old["work_id"], uid, await request.json(), card_id))
+
+
+@app.delete("/api/production/cards/{card_id}")
+async def delete_production_card(card_id: int, request: Request):
+    if not db.archive_production_card(card_id, _auth(request)):
+        raise HTTPException(404, "设定卡不存在")
+    return {"ok": True}
+
+
+@app.post("/api/production/cards/{card_id}/versions")
+async def new_production_card_version(card_id: int, request: Request):
+    body = await request.json()
+    chapter_id = body.get("chapter_id")
+    if not isinstance(chapter_id, int):
+        raise HTTPException(400, "请选择状态生效章节")
+    return _production_error(db.create_production_card_version(
+        card_id, _auth(request), chapter_id, body.get("state"), body.get("change_summary", ""),
+        body.get("evidence", ""), body.get("evidence_start"), body.get("evidence_end"),
+    ))
+
+
+@app.post("/api/chapters/{cid}/production/scenes")
+async def new_production_scene(cid: int, request: Request):
+    return _production_error(db.save_production_scene(cid, _auth(request), await request.json()))
+
+
+@app.put("/api/production/scenes/{scene_id}")
+async def update_production_scene(scene_id: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    chapter_id = body.get("chapter_id")
+    if not isinstance(chapter_id, int):
+        raise HTTPException(400, "缺少场景所属章节")
+    return _production_error(db.save_production_scene(chapter_id, uid, body, scene_id))
+
+
+@app.delete("/api/production/scenes/{scene_id}")
+async def delete_production_scene(scene_id: int, request: Request):
+    if not db.delete_production_scene(scene_id, _auth(request)):
+        raise HTTPException(404, "场景不存在")
+    return {"ok": True}
+
+
+@app.put("/api/works/{wid}/production/settings")
+async def update_production_settings(wid: int, request: Request):
+    return _production_error(db.save_production_settings(wid, _auth(request), await request.json()))
+
+
+@app.put("/api/works/{wid}/production/layout")
+async def update_production_layout(wid: int, request: Request):
+    body = await request.json()
+    chapter_id = body.get("chapter_id")
+    if chapter_id is not None and not isinstance(chapter_id, int):
+        raise HTTPException(400, "章节编号无效")
+    return _production_error(db.save_production_layout(wid, _auth(request), chapter_id, body.get("layout")))
+
+
+@app.post("/api/production/proposals/{proposal_id}/accept")
+async def accept_production_proposal(proposal_id: int, request: Request):
+    return _production_error(db.resolve_production_proposal(proposal_id, _auth(request), True))
+
+
+@app.post("/api/production/proposals/{proposal_id}/reject")
+async def reject_production_proposal(proposal_id: int, request: Request):
+    return _production_error(db.resolve_production_proposal(proposal_id, _auth(request), False))
+
+
+@app.post("/api/production/impacts/{impact_id}/resolve")
+async def resolve_production_impact(impact_id: int, request: Request):
+    if not db.resolve_production_impact(impact_id, _auth(request)):
+        raise HTTPException(404, "影响提醒不存在")
+    return {"ok": True}
+
+
+@app.post("/api/chapters/{cid}/production/analyze")
+async def analyze_chapter_production(cid: int, request: Request):
+    return _generate_production_analysis(_auth(request), cid, raise_on_error=True)
+
+
 def _default_character_image_prompt(entity, state=None):
     parts = [
         "Create a polished full-body character concept illustration for a novel.",
@@ -2779,6 +2908,49 @@ AGENT_TOOLS = [
             "applied_excerpt": {"type": "string"}},
             "required": ["inspiration_id","usage_type","usage_status"]}}},
     {"type": "function", "function": {
+        "name": "list_story_cards",
+        "description": "读取生产画布中的正式规则、地点、技能、道具和组织卡，以及当前章节时点的有效状态。",
+        "parameters": {"type": "object", "properties": {
+            "chapter_id": _CHAPTER_ID_PROPERTY,
+            "category": {"type": "string", "enum": ["rule","location","skill","item","organization"]}}}}},
+    {"type": "function", "function": {
+        "name": "save_story_card",
+        "description": "创建或更新一张正式生产设定卡。用于稳定的规则、地点、技能、道具或组织；动态变化请用 save_story_card_state。",
+        "parameters": {"type": "object", "properties": {
+            "card_id": {"type": "integer"},
+            "category": {"type": "string", "enum": ["rule","location","skill","item","organization"]},
+            "name": {"type": "string"}, "summary": {"type": "string"}, "detail": {"type": "string"},
+            "attributes": {"type": "object", "additionalProperties": True},
+            "truth": {"type": "object", "additionalProperties": True},
+            "reader_state": {"type": "string"},
+            "scope_type": {"type": "string", "enum": ["global","chapter_range","scene"]},
+            "scope_start_chapter_id": {"type": "integer"}, "scope_end_chapter_id": {"type": "integer"}}}}},
+    {"type": "function", "function": {
+        "name": "save_story_card_state",
+        "description": "记录某张设定卡截至指定章节的动态状态，例如技能熟练度、道具归属、地点损毁或规则临时例外。",
+        "parameters": {"type": "object", "properties": {
+            "card_id": {"type": "integer"}, "chapter_id": _CHAPTER_ID_PROPERTY,
+            "state": {"type": "object", "additionalProperties": True},
+            "change_summary": {"type": "string"}, "evidence": {"type": "string"}},
+            "required": ["card_id","state"]}}},
+    {"type": "function", "function": {
+        "name": "list_chapter_scenes",
+        "description": "读取指定章节在生产画布中的有序场景节点及其目标、冲突、结果和关联设定。",
+        "parameters": {"type": "object", "properties": {"chapter_id": _CHAPTER_ID_PROPERTY}}}},
+    {"type": "function", "function": {
+        "name": "save_chapter_scene",
+        "description": "创建或更新章节场景节点。只整理场景结构，不直接改写正文。",
+        "parameters": {"type": "object", "properties": {
+            "scene_id": {"type": "integer"}, "chapter_id": _CHAPTER_ID_PROPERTY,
+            "title": {"type": "string"}, "summary": {"type": "string"}, "time_label": {"type": "string"},
+            "location_card_id": {"type": "integer"}, "goal": {"type": "string"},
+            "conflict": {"type": "string"}, "outcome": {"type": "string"},
+            "refs": {"type": "object", "additionalProperties": True}}, "required": ["title"]}}},
+    {"type": "function", "function": {
+        "name": "analyze_chapter_production",
+        "description": "用当前文字模型分析指定章节的场景和设定变化。场景与普通状态自动记录，新设定和重大变化生成待作者确认项。",
+        "parameters": {"type": "object", "properties": {"chapter_id": _CHAPTER_ID_PROPERTY}}}},
+    {"type": "function", "function": {
         "name": "web_search",
         "description": "联网搜索公开网页，获取最新事实、新闻、天气、资料和来源链接。涉及“今天、最新、当前、最近、网上查”等时优先调用；每次先使用一个明确查询，回答中必须注明来源。",
         "parameters": {"type": "object", "properties": {
@@ -2815,8 +2987,162 @@ def _agent_bible(wid, uid, cid=None):
         return ""
     return context_builder.render_context(
         context,
-        {"work_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"},
+        {"work_bible", "production_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"},
     )
+
+
+def _production_evidence_span(content, evidence):
+    evidence = str(evidence or "").strip()
+    if not evidence:
+        return None, None
+    start = (content or "").find(evidence)
+    return (start, start + len(evidence)) if start >= 0 else (None, None)
+
+
+def _generate_production_analysis(uid, cid, *, raise_on_error=False):
+    """Analyze scenes and state changes in one model call; major facts remain author proposals."""
+    chapter = db.get_chapter_meta(cid, uid) if cid else None
+    if not chapter:
+        if raise_on_error:
+            raise HTTPException(404, "章节不存在")
+        return None
+    content = (chapter.get("content") or "").strip()
+    if not content:
+        if raise_on_error:
+            raise HTTPException(400, "本章为空，无法分析生产画布")
+        return None
+    settings = db.get_settings(uid) or {}
+    base_url = settings.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = settings.get("llm_api_key") or config.LLM_API_KEY
+    model = settings.get("llm_model") or config.LLM_MODEL
+    if not api_key:
+        if raise_on_error:
+            raise HTTPException(500, "未配置 API Key，无法分析生产画布")
+        return None
+    work_settings = db.get_production_settings(chapter["work_id"], uid) or {}
+    evidence_enabled = work_settings.get("evidence_enabled", True)
+    cards = db.list_production_cards(chapter["work_id"], uid, cid, before=True, include_pending=False) or []
+    characters = db.list_character_cards(chapter["work_id"], uid, cid, before=True) or []
+    compact_cards = [{
+        "id": item["id"], "category": item["category"], "name": item["name"],
+        "summary": item.get("summary") or "", "detail": (item.get("detail") or "")[:2000],
+        "attributes": item.get("attributes") or {}, "truth": item.get("truth") or {},
+        "current_state": (item.get("current_state") or {}).get("state") or {},
+    } for item in cards[:120]]
+    compact_characters = [{
+        "id": item["id"], "name": item["name"], "summary": item.get("summary") or "",
+        "current_state": item.get("current_state") or {},
+    } for item in characters[:100]]
+    base_context = context_builder.build_context(
+        uid, "chapter_review", chapter["work_id"], cid, token_budget=16000,
+    ) or {"context_items": []}
+    prompt = {
+        "task": "把当前小说章节整理成创作生产画布：划分有戏剧意义的场景，并识别本章造成的状态变化。",
+        "output": {
+            "scenes": [{
+                "title": "场景短标题", "summary": "发生了什么", "time_label": "时间",
+                "location_card_id": None, "goal": "人物/剧情目标", "conflict": "阻力",
+                "outcome": "场景结束后的结果", "refs": {"character_ids": [], "card_ids": []},
+                "evidence": "正文中的连续短句原文",
+            }],
+            "changes": [{
+                "proposal_type": "new_card|card_update|card_state", "target_id": None,
+                "category": "rule|location|skill|item|organization", "name": "卡片名",
+                "severity": "ordinary|major", "change_summary": "变化摘要",
+                "before": {}, "after": {}, "confidence": 0.9,
+                "evidence": "正文中的连续短句原文",
+            }],
+            "character_changes": [{
+                "entity_id": 1, "severity": "ordinary|major", "change_summary": "人物变化",
+                "state": {field: "" for field in db.CHARACTER_STATE_FIELDS},
+                "evidence": "正文中的连续短句原文",
+            }],
+        },
+        "rules": [
+            "只返回 JSON 对象，不要 Markdown 或解释。",
+            "场景按正文顺序排列；不要按自然段机械切分，地点、目标或冲突明显变化时才分场。",
+            "只记录本章正文明确支持的变化，不预测后续，不把临时动作误写成长期设定。",
+            "已存在卡片必须填写 target_id；正文首次出现且确有后续价值的规则、地点、技能、道具或组织才用 new_card。",
+            "普通变化仅指位置、持有状态、熟练度、短期可逆状态；新卡、死亡、能力获得/失去、规则真相、归属永久变化均为 major。",
+            "after 对 new_card 使用 name/summary/detail/attributes/truth/reader_state；对 card_state 使用 state 对象。",
+            "人物 state 必须给出截至本章结束的完整状态，未变化字段沿用 known_characters 的 current_state。",
+            "truth 可区分 objective、reader_known、character_knowledge、secrecy；不得提前打破 secrecy。",
+            ("每条场景和变化都提供能在正文中逐字找到的短证据。" if evidence_enabled
+             else "evidence 返回空字符串，不需要生成证据。"),
+        ],
+        "known_cards": compact_cards,
+        "known_characters": compact_characters,
+        "confirmed_context": context_builder.render_context(
+            base_context, {"work_bible", "plot_state", "relationships", "memory", "chapter_summary"}
+        )[:22000],
+        "chapter": {"id": cid, "title": chapter["title"], "notes": chapter.get("notes") or "",
+                    "content": content[-40000:]},
+    }
+    try:
+        parsed = _parse_json_from_model(llm.chat([
+            {"role": "system", "content": "你是长篇小说的连续性编辑和场景制片。输出必须是严格 JSON。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ], base_url=base_url, api_key=api_key, model=model))
+    except Exception as exc:
+        if raise_on_error:
+            raise HTTPException(502, "生产画布分析失败：" + _provider_error(exc))
+        return None
+    if not isinstance(parsed, dict):
+        if raise_on_error:
+            raise HTTPException(502, "生产画布分析没有返回有效 JSON")
+        return None
+    scenes = parsed.get("scenes") if isinstance(parsed.get("scenes"), list) else []
+    clean_scenes = []
+    for raw in scenes[:40]:
+        if not isinstance(raw, dict):
+            continue
+        evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
+        start, end = _production_evidence_span(content, evidence)
+        clean = dict(raw)
+        clean.update({"evidence": evidence, "evidence_start": start, "evidence_end": end})
+        clean_scenes.append(clean)
+    db.replace_ai_production_scenes(cid, uid, clean_scenes)
+    saved_changes = []
+    for raw in (parsed.get("changes") if isinstance(parsed.get("changes"), list) else [])[:60]:
+        if not isinstance(raw, dict):
+            continue
+        evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
+        start, end = _production_evidence_span(content, evidence)
+        item = dict(raw)
+        item.update({"evidence": evidence, "evidence_start": start, "evidence_end": end})
+        saved = db.upsert_production_proposal(chapter["work_id"], uid, cid, item)
+        if not saved or saved.get("invalid") or saved.get("invalid_type") or saved.get("invalid_target"):
+            continue
+        auto_applied = saved.get("severity") == "ordinary" and saved.get("proposal_type") == "card_state"
+        if auto_applied:
+            applied = db.resolve_production_proposal(saved["id"], uid, True)
+            saved["status"] = "accepted" if applied and applied.get("ok") else saved["status"]
+            saved["auto_applied"] = bool(applied and applied.get("ok"))
+        saved_changes.append(saved)
+    character_results = []
+    known_character_ids = {item["id"] for item in characters}
+    for raw in (parsed.get("character_changes") if isinstance(parsed.get("character_changes"), list) else [])[:40]:
+        if not isinstance(raw, dict) or raw.get("entity_id") not in known_character_ids:
+            continue
+        evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
+        if raw.get("severity") == "ordinary":
+            saved = db.create_character_state_version(
+                raw["entity_id"], uid, cid, raw.get("state"), raw.get("change_summary", ""), evidence, source="ai",
+            )
+            kind = "version"
+        else:
+            saved = db.upsert_character_state_proposal(
+                raw["entity_id"], uid, cid, raw.get("state"), raw.get("change_summary", ""), evidence,
+            )
+            kind = "proposal"
+        if saved and not saved.get("empty_state"):
+            character_results.append({"kind": kind, "item": saved})
+    db.mark_production_analysis_current(cid, uid)
+    return {
+        "ok": True, "model": model, "scene_count": len(clean_scenes),
+        "changes": saved_changes, "character_changes": character_results,
+        "production": db.get_chapter_production(cid, uid),
+    }
 
 
 def _parse_json_from_model(raw):
@@ -3001,7 +3327,7 @@ def _generate_plot_state_proposal(uid, cid, *, base_url=None, api_key=None, mode
         ],
         "confirmed_state_at_this_point": before,
         "story_context": context_builder.render_context(
-            context, {"work_bible", "character_state", "relationships", "memory", "chapter_summary"}
+            context, {"work_bible", "production_bible", "character_state", "relationships", "memory", "chapter_summary"}
         )[:22000],
         "chapter": {
             "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
@@ -3093,7 +3419,7 @@ def _generate_story_memory_proposals(uid, cid, *, base_url=None, api_key=None, m
         ],
         "known_entities": known_entities,
         "confirmed_context": context_builder.render_context(
-            context, {"work_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"}
+            context, {"work_bible", "production_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"}
         )[:22000],
         "chapter": {
             "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
@@ -3192,6 +3518,7 @@ def _run_chapter_review(uid, cid, *, base_url=None, api_key=None, model=None, ra
     memory_proposals = _generate_story_memory_proposals(
         uid, cid, base_url=base_url, api_key=api_key, model=model,
     )
+    production_analysis = _generate_production_analysis(uid, cid)
     analysis = db.mark_chapter_analysis_reviewed(cid, uid)
     return {
         "workflow": workflow,
@@ -3199,6 +3526,7 @@ def _run_chapter_review(uid, cid, *, base_url=None, api_key=None, model=None, ra
         "character_state_proposals": character_state_proposals,
         "plot_state_proposal": plot_state_proposal,
         "memory_proposals": memory_proposals,
+        "production_analysis": production_analysis,
         "analysis": analysis,
     }
 
@@ -3319,6 +3647,8 @@ def _compact_agent_history(messages, summary, *, system_prompt, prompt, base_url
 
 
 def _agent_context_task(instruction, selection):
+    if isinstance(selection, dict) and selection.get("context_kind") == "canvas_target":
+        return "answer_story_question"
     if isinstance(selection, dict) and isinstance(selection.get("text"), str) and selection["text"].strip():
         return "rewrite_selection"
     text = (instruction or "").strip()
@@ -3349,7 +3679,10 @@ def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
         "10) 用户可以在同一会话中要求处理当前作品的多章内容。先用 list_chapters 取得 id，"
         "再通过 chapter_id 操作指定章节；新章成稿可直接用 create_chapter 的 content 写入，"
         "已有章节整章写入可用 write_chapter。不要人为限制每次只能处理一章；"
-        "11) 回答简洁，做完事说一句即可。"
+        "11) 规则、地点、技能、道具和组织属于生产设定卡，使用 list_story_cards、save_story_card "
+        "和 save_story_card_state 读写；章节场景使用 list_chapter_scenes、save_chapter_scene。"
+        "新设定或重大剧情变化应先通过 analyze_chapter_production 形成作者待确认项，不能默认为既定事实；"
+        "12) 回答简洁，做完事说一句即可。"
     ]
     if cid:
         c = db.get_chapter_meta(cid, uid)
@@ -3367,7 +3700,7 @@ def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
             )
             if context:
                 story_context = context_builder.render_context(
-                    context, {"work_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary",
+                    context, {"work_bible", "production_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary",
                               "style_profile", "reference_project", "reference_document", "inspiration"},
                 )
                 if story_context:
@@ -3390,6 +3723,16 @@ def _agent_selection_system(uid, cid, selection):
         return None
     if len(selected) > 8000:
         raise HTTPException(400, "选区太长，请少选一点再交给 AI")
+
+    if selection.get("context_kind") == "canvas_target":
+        target_type = str(selection.get("target_type") or "对象")[:40]
+        target_id = selection.get("target_id")
+        return {"role": "system", "content": (
+            "用户本轮在创作生产画布中选中了一个对象。这个对象是本轮临时编辑目标，不是正文选区。"
+            "用户说“这个”“当前卡片”“当前场景”时指它。修改设定时使用生产画布工具；"
+            "只有用户明确要求改正文时才调用正文编辑工具。\n\n"
+            f"target_type={target_type}, target_id={target_id}\n{selected}"
+        )}
 
     c = db.get_chapter_meta(cid, uid)
     if not c:
@@ -3803,6 +4146,114 @@ def _tool_save_character_card(uid, cid, cfg, args):
         },
         "summary": f"已{action}人物卡「{saved['name']}」",
     }
+
+
+def _tool_list_story_cards(uid, cid, cfg, args):
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not work_id:
+        return _agent_err("当前没有可用作品")
+    target_id = args.get("chapter_id", cid)
+    if target_id is not None:
+        _, chapter, error = _tool_target_chapter(uid, cid, cfg, {"chapter_id": target_id})
+        if error:
+            return error
+        target_id = chapter["id"]
+    cards = db.list_production_cards(work_id, uid, target_id, include_pending=False)
+    if cards is None:
+        return _agent_err("作品不存在")
+    category = args.get("category")
+    if category:
+        cards = [item for item in cards if item.get("category") == category]
+    result = [{
+        "id": item["id"], "category": item["category"], "name": item["name"],
+        "summary": item.get("summary") or "", "detail": item.get("detail") or "",
+        "attributes": item.get("attributes") or {}, "truth": item.get("truth") or {},
+        "reader_state": item.get("reader_state") or "",
+        "current_state": (item.get("current_state") or {}).get("state") or {},
+    } for item in cards[:120]]
+    return {"changed": False, "cards": result, "summary": f"读取了 {len(result)} 张生产设定卡"}
+
+
+def _tool_save_story_card(uid, cid, cfg, args):
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not work_id:
+        return _agent_err("当前没有可用作品")
+    card_id = args.get("card_id")
+    if card_id is not None and (not isinstance(card_id, int) or isinstance(card_id, bool)):
+        return _agent_err("设定卡 id 无效")
+    if card_id is not None:
+        existing = db.get_production_card(card_id, uid)
+        if not existing or existing["work_id"] != work_id:
+            return _agent_err("设定卡不存在或不属于当前作品")
+    values = {key: args[key] for key in (
+        "category", "name", "summary", "detail", "attributes", "truth", "reader_state",
+        "scope_type", "scope_start_chapter_id", "scope_end_chapter_id",
+    ) if key in args}
+    saved = db.save_production_card(work_id, uid, values, card_id)
+    if not saved or saved.get("invalid_category") or saved.get("invalid_name") or saved.get("invalid_scope"):
+        return _agent_err("设定卡数据无效，未保存")
+    return {"changed": False, "production_dirty": True, "card": saved,
+            "summary": f"已{'更新' if card_id else '创建'}{saved['category_label']}卡「{saved['name']}」"}
+
+
+def _tool_save_story_card_state(uid, cid, cfg, args):
+    card_id = args.get("card_id")
+    if not isinstance(card_id, int) or isinstance(card_id, bool):
+        return _agent_err("设定卡 id 无效")
+    target_id, _, error = _tool_target_chapter(uid, cid, cfg, args)
+    if error:
+        return error
+    card = db.get_production_card(card_id, uid)
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not card or card["work_id"] != work_id:
+        return _agent_err("设定卡不存在或不属于当前作品")
+    saved = db.create_production_card_version(
+        card_id, uid, target_id, args.get("state"), args.get("change_summary", ""),
+        args.get("evidence", ""), source="agent",
+    )
+    if not saved or saved.get("empty_state"):
+        return _agent_err("状态为空，未保存")
+    return {"changed": False, "production_dirty": True, "version": saved,
+            "summary": f"已记录「{card['name']}」在第 {saved['chapter_ord']} 章后的状态"}
+
+
+def _tool_list_chapter_scenes(uid, cid, cfg, args):
+    target_id, chapter, error = _tool_target_chapter(uid, cid, cfg, args)
+    if error:
+        return error
+    scenes = db.list_production_scenes(target_id, uid)
+    return {"changed": False, "chapter_id": target_id, "chapter_title": chapter["title"],
+            "scenes": scenes or [], "summary": f"本章共有 {len(scenes or [])} 个场景节点"}
+
+
+def _tool_save_chapter_scene(uid, cid, cfg, args):
+    target_id, _, error = _tool_target_chapter(uid, cid, cfg, args)
+    if error:
+        return error
+    scene_id = args.get("scene_id")
+    if scene_id is not None and (not isinstance(scene_id, int) or isinstance(scene_id, bool)):
+        return _agent_err("场景 id 无效")
+    values = {key: args[key] for key in (
+        "title", "summary", "time_label", "location_card_id", "goal", "conflict", "outcome", "refs",
+    ) if key in args}
+    saved = db.save_production_scene(target_id, uid, values, scene_id)
+    if not saved or saved.get("invalid_location") or saved.get("invalid_refs"):
+        return _agent_err("场景数据无效，未保存")
+    return {"changed": False, "production_dirty": True, "scene": saved,
+            "summary": f"已{'更新' if scene_id else '创建'}场景「{saved['title']}」"}
+
+
+def _tool_analyze_chapter_production(uid, cid, cfg, args):
+    target_id, chapter, error = _tool_target_chapter(uid, cid, cfg, args)
+    if error:
+        return error
+    result = _generate_production_analysis(uid, target_id)
+    if not result:
+        return _agent_err("生产画布分析失败，请检查正文和模型设置")
+    return {"changed": False, "production_dirty": True,
+            "summary": f"已分析《{chapter['title']}》：{result['scene_count']} 个场景，"
+                       f"{len(result['changes'])} 项设定变化",
+            "scene_count": result["scene_count"], "changes": result["changes"]}
 
 
 def _tool_list_revisions(uid, cid, cfg, args):
@@ -4335,6 +4786,10 @@ _AGENT_TOOLS = {
     "save_inspiration": _tool_save_inspiration, "search_inspirations": _tool_search_inspirations,
     "get_inspiration": _tool_get_inspiration, "update_inspiration": _tool_update_inspiration,
     "mark_inspiration_used": _tool_mark_inspiration_used,
+    "list_story_cards": _tool_list_story_cards, "save_story_card": _tool_save_story_card,
+    "save_story_card_state": _tool_save_story_card_state,
+    "list_chapter_scenes": _tool_list_chapter_scenes, "save_chapter_scene": _tool_save_chapter_scene,
+    "analyze_chapter_production": _tool_analyze_chapter_production,
     "web_search": _tool_web_search,
 }
 
@@ -4942,7 +5397,7 @@ def _runtime_request_payload(uid, cid, history_text, selection, session_id=None,
 
 def _apply_story_update_proposals(uid, state_request):
     if not state_request:
-        return [], None
+        return [], None, [], None
     kwargs = {
         "base_url": state_request["base_url"],
         "api_key": state_request["api_key"],
@@ -4952,6 +5407,7 @@ def _apply_story_update_proposals(uid, state_request):
         _generate_character_state_proposals(uid, state_request["chapter_id"], **kwargs),
         _generate_plot_state_proposal(uid, state_request["chapter_id"], **kwargs),
         _generate_story_memory_proposals(uid, state_request["chapter_id"], **kwargs),
+        _generate_production_analysis(uid, state_request["chapter_id"]),
     )
 
 
@@ -5022,10 +5478,11 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     if not turn:
         if state_request:
             emit({"type": "status", "stage": "story_state", "message": "正在整理人物与剧情状态"})
-            character_proposals, plot_proposal, memory_proposals = _apply_story_update_proposals(uid, state_request)
+            character_proposals, plot_proposal, memory_proposals, production_analysis = _apply_story_update_proposals(uid, state_request)
             result["character_state_proposals"] = character_proposals
             result["plot_state_proposal"] = plot_proposal
             result["memory_proposals"] = memory_proposals
+            result["production_analysis"] = production_analysis
         return result
 
     pending = result.pop("_pending_conversation")
@@ -5061,10 +5518,11 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     result["conversation_summary"] = pending.get("summary") if retain_history else ""
     if state_request:
         emit({"type": "status", "stage": "story_state", "message": "正在整理人物与剧情状态"})
-        character_proposals, plot_proposal, memory_proposals = _apply_story_update_proposals(uid, state_request)
+        character_proposals, plot_proposal, memory_proposals, production_analysis = _apply_story_update_proposals(uid, state_request)
         result["character_state_proposals"] = character_proposals
         result["plot_state_proposal"] = plot_proposal
         result["memory_proposals"] = memory_proposals
+        result["production_analysis"] = production_analysis
     return result
 
 

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=character-tools-20260920">
+  <link rel="stylesheet" href="style.css?v=production-canvas-20260920b">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -70,6 +70,7 @@
         <span id="wc" class="wc">0 字</span>
         <span id="saveStat" class="save-stat"></span>
         <select id="modelQuickSwitch" class="model-switch model-switch-top" onchange="switchActiveModel(this.value)" aria-label="切换当前 AI 模型" title="切换当前 AI 模型"></select>
+        <button class="ic top-production" id="productionToggleBtn" data-ic="nodes" onclick="openProductionCanvas()" title="创作生产画布"></button>
         <button class="ic top-workbench" id="storyToggleBtn" data-ic="panel" onclick="toggleStoryDrawer()" title="写作工作台"></button>
         <button class="ic top-ai" id="aiToggleBtn" data-ic="bot" data-label="AI 助手" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
         <div class="menu-wrap">
@@ -97,6 +98,7 @@
             <button data-ic="archive" data-label="资料中心" onclick="openMaterialHub();closeMoreMenu()"></button>
             <button data-ic="bulb" data-label="灵感库" onclick="openInspirationLibrary();closeMoreMenu()"></button>
             <button data-ic="image" data-label="全书角色图库" onclick="openCharacterImageLibrary();closeMoreMenu()"></button>
+            <button data-ic="nodes" data-label="创作生产画布" onclick="openProductionCanvas();closeMoreMenu()"></button>
             <button data-ic="branch" data-label="情节沙盘" onclick="openOutlineSandbox();closeMoreMenu()"></button>
             <button data-ic="book" data-label="拆书引擎" onclick="openDisassembly();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI Skills" onclick="openSkills();closeMoreMenu()"></button>
@@ -151,6 +153,74 @@
         </div>
       </div>
     </main>
+
+    <section id="productionWorkspace" class="production-workspace" aria-label="创作生产画布">
+      <header class="production-head">
+        <button class="ic" data-ic="chevL" onclick="closeProductionCanvas()" title="返回正文编辑器"></button>
+        <div class="production-brand">
+          <span data-ic="nodes"></span>
+          <div><b>创作生产画布</b><small id="productionSubtitle">全书脉络与章节状态</small></div>
+        </div>
+        <div class="production-view-switch" role="group" aria-label="画布视图">
+          <button id="productionOverviewBtn" class="active" onclick="showProductionOverview()">全书</button>
+          <button id="productionChapterBtn" onclick="showProductionChapter()">本章</button>
+        </div>
+        <select id="productionChapterSelect" onchange="changeProductionChapter(this.value)" aria-label="选择画布章节"></select>
+        <span id="productionSaveStatus" class="production-save-status"></span>
+        <div class="production-head-actions">
+          <button class="production-edit-body" data-ic="pen" data-label="编辑正文" onclick="closeProductionCanvas()" title="编辑正文"></button>
+          <button class="ic" data-ic="archive" onclick="toggleProductionResources()" title="设定资源库"></button>
+          <button id="productionAnalyzeBtn" data-ic="sparkles" data-label="分析本章" onclick="analyzeProductionChapter()"></button>
+          <button class="ic" data-ic="bot" onclick="openProductionAI()" title="打开 AI 助手"></button>
+          <button class="ic" data-ic="settings" onclick="toggleProductionSettings()" title="画布设置"></button>
+          <button class="ic" data-ic="x" onclick="closeProductionCanvas()" title="关闭画布"></button>
+        </div>
+      </header>
+      <div id="productionSettingsBar" class="production-settings-bar hidden">
+        <label><input id="productionEvidenceEnabled" type="checkbox" onchange="saveProductionSettings()"> 保存 AI 分析证据</label>
+        <label><input id="productionAutoAnalyze" type="checkbox" onchange="saveProductionSettings()"> 离开未分析章节时提醒</label>
+        <button onclick="editProductionCustomFields()">自定义字段</button>
+        <span>正文仍自动保存；手动分析、AI 写作完成或章节复核后才整理画布，不会逐字调用模型。</span>
+      </div>
+      <div class="production-body">
+        <aside id="productionResources" class="production-resources">
+          <div class="production-pane-head">
+            <div><b>全书资源</b><small id="productionResourceCount">0 项</small></div>
+            <span>
+              <button class="ic" data-ic="plus" onclick="newProductionCard()" title="新建设定卡"></button>
+              <button class="ic" data-ic="x" onclick="toggleProductionResources(false)" title="收起资源库"></button>
+            </span>
+          </div>
+          <div id="productionResourceTabs" class="production-resource-tabs" role="tablist">
+            <button class="active" data-category="all" onclick="setProductionResourceCategory('all')">全部</button>
+            <button data-category="character" onclick="setProductionResourceCategory('character')">人物</button>
+            <button data-category="rule" onclick="setProductionResourceCategory('rule')">规则</button>
+            <button data-category="location" onclick="setProductionResourceCategory('location')">地点</button>
+            <button data-category="skill" onclick="setProductionResourceCategory('skill')">技能</button>
+            <button data-category="item" onclick="setProductionResourceCategory('item')">道具</button>
+            <button data-category="organization" onclick="setProductionResourceCategory('organization')">组织</button>
+          </div>
+          <label class="production-resource-search"><span data-ic="search"></span><input id="productionResourceSearch" placeholder="搜索设定…" oninput="renderProductionResources()"></label>
+          <div id="productionResourceList" class="production-resource-list"></div>
+        </aside>
+
+        <main class="production-stage-shell">
+          <div id="productionLoading" class="production-loading hidden"><span class="spinner"></span><span>正在读取画布</span></div>
+          <div id="productionOverview" class="production-overview"></div>
+          <div id="productionCanvasViewport" class="production-canvas-viewport hidden">
+            <div id="productionCanvas" class="production-canvas"></div>
+          </div>
+        </main>
+
+        <aside id="productionInspector" class="production-inspector" aria-label="画布对象详情">
+          <div class="production-pane-head">
+            <div><b id="productionInspectorTitle">详情</b><small id="productionInspectorMeta"></small></div>
+            <button class="ic" data-ic="x" onclick="closeProductionInspector()" title="关闭详情"></button>
+          </div>
+          <div id="productionInspectorBody" class="production-inspector-body"></div>
+        </aside>
+      </div>
+    </section>
 
     <div class="ai-backdrop" onclick="toggleAISide()"></div>
     <aside id="aiSide" class="ai-side">
@@ -968,6 +1038,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=character-tools-20260920"></script>
+  <script src="app.js?v=production-canvas-20260920b"></script>
 </body>
 </html>

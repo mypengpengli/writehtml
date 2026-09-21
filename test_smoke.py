@@ -113,12 +113,74 @@ ok(c.put(f"/api/works/{wid}/notes", json={"notes": "主角:小明"}, headers=H(t
 ok(c.get(f"/api/works/{wid}/notes", headers=H(tokA)).json()["notes"] == "主角:小明", "作品设定读回")
 ok(c.get(f"/api/works/{wid}/notes", headers=H(tokB)).status_code == 404, "bob 读 alice 作品设定 404")
 
+# 创作生产画布：全书卡片、章节状态、场景、设置和布局都持久化且隔离。
+production_overview = c.get(f"/api/works/{wid}/production", headers=H(tokA)).json()
+ok(production_overview["chapters"][0]["id"] == cid and production_overview["settings"]["evidence_enabled"]
+   and production_overview["settings"]["auto_analyze_on_leave"],
+   "生产画布概览默认启用证据和离章提醒")
+production_settings = c.put(
+    f"/api/works/{wid}/production/settings",
+    json={"evidence_enabled": False, "auto_analyze_on_leave": True,
+          "custom_fields": [{"name": "战力", "type": "level", "options": ["低", "中", "高"]}]},
+    headers=H(tokA),
+).json()
+ok(not production_settings["evidence_enabled"] and production_settings["auto_analyze_on_leave"]
+   and production_settings["custom_fields"][0]["name"] == "战力", "生产画布偏好与自定义字段可保存")
+production_card = c.post(
+    f"/api/works/{wid}/production/cards",
+    json={"category": "rule", "name": "灵力守恒", "summary": "力量必须有代价",
+          "truth": {"objective": "规则真实存在", "secrecy": "第三章前不可揭示代价来源"}},
+    headers=H(tokA),
+).json()
+ok(production_card["category"] == "rule" and production_card["truth"]["objective"] == "规则真实存在",
+   "生产画布正式设定卡可创建")
+production_version = c.post(
+    f"/api/production/cards/{production_card['id']}/versions",
+    json={"chapter_id": cid, "state": {"status": "首次显现"}, "change_summary": "规则生效"},
+    headers=H(tokA),
+).json()
+ok(production_version["state"]["status"] == "首次显现", "设定卡章节状态版本可保存")
+production_scene = c.post(
+    f"/api/chapters/{cid}/production/scenes",
+    json={"title": "开场", "summary": "建立人物与冲突", "goal": "提出问题",
+          "refs": {"card_ids": [production_card["id"]]}}, headers=H(tokA),
+).json()
+ok(production_scene["ord"] == 1 and production_scene["refs"]["card_ids"] == [production_card["id"]],
+   "章节场景节点及引用可保存")
+production_layout = c.put(
+    f"/api/works/{wid}/production/layout",
+    json={"chapter_id": cid, "layout": {"before": {"x": 80, "y": 100}}}, headers=H(tokA),
+).json()
+ok(production_layout["layout"]["before"]["x"] == 80, "生产画布节点布局可持久化")
+production_chapter = c.get(f"/api/chapters/{cid}/production", headers=H(tokA)).json()
+ok(production_chapter["scenes"][0]["title"] == "开场"
+   and production_chapter["after"]["cards"][0]["current_state"]["state"]["status"] == "首次显现",
+   "章节画布返回章前/章后状态和场景")
+ok(c.get(f"/api/works/{wid}/production", headers=H(tokB)).status_code == 404,
+   "生产画布按用户隔离")
+
 # 转写（追加正文）
 r = c.post("/api/process", json={"mode": "转写", "text": "你好世界", "chapter_id": cid}, headers=H(tokA))
 ok(r.json()["result"] == "你好世界", "转写结果=原文")
 chap = c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()
 ok(chap["content"] == "你好世界", "正文已追加")
 ok(len(chap["segments"]) == 1, "段落历史 1 条")
+production_after_edit = c.get(f"/api/chapters/{cid}/production", headers=H(tokA)).json()
+ok(production_after_edit["after"]["cards"][0]["current_state"]["state"]["status"] == "首次显现",
+   "作者手工保存的画布状态不随正文编辑失效")
+
+_uidA_early = db.verify_user("alice", "pw1234")["id"]
+production_proposal = db.upsert_production_proposal(wid, _uidA_early, cid, {
+    "proposal_type": "new_card", "category": "item", "name": "青铜令牌", "severity": "major",
+    "change_summary": "正文首次出现青铜令牌",
+    "after": {"name": "青铜令牌", "summary": "可进入内城的凭证", "attributes": {"owner": "小明"}},
+})
+proposal_accept = c.post(
+    f"/api/production/proposals/{production_proposal['id']}/accept", headers=H(tokA),
+).json()
+accepted_card = db.get_production_card(proposal_accept["result"]["card_id"], _uidA_early)
+ok(proposal_accept["status"] == "accepted" and accepted_card["name"] == "青铜令牌"
+   and accepted_card["attributes"]["owner"] == "小明", "重大新设定经确认后写入正式卡片")
 
 # 每用户大模型设置
 c.post("/api/settings", json={
@@ -925,6 +987,9 @@ def _make_agent(stub):
 # Agent 必须能直接读写正式人物卡，不能拿故事记忆冒充人物档案。
 _agent_tool_names = {item["function"]["name"] for item in main.AGENT_TOOLS}
 ok({"list_characters", "save_character_card"}.issubset(_agent_tool_names), "Agent 暴露人物卡读写工具")
+ok({"list_story_cards", "save_story_card", "save_story_card_state", "list_chapter_scenes",
+    "save_chapter_scene", "analyze_chapter_production"}.issubset(_agent_tool_names),
+   "Agent 暴露生产画布读写与分析工具")
 _character_tool_prompt = main._agent_system(uidA, cid, "按正文自动建立人物卡")["content"]
 ok("save_character_card" in _character_tool_prompt and "不能用故事记忆替代" in _character_tool_prompt,
    "Agent 明确使用正式人物卡工具而非故事记忆")
@@ -951,6 +1016,31 @@ ok(_created_character.get("entity", {}).get("name") == "周远"
    and sum(item["name"] == "周远" for item in _all_characters) == 1
    and next(item for item in _all_characters if item["name"] == "周远")["summary"] == "调查组新人，负责资料核验",
    "Agent 可创建人物卡且同名调用执行更新而非重复建卡")
+
+_listed_story_cards = _call_agent_tool("list_story_cards", {"chapter_id": cid})
+ok(any(item["id"] == production_card["id"] for item in _listed_story_cards["cards"]),
+   "Agent 可读取当前章节时点的生产设定卡")
+_agent_story_card = _call_agent_tool("save_story_card", {
+    "category": "item", "name": "旧钥匙", "summary": "只能开启旧码头仓库",
+    "truth": {"objective": "钥匙真实有效", "secrecy": "使用前不解释来源"},
+})
+_agent_story_state = _call_agent_tool("save_story_card_state", {
+    "card_id": _agent_story_card["card"]["id"], "chapter_id": cid,
+    "state": {"holder": "林晚", "condition": "完好"}, "change_summary": "林晚取得钥匙",
+    "evidence": "林晚攥紧那把旧钥匙。",
+})
+ok(_agent_story_card.get("production_dirty") and _agent_story_state.get("production_dirty")
+   and _agent_story_state["version"]["state"]["holder"] == "林晚",
+   "Agent 可创建生产设定卡并记录逐章状态")
+_listed_scenes = _call_agent_tool("list_chapter_scenes", {"chapter_id": cid})
+_agent_scene = _call_agent_tool("save_chapter_scene", {
+    "chapter_id": cid, "title": "仓库门前", "summary": "林晚尝试旧钥匙",
+    "goal": "确认钥匙用途", "conflict": "门后有人", "outcome": "暂缓开门",
+    "refs": {"card_ids": [_agent_story_card["card"]["id"]]},
+})
+ok(any(item["id"] == production_scene["id"] for item in _listed_scenes["scenes"])
+   and _agent_scene.get("production_dirty") and _agent_scene["scene"]["title"] == "仓库门前",
+   "Agent 可读取并创建章节场景")
 
 def _stream_events(response):
     return [json.loads(line) for line in response.text.splitlines() if line.strip()]

@@ -15,6 +15,7 @@ TASK_LABELS = {
     "extract_memory": "故事记忆提取",
     "extract_character_state": "人物状态提取",
     "extract_plot_state": "剧情状态提取",
+    "analyze_production": "生产画布分析",
     "answer_story_question": "故事问答",
 }
 
@@ -118,6 +119,7 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
 
     instruction = (instruction or "").strip()
     selected_text = ""
+    canvas_target = isinstance(selection, dict) and selection.get("context_kind") == "canvas_target"
     if isinstance(selection, dict) and isinstance(selection.get("text"), str):
         selected_text = _clip(selection["text"], 8000)
     chapter_content = (chapter or {}).get("content") or ""
@@ -127,11 +129,13 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
 
     if instruction:
         items.append(_item("instruction", "作者本轮指令", instruction, "本轮明确请求", 0))
+    if canvas_target and selected_text:
+        items.append(_item("canvas_target", "本轮画布目标", selected_text, "作者在生产画布中选中的临时对象", 0))
     if chapter:
         items.append(_item(
             "chapter", f"当前章节：第{chapter.get('ord') or '?'}章《{chapter.get('title') or '未命名'}》",
-            selected_text if selected_text else chapter_tail,
-            "用户选区" if selected_text else "当前章节的最近正文",
+            selected_text if selected_text and not canvas_target else chapter_tail,
+            "用户选区" if selected_text and not canvas_target else "当前章节的最近正文",
             0,
         ))
         if chapter.get("notes"):
@@ -140,6 +144,13 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
     work_notes = db.get_work_notes(work_id, user_id) or ""
     if work_notes:
         items.append(_item("work_bible", "作品设定", _clip(work_notes, 9000), "全局创作约束", 1))
+
+    production_digest = db.production_context_digest(work_id, user_id, chapter_id)
+    if production_digest:
+        items.append(_item(
+            "production_bible", "生产画布设定", _clip(production_digest, 14000),
+            "当前章节时点生效的规则、地点、技能、道具与保密边界", 1,
+        ))
 
     entities = db.list_character_cards(work_id, user_id, chapter_id) or []
     active_entities = _mentioned_entities(entities, mentions_text)

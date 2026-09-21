@@ -54,6 +54,13 @@ STORY_MEMORY_TYPE_LABELS = {
     "location_change": "地点变化", "ability_change": "能力变化",
     "world_rule": "世界规则", "promise": "承诺/任务", "secret": "重要秘密",
 }
+PRODUCTION_CARD_CATEGORIES = ("rule", "location", "skill", "item", "organization")
+PRODUCTION_CARD_CATEGORY_LABELS = {
+    "rule": "规则", "location": "地点", "skill": "技能",
+    "item": "道具", "organization": "组织",
+}
+PRODUCTION_SCOPE_TYPES = ("global", "chapter_range", "scene")
+PRODUCTION_PROPOSAL_TYPES = ("new_card", "card_update", "card_state", "scene")
 MAX_LLM_MODELS = 20
 MAX_LLM_MODEL_ID_LENGTH = 160
 MAX_TAVILY_API_KEYS = 20
@@ -762,6 +769,141 @@ def _migration_character_image_library(conn):
     )
 
 
+def _migration_production_canvas(conn):
+    """Chapter-aware production canvas: canonical cards, scenes and source-backed changes."""
+    _add_col(conn, "chapters", "production_analysis_status", "TEXT DEFAULT 'unreviewed'")
+    _add_col(conn, "chapters", "production_analysis_hash", "TEXT DEFAULT ''")
+    _add_col(conn, "chapters", "production_analyzed_at", "REAL")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS production_work_settings (
+            work_id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            evidence_enabled INTEGER NOT NULL DEFAULT 1,
+            auto_analyze_on_leave INTEGER NOT NULL DEFAULT 1,
+            custom_fields_json TEXT NOT NULL DEFAULT '[]',
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE TABLE IF NOT EXISTS production_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            name TEXT NOT NULL,
+            summary TEXT DEFAULT '',
+            detail TEXT DEFAULT '',
+            attributes_json TEXT NOT NULL DEFAULT '{}',
+            truth_json TEXT NOT NULL DEFAULT '{}',
+            reader_state TEXT DEFAULT '',
+            scope_type TEXT NOT NULL DEFAULT 'global',
+            scope_start_chapter_id INTEGER,
+            scope_end_chapter_id INTEGER,
+            scope_scene_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'confirmed',
+            source_chapter_id INTEGER,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE TABLE IF NOT EXISTS production_card_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id INTEGER NOT NULL,
+            chapter_id INTEGER NOT NULL,
+            state_json TEXT NOT NULL DEFAULT '{}',
+            change_summary TEXT DEFAULT '',
+            evidence TEXT DEFAULT '',
+            evidence_start INTEGER,
+            evidence_end INTEGER,
+            source_content_hash TEXT DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            stale INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            FOREIGN KEY(card_id) REFERENCES production_cards(id),
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+        );
+        CREATE TABLE IF NOT EXISTS production_scenes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chapter_id INTEGER NOT NULL,
+            ord INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT DEFAULT '',
+            time_label TEXT DEFAULT '',
+            location_card_id INTEGER,
+            goal TEXT DEFAULT '',
+            conflict TEXT DEFAULT '',
+            outcome TEXT DEFAULT '',
+            refs_json TEXT NOT NULL DEFAULT '{}',
+            evidence TEXT DEFAULT '',
+            evidence_start INTEGER,
+            evidence_end INTEGER,
+            source_content_hash TEXT DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            stale INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+        );
+        CREATE TABLE IF NOT EXISTS production_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_id INTEGER NOT NULL,
+            chapter_id INTEGER NOT NULL,
+            scene_id INTEGER,
+            proposal_type TEXT NOT NULL,
+            target_id INTEGER,
+            category TEXT DEFAULT '',
+            name TEXT DEFAULT '',
+            severity TEXT NOT NULL DEFAULT 'major',
+            before_json TEXT NOT NULL DEFAULT '{}',
+            after_json TEXT NOT NULL DEFAULT '{}',
+            change_summary TEXT DEFAULT '',
+            evidence TEXT DEFAULT '',
+            evidence_start INTEGER,
+            evidence_end INTEGER,
+            confidence REAL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            source_content_hash TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            resolved_at REAL,
+            FOREIGN KEY(work_id) REFERENCES works(id),
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+        );
+        CREATE TABLE IF NOT EXISTS production_canvas_layouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_id INTEGER NOT NULL,
+            chapter_id INTEGER,
+            scope_key TEXT NOT NULL,
+            data_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(work_id, scope_key),
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE TABLE IF NOT EXISTS production_impact_flags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_id INTEGER NOT NULL,
+            source_chapter_id INTEGER NOT NULL,
+            affected_chapter_id INTEGER NOT NULL,
+            summary TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at REAL NOT NULL,
+            resolved_at REAL,
+            FOREIGN KEY(work_id) REFERENCES works(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_production_cards_work
+            ON production_cards(work_id, status, category, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_production_versions_card_chapter
+            ON production_card_versions(card_id, chapter_id, id);
+        CREATE INDEX IF NOT EXISTS idx_production_scenes_chapter
+            ON production_scenes(chapter_id, ord, id);
+        CREATE INDEX IF NOT EXISTS idx_production_proposals_chapter
+            ON production_proposals(chapter_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_production_impacts_chapter
+            ON production_impact_flags(affected_chapter_id, status, id);
+        """
+    )
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
@@ -774,6 +916,7 @@ _MIGRATIONS = (
     (9, "book_disassembly", _migration_book_disassembly),
     (10, "unified_reference_materials", _migration_unified_materials),
     (11, "character_image_library", _migration_character_image_library),
+    (12, "production_canvas", _migration_production_canvas),
 )
 
 
@@ -1611,6 +1754,13 @@ def admin_delete_user(user_id):
         conn.execute("DELETE FROM plot_state_proposals WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entity_relations WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM story_sandboxes WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM production_proposals WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM production_scenes WHERE chapter_id IN (SELECT c.id FROM chapters c JOIN works w ON w.id=c.work_id WHERE w.user_id=?)", (user_id,))
+        conn.execute("DELETE FROM production_card_versions WHERE card_id IN (SELECT p.id FROM production_cards p JOIN works w ON w.id=p.work_id WHERE w.user_id=?)", (user_id,))
+        conn.execute("DELETE FROM production_cards WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM production_canvas_layouts WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM production_impact_flags WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM production_work_settings WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM disassembly_material_extractions WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM book_disassembly_chapters WHERE job_id IN (SELECT id FROM book_disassembly_jobs WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM book_disassembly_jobs WHERE user_id=?", (user_id,))
@@ -1859,6 +2009,13 @@ def delete_work(wid, user_id):
         conn.execute("DELETE FROM plot_state_proposals WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entity_relations WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM story_sandboxes WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM production_proposals WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM production_scenes WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id=?)", (wid,))
+        conn.execute("DELETE FROM production_card_versions WHERE card_id IN (SELECT id FROM production_cards WHERE work_id=?)", (wid,))
+        conn.execute("DELETE FROM production_cards WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM production_canvas_layouts WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM production_impact_flags WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM production_work_settings WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM disassembly_material_extractions WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM book_disassembly_chapters WHERE job_id IN (SELECT id FROM book_disassembly_jobs WHERE target_work_id=?)", (wid,))
         conn.execute("DELETE FROM book_disassembly_jobs WHERE target_work_id=?", (wid,))
@@ -3480,7 +3637,8 @@ def create_character_state_version(eid, user_id, chapter_id, state, change_summa
             "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,"
             "source_content_hash,stale,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (eid, chapter_id, json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1000],
-             (evidence or "").strip()[:3000], source, proposal_id, "", 0, now),
+             (evidence or "").strip()[:3000], source, proposal_id,
+             chapter_source["content_hash"] if source == "ai" else "", 0, now),
         )
         row = conn.execute(
             "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
@@ -3750,6 +3908,842 @@ def get_relationship_digest(wid, user_id):
     return "人物关系（写作时保持连续）：\n" + "\n".join(lines)
 
 
+# ---------- 创作生产画布（全书设定 + 章节场景 + 时点状态）----------
+
+def _production_json_object(value):
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value or "{}")
+    except Exception:
+        parsed = {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _production_json_list(value):
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value or "[]")
+    except Exception:
+        parsed = []
+    return parsed if isinstance(parsed, list) else []
+
+
+def get_production_settings(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        row = conn.execute(
+            "SELECT evidence_enabled,auto_analyze_on_leave,custom_fields_json,updated_at "
+            "FROM production_work_settings WHERE work_id=?", (wid,),
+        ).fetchone()
+        if not row:
+            return {"evidence_enabled": True, "auto_analyze_on_leave": True,
+                    "custom_fields": [], "updated_at": None}
+        item = dict(row)
+        item["evidence_enabled"] = bool(item["evidence_enabled"])
+        item["auto_analyze_on_leave"] = bool(item["auto_analyze_on_leave"])
+        item["custom_fields"] = _production_json_list(item.pop("custom_fields_json", "[]"))
+        return item
+
+
+def save_production_settings(wid, user_id, values):
+    values = values if isinstance(values, dict) else {}
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        old = conn.execute(
+            "SELECT evidence_enabled,auto_analyze_on_leave,custom_fields_json "
+            "FROM production_work_settings WHERE work_id=?", (wid,),
+        ).fetchone()
+        evidence_enabled = int(bool(values.get(
+            "evidence_enabled", old["evidence_enabled"] if old else True
+        )))
+        auto_analyze = int(bool(values.get(
+            "auto_analyze_on_leave", old["auto_analyze_on_leave"] if old else True
+        )))
+        custom_fields = values.get(
+            "custom_fields", _production_json_list(old["custom_fields_json"]) if old else []
+        )
+        if not isinstance(custom_fields, list):
+            return {"invalid_fields": True}
+        clean_fields = []
+        for field in custom_fields[:40]:
+            if not isinstance(field, dict):
+                continue
+            name = str(field.get("name") or "").strip()[:80]
+            type_ = str(field.get("type") or "text").strip()
+            if not name or type_ not in {"text", "number", "level", "enum", "boolean", "hidden"}:
+                continue
+            clean_fields.append({
+                "id": str(field.get("id") or hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]),
+                "name": name, "type": type_,
+                "options": [str(item).strip()[:80] for item in field.get("options", [])[:30]
+                            if str(item).strip()] if isinstance(field.get("options"), list) else [],
+            })
+        conn.execute(
+            "INSERT INTO production_work_settings(work_id,user_id,evidence_enabled,auto_analyze_on_leave,"
+            "custom_fields_json,updated_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(work_id) DO UPDATE SET evidence_enabled=excluded.evidence_enabled,"
+            "auto_analyze_on_leave=excluded.auto_analyze_on_leave,custom_fields_json=excluded.custom_fields_json,"
+            "updated_at=excluded.updated_at",
+            (wid, user_id, evidence_enabled, auto_analyze,
+             json.dumps(clean_fields, ensure_ascii=False), now),
+        )
+    return get_production_settings(wid, user_id)
+
+
+def _production_card_state_at(conn, card_id, target_chapter_id, before=False):
+    if target_chapter_id is None:
+        return None
+    op = "<" if before else "<="
+    row = conn.execute(
+        "SELECT v.id,v.card_id,v.chapter_id,v.state_json,v.change_summary,v.evidence,"
+        "v.evidence_start,v.evidence_end,v.source_content_hash,v.source,v.stale,v.created_at,"
+        "c.title AS chapter_title,c.ord AS chapter_ord "
+        "FROM production_card_versions v JOIN chapters c ON c.id=v.chapter_id "
+        "JOIN chapters target ON target.id=? "
+        f"WHERE v.card_id=? AND c.work_id=target.work_id AND c.deleted_at IS NULL "
+        f"AND c.ord {op} target.ord AND v.stale=0 "
+        "AND (v.source_content_hash='' OR v.source_content_hash=c.content_hash) "
+        "ORDER BY c.ord DESC,v.id DESC LIMIT 1",
+        (target_chapter_id, card_id),
+    ).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["state"] = _production_json_object(item.pop("state_json", "{}"))
+    item["is_stale"] = bool(item.pop("stale", 0))
+    return item
+
+
+def _production_card_payload(conn, row, target_chapter_id=None, before=False):
+    if not row:
+        return None
+    item = dict(row)
+    item["attributes"] = _production_json_object(item.pop("attributes_json", "{}"))
+    item["truth"] = _production_json_object(item.pop("truth_json", "{}"))
+    item["category_label"] = PRODUCTION_CARD_CATEGORY_LABELS.get(item.get("category"), item.get("category"))
+    item["current_state"] = _production_card_state_at(conn, item["id"], target_chapter_id, before)
+    return item
+
+
+def list_production_cards(wid, user_id, at_chapter_id=None, before=False, include_pending=True):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if at_chapter_id is not None and not _chapter_for_work(conn, at_chapter_id, wid):
+            return None
+        where = "work_id=? AND status<>'archived'"
+        params = [wid]
+        if not include_pending:
+            where += " AND status='confirmed'"
+        rows = conn.execute(
+            "SELECT * FROM production_cards WHERE " + where + " ORDER BY category,name,id", params
+        ).fetchall()
+        return [_production_card_payload(conn, row, at_chapter_id, before) for row in rows]
+
+
+def get_production_card(card_id, user_id, at_chapter_id=None):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT p.* FROM production_cards p JOIN works w ON w.id=p.work_id "
+            "WHERE p.id=? AND w.user_id=?", (card_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        if at_chapter_id is not None and not _chapter_for_work(conn, at_chapter_id, row["work_id"]):
+            return None
+        item = _production_card_payload(conn, row, at_chapter_id)
+        versions = conn.execute(
+            "SELECT v.*,c.title AS chapter_title,c.ord AS chapter_ord FROM production_card_versions v "
+            "JOIN chapters c ON c.id=v.chapter_id WHERE v.card_id=? ORDER BY c.ord DESC,v.id DESC",
+            (card_id,),
+        ).fetchall()
+        item["versions"] = []
+        for version in versions:
+            value = dict(version)
+            value["state"] = _production_json_object(value.pop("state_json", "{}"))
+            value["is_stale"] = bool(value.pop("stale", 0)) or bool(
+                value.get("source_content_hash") and value["source_content_hash"] != conn.execute(
+                    "SELECT content_hash FROM chapters WHERE id=?", (value["chapter_id"],)
+                ).fetchone()[0]
+            )
+            item["versions"].append(value)
+        return item
+
+
+def save_production_card(wid, user_id, values, card_id=None):
+    values = values if isinstance(values, dict) else {}
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        old = None
+        if card_id is not None:
+            old = conn.execute("SELECT * FROM production_cards WHERE id=? AND work_id=?", (card_id, wid)).fetchone()
+            if not old:
+                return None
+        category = str(values.get("category", old["category"] if old else "rule") or "rule").strip()
+        if category not in PRODUCTION_CARD_CATEGORIES:
+            return {"invalid_category": True}
+        name = str(values.get("name", old["name"] if old else "") or "").strip()[:160]
+        if not name:
+            return {"invalid_name": True}
+        scope_type = str(values.get("scope_type", old["scope_type"] if old else "global") or "global")
+        if scope_type not in PRODUCTION_SCOPE_TYPES:
+            return {"invalid_scope": True}
+        def chosen(key, default=""):
+            return values[key] if key in values else (old[key] if old else default)
+        attrs = chosen("attributes", _production_json_object(old["attributes_json"]) if old else {})
+        truth = chosen("truth", _production_json_object(old["truth_json"]) if old else {})
+        if not isinstance(attrs, dict) or not isinstance(truth, dict):
+            return {"invalid_json": True}
+        start_id = chosen("scope_start_chapter_id", None)
+        end_id = chosen("scope_end_chapter_id", None)
+        source_id = chosen("source_chapter_id", None)
+        for chapter_id in (start_id, end_id, source_id):
+            if chapter_id is not None and not _chapter_for_work(conn, chapter_id, wid):
+                return {"invalid_chapter": True}
+        status = str(chosen("status", "confirmed") or "confirmed")
+        if status not in {"confirmed", "pending", "archived"}:
+            status = "confirmed"
+        payload = (
+            category, name, str(chosen("summary", "") or "")[:4000],
+            str(chosen("detail", "") or "")[:16000], json.dumps(attrs, ensure_ascii=False),
+            json.dumps(truth, ensure_ascii=False), str(chosen("reader_state", "") or "")[:6000],
+            scope_type, start_id, end_id, chosen("scope_scene_id", None), status, source_id, now,
+        )
+        if old:
+            conn.execute(
+                "UPDATE production_cards SET category=?,name=?,summary=?,detail=?,attributes_json=?,truth_json=?,"
+                "reader_state=?,scope_type=?,scope_start_chapter_id=?,scope_end_chapter_id=?,scope_scene_id=?,"
+                "status=?,source_chapter_id=?,updated_at=? WHERE id=?",
+                (*payload, card_id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO production_cards(work_id,category,name,summary,detail,attributes_json,truth_json,"
+                "reader_state,scope_type,scope_start_chapter_id,scope_end_chapter_id,scope_scene_id,status,"
+                "source_chapter_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (wid, *payload[:-1], now, now),
+            )
+            card_id = cur.lastrowid
+        row = conn.execute("SELECT * FROM production_cards WHERE id=?", (card_id,)).fetchone()
+        return _production_card_payload(conn, row)
+
+
+def archive_production_card(card_id, user_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT p.id FROM production_cards p JOIN works w ON w.id=p.work_id WHERE p.id=? AND w.user_id=?",
+            (card_id, user_id),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE production_cards SET status='archived',updated_at=? WHERE id=?", (time.time(), card_id))
+        return True
+
+
+def create_production_card_version(card_id, user_id, chapter_id, state, change_summary="", evidence="",
+                                   evidence_start=None, evidence_end=None, source="manual"):
+    state = state if isinstance(state, dict) else {}
+    now = time.time()
+    with get_conn() as conn:
+        card = conn.execute(
+            "SELECT p.id,p.work_id FROM production_cards p JOIN works w ON w.id=p.work_id "
+            "WHERE p.id=? AND w.user_id=?", (card_id, user_id),
+        ).fetchone()
+        if not card:
+            return None
+        chapter = conn.execute(
+            "SELECT id,work_id,title,ord,content,content_hash FROM chapters "
+            "WHERE id=? AND work_id=? AND deleted_at IS NULL",
+            (chapter_id, card["work_id"]),
+        ).fetchone()
+        if not chapter:
+            return {"invalid_chapter": True}
+        if not state and not str(change_summary or "").strip():
+            return {"empty_state": True}
+        source_hash = (
+            chapter["content_hash"] or _content_fingerprint(chapter["content"] or "")
+            if source == "ai" else ""
+        )
+        cur = conn.execute(
+            "INSERT INTO production_card_versions(card_id,chapter_id,state_json,change_summary,evidence,"
+            "evidence_start,evidence_end,source_content_hash,source,stale,created_at) VALUES(?,?,?,?,?,?,?,?,?,0,?)",
+            (card_id, chapter_id, json.dumps(state, ensure_ascii=False), str(change_summary or "")[:4000],
+             str(evidence or "")[:4000], evidence_start, evidence_end,
+             source_hash, source, now),
+        )
+        row = conn.execute(
+            "SELECT v.*,c.title AS chapter_title,c.ord AS chapter_ord FROM production_card_versions v "
+            "JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?", (cur.lastrowid,),
+        ).fetchone()
+        result = dict(row)
+        result["state"] = _production_json_object(result.pop("state_json", "{}"))
+        result["is_stale"] = False
+        return result
+
+
+def _production_scene_payload(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["refs"] = _production_json_object(item.pop("refs_json", "{}"))
+    item["is_stale"] = bool(item.pop("stale", 0)) or bool(
+        item.get("source_content_hash") and item.get("chapter_content_hash")
+        and item["source_content_hash"] != item["chapter_content_hash"]
+    )
+    item.pop("chapter_content_hash", None)
+    return item
+
+
+def list_production_scenes(chapter_id, user_id):
+    with get_conn() as conn:
+        if not _chapter_owned(conn, chapter_id, user_id):
+            return None
+        rows = conn.execute(
+            "SELECT s.*,c.content_hash AS chapter_content_hash,p.name AS location_name "
+            "FROM production_scenes s JOIN chapters c ON c.id=s.chapter_id "
+            "LEFT JOIN production_cards p ON p.id=s.location_card_id "
+            "WHERE s.chapter_id=? ORDER BY s.ord,s.id", (chapter_id,),
+        ).fetchall()
+        return [_production_scene_payload(row) for row in rows]
+
+
+def save_production_scene(chapter_id, user_id, values, scene_id=None):
+    values = values if isinstance(values, dict) else {}
+    now = time.time()
+    with get_conn() as conn:
+        chapter = conn.execute(
+            "SELECT c.id,c.work_id,c.content,c.content_hash FROM chapters c JOIN works w ON w.id=c.work_id "
+            "WHERE c.id=? AND w.user_id=? AND c.deleted_at IS NULL", (chapter_id, user_id),
+        ).fetchone()
+        if not chapter:
+            return None
+        old = None
+        if scene_id is not None:
+            old = conn.execute("SELECT * FROM production_scenes WHERE id=? AND chapter_id=?", (scene_id, chapter_id)).fetchone()
+            if not old:
+                return None
+        def chosen(key, default=""):
+            return values[key] if key in values else (old[key] if old else default)
+        title = str(chosen("title", "新场景") or "新场景").strip()[:160]
+        refs = chosen("refs", _production_json_object(old["refs_json"]) if old else {})
+        if not isinstance(refs, dict):
+            return {"invalid_refs": True}
+        location_id = chosen("location_card_id", None)
+        if location_id is not None:
+            location = conn.execute(
+                "SELECT id FROM production_cards WHERE id=? AND work_id=? AND category='location' AND status<>'archived'",
+                (location_id, chapter["work_id"]),
+            ).fetchone()
+            if not location:
+                return {"invalid_location": True}
+        if old:
+            default_ord = old["ord"]
+        else:
+            default_ord = conn.execute(
+                "SELECT COALESCE(MAX(ord),0)+1 FROM production_scenes WHERE chapter_id=?", (chapter_id,)
+            ).fetchone()[0]
+        try:
+            ord_ = max(1, int(chosen("ord", default_ord)))
+        except Exception:
+            ord_ = default_ord
+        source = str(chosen("source", "manual") or "manual")[:40]
+        source_hash = str(chosen("source_content_hash", "") or "")
+        if source == "ai" and not source_hash:
+            source_hash = chapter["content_hash"] or _content_fingerprint(chapter["content"] or "")
+        payload = (
+            ord_, title, str(chosen("summary", "") or "")[:6000],
+            str(chosen("time_label", "") or "")[:500], location_id,
+            str(chosen("goal", "") or "")[:4000], str(chosen("conflict", "") or "")[:4000],
+            str(chosen("outcome", "") or "")[:4000], json.dumps(refs, ensure_ascii=False),
+            str(chosen("evidence", "") or "")[:4000], chosen("evidence_start", None),
+            chosen("evidence_end", None), source_hash, source, now,
+        )
+        if old:
+            conn.execute(
+                "UPDATE production_scenes SET ord=?,title=?,summary=?,time_label=?,location_card_id=?,goal=?,"
+                "conflict=?,outcome=?,refs_json=?,evidence=?,evidence_start=?,evidence_end=?,source_content_hash=?,"
+                "source=?,stale=0,updated_at=? WHERE id=?", (*payload, scene_id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO production_scenes(chapter_id,ord,title,summary,time_label,location_card_id,goal,conflict,"
+                "outcome,refs_json,evidence,evidence_start,evidence_end,source_content_hash,source,stale,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+                (chapter_id, *payload[:-1], now, now),
+            )
+            scene_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT s.*,c.content_hash AS chapter_content_hash,p.name AS location_name FROM production_scenes s "
+            "JOIN chapters c ON c.id=s.chapter_id LEFT JOIN production_cards p ON p.id=s.location_card_id "
+            "WHERE s.id=?", (scene_id,),
+        ).fetchone()
+        return _production_scene_payload(row)
+
+
+def delete_production_scene(scene_id, user_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT s.id FROM production_scenes s JOIN chapters c ON c.id=s.chapter_id "
+            "JOIN works w ON w.id=c.work_id WHERE s.id=? AND w.user_id=?", (scene_id, user_id),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM production_proposals WHERE scene_id=?", (scene_id,))
+        conn.execute("DELETE FROM production_scenes WHERE id=?", (scene_id,))
+        return True
+
+
+def get_production_layout(wid, user_id, chapter_id=None):
+    scope_key = f"chapter:{chapter_id}" if chapter_id is not None else "overview"
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if chapter_id is not None and not _chapter_for_work(conn, chapter_id, wid):
+            return None
+        row = conn.execute(
+            "SELECT data_json,updated_at FROM production_canvas_layouts WHERE work_id=? AND scope_key=?",
+            (wid, scope_key),
+        ).fetchone()
+        return {"scope_key": scope_key, "layout": _production_json_object(row["data_json"]) if row else {},
+                "updated_at": row["updated_at"] if row else None}
+
+
+def save_production_layout(wid, user_id, chapter_id, layout):
+    if not isinstance(layout, dict):
+        return {"invalid_layout": True}
+    scope_key = f"chapter:{chapter_id}" if chapter_id is not None else "overview"
+    now = time.time()
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        if chapter_id is not None and not _chapter_for_work(conn, chapter_id, wid):
+            return {"invalid_chapter": True}
+        conn.execute(
+            "INSERT INTO production_canvas_layouts(work_id,chapter_id,scope_key,data_json,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(work_id,scope_key) DO UPDATE SET chapter_id=excluded.chapter_id,"
+            "data_json=excluded.data_json,updated_at=excluded.updated_at",
+            (wid, chapter_id, scope_key, json.dumps(layout, ensure_ascii=False), now, now),
+        )
+        return {"scope_key": scope_key, "layout": layout, "updated_at": now}
+
+
+def _production_proposal_payload(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["before"] = _production_json_object(item.pop("before_json", "{}"))
+    item["after"] = _production_json_object(item.pop("after_json", "{}"))
+    item["is_stale"] = bool(
+        item.get("source_content_hash") and item.get("chapter_content_hash")
+        and item["source_content_hash"] != item["chapter_content_hash"]
+    )
+    item.pop("chapter_content_hash", None)
+    return item
+
+
+def list_production_proposals(chapter_id, user_id, status=None):
+    with get_conn() as conn:
+        if not _chapter_owned(conn, chapter_id, user_id):
+            return None
+        params = [chapter_id]
+        where = "p.chapter_id=?"
+        if status:
+            where += " AND p.status=?"
+            params.append(status)
+        rows = conn.execute(
+            "SELECT p.*,c.content_hash AS chapter_content_hash FROM production_proposals p "
+            "JOIN chapters c ON c.id=p.chapter_id WHERE " + where + " ORDER BY p.id DESC", params,
+        ).fetchall()
+        return [_production_proposal_payload(row) for row in rows]
+
+
+def upsert_production_proposal(wid, user_id, chapter_id, item):
+    item = item if isinstance(item, dict) else {}
+    now = time.time()
+    proposal_type = str(item.get("proposal_type") or "").strip()
+    if proposal_type not in PRODUCTION_PROPOSAL_TYPES:
+        return {"invalid_type": True}
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        chapter = conn.execute(
+            "SELECT id,content,content_hash FROM chapters WHERE id=? AND work_id=? AND deleted_at IS NULL",
+            (chapter_id, wid),
+        ).fetchone()
+        if not chapter:
+            return {"invalid_chapter": True}
+        category = str(item.get("category") or "").strip()
+        if proposal_type in {"new_card", "card_update", "card_state"} and category not in PRODUCTION_CARD_CATEGORIES:
+            return {"invalid_category": True}
+        target_id = item.get("target_id") if isinstance(item.get("target_id"), int) else None
+        if target_id is not None:
+            target = conn.execute("SELECT id FROM production_cards WHERE id=? AND work_id=?", (target_id, wid)).fetchone()
+            if not target:
+                return {"invalid_target": True}
+        name = str(item.get("name") or "").strip()[:160]
+        summary = str(item.get("change_summary") or "").strip()[:4000]
+        evidence = str(item.get("evidence") or "").strip()[:4000]
+        if not summary and not name:
+            return {"invalid": True}
+        source_hash = chapter["content_hash"] or _content_fingerprint(chapter["content"] or "")
+        existing = conn.execute(
+            "SELECT id FROM production_proposals WHERE chapter_id=? AND proposal_type=? "
+            "AND COALESCE(target_id,0)=COALESCE(?,0) AND name=? AND status='pending' ORDER BY id DESC LIMIT 1",
+            (chapter_id, proposal_type, target_id, name),
+        ).fetchone()
+        values = (
+            item.get("scene_id") if isinstance(item.get("scene_id"), int) else None,
+            category, name, "ordinary" if item.get("severity") == "ordinary" else "major",
+            json.dumps(item.get("before") if isinstance(item.get("before"), dict) else {}, ensure_ascii=False),
+            json.dumps(item.get("after") if isinstance(item.get("after"), dict) else {}, ensure_ascii=False),
+            summary, evidence,
+            item.get("evidence_start") if isinstance(item.get("evidence_start"), int) else None,
+            item.get("evidence_end") if isinstance(item.get("evidence_end"), int) else None,
+            max(0.0, min(1.0, float(item.get("confidence") or 0))), source_hash, now,
+        )
+        if existing:
+            conn.execute(
+                "UPDATE production_proposals SET scene_id=?,category=?,name=?,severity=?,before_json=?,after_json=?,"
+                "change_summary=?,evidence=?,evidence_start=?,evidence_end=?,confidence=?,source_content_hash=?,"
+                "updated_at=?,resolved_at=NULL WHERE id=?", (*values, existing["id"]),
+            )
+            proposal_id = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO production_proposals(work_id,chapter_id,scene_id,proposal_type,target_id,category,name,"
+                "severity,before_json,after_json,change_summary,evidence,evidence_start,evidence_end,confidence,status,"
+                "source_content_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
+                (wid, chapter_id, values[0], proposal_type, target_id, *values[1:-1], now, now),
+            )
+            proposal_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT p.*,c.content_hash AS chapter_content_hash FROM production_proposals p "
+            "JOIN chapters c ON c.id=p.chapter_id WHERE p.id=?", (proposal_id,),
+        ).fetchone()
+        return _production_proposal_payload(row)
+
+
+def resolve_production_proposal(proposal_id, user_id, accept=True):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT p.*,c.content,c.content_hash AS chapter_content_hash FROM production_proposals p "
+            "JOIN chapters c ON c.id=p.chapter_id JOIN works w ON w.id=p.work_id "
+            "WHERE p.id=? AND w.user_id=?", (proposal_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] != "pending":
+            return {"resolved": True}
+        if row["source_content_hash"] and row["source_content_hash"] != row["chapter_content_hash"]:
+            conn.execute(
+                "UPDATE production_proposals SET status='stale',updated_at=?,resolved_at=? WHERE id=?",
+                (now, now, proposal_id),
+            )
+            return {"stale": True}
+        if not accept:
+            conn.execute(
+                "UPDATE production_proposals SET status='rejected',updated_at=?,resolved_at=? WHERE id=?",
+                (now, now, proposal_id),
+            )
+            return {"ok": True, "status": "rejected"}
+        after = _production_json_object(row["after_json"])
+        result = None
+        if row["proposal_type"] == "new_card":
+            category = row["category"] if row["category"] in PRODUCTION_CARD_CATEGORIES else "rule"
+            name = str(after.get("name") or row["name"] or "新设定").strip()[:160]
+            cur = conn.execute(
+                "INSERT INTO production_cards(work_id,category,name,summary,detail,attributes_json,truth_json,"
+                "reader_state,scope_type,status,source_chapter_id,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'confirmed',?,?,?)",
+                (row["work_id"], category, name, str(after.get("summary") or row["change_summary"] or "")[:4000],
+                 str(after.get("detail") or "")[:16000],
+                 json.dumps(after.get("attributes") if isinstance(after.get("attributes"), dict) else {}, ensure_ascii=False),
+                 json.dumps(after.get("truth") if isinstance(after.get("truth"), dict) else {}, ensure_ascii=False),
+                 str(after.get("reader_state") or "")[:6000],
+                 after.get("scope_type") if after.get("scope_type") in PRODUCTION_SCOPE_TYPES else "global",
+                 row["chapter_id"], now, now),
+            )
+            result = {"card_id": cur.lastrowid}
+        elif row["proposal_type"] == "card_update" and row["target_id"]:
+            card = conn.execute(
+                "SELECT * FROM production_cards WHERE id=? AND work_id=?", (row["target_id"], row["work_id"])
+            ).fetchone()
+            if not card:
+                return {"invalid_target": True}
+            attrs = after.get("attributes") if isinstance(after.get("attributes"), dict) else _production_json_object(card["attributes_json"])
+            truth = after.get("truth") if isinstance(after.get("truth"), dict) else _production_json_object(card["truth_json"])
+            conn.execute(
+                "UPDATE production_cards SET name=?,summary=?,detail=?,attributes_json=?,truth_json=?,reader_state=?,updated_at=? WHERE id=?",
+                (str(after.get("name", card["name"]) or card["name"])[:160],
+                 str(after.get("summary", card["summary"]) or "")[:4000],
+                 str(after.get("detail", card["detail"]) or "")[:16000],
+                 json.dumps(attrs, ensure_ascii=False), json.dumps(truth, ensure_ascii=False),
+                 str(after.get("reader_state", card["reader_state"]) or "")[:6000], now, row["target_id"]),
+            )
+            result = {"card_id": row["target_id"]}
+        elif row["proposal_type"] == "card_state" and row["target_id"]:
+            state = after.get("state") if isinstance(after.get("state"), dict) else after
+            cur = conn.execute(
+                "INSERT INTO production_card_versions(card_id,chapter_id,state_json,change_summary,evidence,"
+                "evidence_start,evidence_end,source_content_hash,source,stale,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?, 'ai',0,?)",
+                (row["target_id"], row["chapter_id"], json.dumps(state, ensure_ascii=False),
+                 row["change_summary"], row["evidence"], row["evidence_start"], row["evidence_end"],
+                 row["source_content_hash"], now),
+            )
+            result = {"version_id": cur.lastrowid, "card_id": row["target_id"]}
+        elif row["proposal_type"] == "scene":
+            next_ord = conn.execute(
+                "SELECT COALESCE(MAX(ord),0)+1 FROM production_scenes WHERE chapter_id=?", (row["chapter_id"],)
+            ).fetchone()[0]
+            cur = conn.execute(
+                "INSERT INTO production_scenes(chapter_id,ord,title,summary,time_label,location_card_id,goal,conflict,"
+                "outcome,refs_json,evidence,evidence_start,evidence_end,source_content_hash,source,stale,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'ai',0,?,?)",
+                (row["chapter_id"], int(after.get("ord") or next_ord),
+                 str(after.get("title") or row["name"] or f"场景 {next_ord}")[:160],
+                 str(after.get("summary") or row["change_summary"] or "")[:6000],
+                 str(after.get("time_label") or "")[:500],
+                 after.get("location_card_id") if isinstance(after.get("location_card_id"), int) else None,
+                 str(after.get("goal") or "")[:4000], str(after.get("conflict") or "")[:4000],
+                 str(after.get("outcome") or "")[:4000],
+                 json.dumps(after.get("refs") if isinstance(after.get("refs"), dict) else {}, ensure_ascii=False),
+                 row["evidence"], row["evidence_start"], row["evidence_end"], row["source_content_hash"], now, now),
+            )
+            result = {"scene_id": cur.lastrowid}
+        else:
+            return {"invalid_target": True}
+        conn.execute(
+            "UPDATE production_proposals SET status='accepted',updated_at=?,resolved_at=? WHERE id=?",
+            (now, now, proposal_id),
+        )
+        return {"ok": True, "status": "accepted", "result": result or {}}
+
+
+def _production_scope_applies(conn, card, chapter_id):
+    if card.get("scope_type") == "global" or chapter_id is None:
+        return True
+    chapter = conn.execute("SELECT ord FROM chapters WHERE id=?", (chapter_id,)).fetchone()
+    if not chapter:
+        return False
+    if card.get("scope_type") == "scene":
+        return bool(card.get("scope_scene_id") and conn.execute(
+            "SELECT 1 FROM production_scenes WHERE id=? AND chapter_id=?",
+            (card["scope_scene_id"], chapter_id),
+        ).fetchone())
+    start = conn.execute("SELECT ord FROM chapters WHERE id=?", (card.get("scope_start_chapter_id"),)).fetchone()
+    end = conn.execute("SELECT ord FROM chapters WHERE id=?", (card.get("scope_end_chapter_id"),)).fetchone()
+    return (not start or chapter["ord"] >= start["ord"]) and (not end or chapter["ord"] <= end["ord"])
+
+
+def production_context_digest(wid, user_id, chapter_id=None, limit=80):
+    cards = list_production_cards(wid, user_id, chapter_id, include_pending=False)
+    if not cards:
+        return ""
+    lines = []
+    with get_conn() as conn:
+        for card in cards:
+            if len(lines) >= limit or not _production_scope_applies(conn, card, chapter_id):
+                continue
+            pieces = [card.get("summary") or card.get("detail") or ""]
+            state = (card.get("current_state") or {}).get("state") or {}
+            if state:
+                pieces.append("当前状态：" + "；".join(f"{key}={value}" for key, value in state.items() if value))
+            truth = card.get("truth") or {}
+            if truth.get("objective"):
+                pieces.append("客观真相：" + str(truth["objective"]))
+            if truth.get("reader_known"):
+                pieces.append("读者已知：" + str(truth["reader_known"]))
+            if truth.get("character_knowledge"):
+                pieces.append("人物认知：" + str(truth["character_knowledge"]))
+            if truth.get("secrecy"):
+                pieces.append("保密边界（未到揭示时不得写出）：" + str(truth["secrecy"]))
+            content = "；".join(piece for piece in pieces if piece)
+            lines.append(f"[{card['category_label']}] {card['name']}：{content}")
+    return "生产画布已确认设定（按当前章节时点生效）：\n" + "\n".join(lines) if lines else ""
+
+
+def get_production_overview(wid, user_id):
+    with get_conn() as conn:
+        if not _work_owned(conn, wid, user_id):
+            return None
+        chapters = [dict(row) for row in conn.execute(
+            "SELECT c.id,c.title,c.ord,c.workflow_status,c.analysis_status,c.production_analysis_status,"
+            "c.production_analyzed_at,length(c.content) AS chars,"
+            "(SELECT COUNT(*) FROM production_scenes s WHERE s.chapter_id=c.id) AS scene_count,"
+            "(SELECT COUNT(*) FROM production_proposals p WHERE p.chapter_id=c.id AND p.status='pending') AS pending_count,"
+            "(SELECT COUNT(*) FROM production_impact_flags f WHERE f.affected_chapter_id=c.id AND f.status='open') AS impact_count "
+            "FROM chapters c WHERE c.work_id=? AND c.deleted_at IS NULL ORDER BY c.ord", (wid,),
+        )]
+        counts = {category: 0 for category in PRODUCTION_CARD_CATEGORIES}
+        for row in conn.execute(
+            "SELECT category,COUNT(*) AS count FROM production_cards WHERE work_id=? AND status='confirmed' GROUP BY category",
+            (wid,),
+        ):
+            counts[row["category"]] = row["count"]
+        pending_cards = conn.execute(
+            "SELECT COUNT(*) FROM production_cards WHERE work_id=? AND status='pending'", (wid,)
+        ).fetchone()[0]
+    return {"work_id": wid, "chapters": chapters, "card_counts": counts,
+            "pending_card_count": pending_cards, "settings": get_production_settings(wid, user_id),
+            "layout": get_production_layout(wid, user_id)}
+
+
+def get_chapter_production(chapter_id, user_id):
+    chapter = get_chapter_meta(chapter_id, user_id)
+    if not chapter:
+        return None
+    wid = chapter["work_id"]
+    before_cards = list_production_cards(wid, user_id, chapter_id, before=True, include_pending=False) or []
+    after_cards = list_production_cards(wid, user_id, chapter_id, before=False, include_pending=False) or []
+    before_characters = list_character_cards(wid, user_id, chapter_id, before=True) or []
+    after_characters = list_character_cards(wid, user_id, chapter_id, before=False) or []
+    scenes = list_production_scenes(chapter_id, user_id) or []
+    proposals = list_production_proposals(chapter_id, user_id) or []
+    with get_conn() as conn:
+        impacts = [dict(row) for row in conn.execute(
+            "SELECT f.*,c.title AS source_chapter_title,c.ord AS source_chapter_ord "
+            "FROM production_impact_flags f JOIN chapters c ON c.id=f.source_chapter_id "
+            "WHERE f.affected_chapter_id=? AND f.status='open' ORDER BY f.id DESC", (chapter_id,),
+        )]
+    related_ids = set()
+    for scene in scenes:
+        if scene.get("location_card_id"):
+            related_ids.add(scene["location_card_id"])
+        refs = scene.get("refs") or {}
+        for key in ("card_ids", "skill_ids", "item_ids", "location_ids", "rule_ids"):
+            for value in refs.get(key, []) if isinstance(refs.get(key), list) else []:
+                if isinstance(value, int):
+                    related_ids.add(value)
+    for item in after_cards:
+        item["related"] = item["id"] in related_ids or bool(item.get("current_state") and item["current_state"].get("chapter_id") == chapter_id)
+    return {
+        "chapter": chapter, "before": {"characters": before_characters, "cards": before_cards},
+        "after": {"characters": after_characters, "cards": after_cards},
+        "scenes": scenes, "proposals": proposals, "impacts": impacts,
+        "settings": get_production_settings(wid, user_id),
+        "layout": get_production_layout(wid, user_id, chapter_id),
+    }
+
+
+def resolve_production_impact(impact_id, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT f.id FROM production_impact_flags f JOIN works w ON w.id=f.work_id "
+            "WHERE f.id=? AND w.user_id=?", (impact_id, user_id),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE production_impact_flags SET status='resolved',resolved_at=? WHERE id=?", (now, impact_id))
+        return True
+
+
+def _invalidate_production_chapter(conn, chapter_id, reason):
+    chapter = conn.execute("SELECT id,work_id,ord FROM chapters WHERE id=?", (chapter_id,)).fetchone()
+    if not chapter:
+        return
+    conn.execute(
+        "UPDATE chapters SET production_analysis_status='needs_review',production_analysis_hash='' WHERE id=?",
+        (chapter_id,),
+    )
+    conn.execute("UPDATE production_scenes SET stale=1 WHERE chapter_id=? AND source_content_hash<>''", (chapter_id,))
+    conn.execute(
+        "UPDATE production_card_versions SET stale=1 WHERE chapter_id=? AND source_content_hash<>''", (chapter_id,)
+    )
+    conn.execute(
+        "UPDATE production_proposals SET status='stale',updated_at=?,resolved_at=? "
+        "WHERE chapter_id=? AND status='pending' AND source_content_hash<>''",
+        (time.time(), time.time(), chapter_id),
+    )
+    downstream = conn.execute(
+        "SELECT id FROM chapters WHERE work_id=? AND deleted_at IS NULL AND ord>? ORDER BY ord",
+        (chapter["work_id"], chapter["ord"]),
+    ).fetchall()
+    for target in downstream:
+        exists = conn.execute(
+            "SELECT 1 FROM production_impact_flags WHERE source_chapter_id=? AND affected_chapter_id=? "
+            "AND status='open' LIMIT 1", (chapter_id, target["id"]),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO production_impact_flags(work_id,source_chapter_id,affected_chapter_id,summary,status,created_at) "
+                "VALUES(?,?,?,?,'open',?)",
+                (chapter["work_id"], chapter_id, target["id"],
+                 (reason or "前序章节正文已变化，请检查本章状态与设定是否仍成立")[:500], time.time()),
+            )
+
+
+def replace_ai_production_scenes(chapter_id, user_id, scenes):
+    scenes = scenes if isinstance(scenes, list) else []
+    now = time.time()
+    with get_conn() as conn:
+        chapter = conn.execute(
+            "SELECT c.id,c.work_id,c.content,c.content_hash FROM chapters c JOIN works w ON w.id=c.work_id "
+            "WHERE c.id=? AND w.user_id=? AND c.deleted_at IS NULL", (chapter_id, user_id),
+        ).fetchone()
+        if not chapter:
+            return None
+        source_hash = chapter["content_hash"] or _content_fingerprint(chapter["content"] or "")
+        conn.execute("DELETE FROM production_scenes WHERE chapter_id=? AND source='ai'", (chapter_id,))
+        result = []
+        for index, raw in enumerate(scenes[:40]):
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or f"场景 {index + 1}").strip()[:160]
+            refs = raw.get("refs") if isinstance(raw.get("refs"), dict) else {}
+            location_id = raw.get("location_card_id") if isinstance(raw.get("location_card_id"), int) else None
+            if location_id and not conn.execute(
+                "SELECT 1 FROM production_cards WHERE id=? AND work_id=? AND category='location'",
+                (location_id, chapter["work_id"]),
+            ).fetchone():
+                location_id = None
+            cur = conn.execute(
+                "INSERT INTO production_scenes(chapter_id,ord,title,summary,time_label,location_card_id,goal,conflict,"
+                "outcome,refs_json,evidence,evidence_start,evidence_end,source_content_hash,source,stale,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'ai',0,?,?)",
+                (chapter_id, index + 1, title, str(raw.get("summary") or "")[:6000],
+                 str(raw.get("time_label") or "")[:500], location_id,
+                 str(raw.get("goal") or "")[:4000], str(raw.get("conflict") or "")[:4000],
+                 str(raw.get("outcome") or "")[:4000], json.dumps(refs, ensure_ascii=False),
+                 str(raw.get("evidence") or "")[:4000],
+                 raw.get("evidence_start") if isinstance(raw.get("evidence_start"), int) else None,
+                 raw.get("evidence_end") if isinstance(raw.get("evidence_end"), int) else None,
+                 source_hash, now, now),
+            )
+            result.append(cur.lastrowid)
+        conn.execute(
+            "UPDATE chapters SET production_analysis_status='current',production_analysis_hash=?,"
+            "production_analyzed_at=? WHERE id=?", (source_hash, now, chapter_id),
+        )
+        return {"scene_ids": result, "source_content_hash": source_hash}
+
+
+def mark_production_analysis_current(chapter_id, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        chapter = conn.execute(
+            "SELECT c.id,c.content,c.content_hash FROM chapters c JOIN works w ON w.id=c.work_id "
+            "WHERE c.id=? AND w.user_id=?", (chapter_id, user_id),
+        ).fetchone()
+        if not chapter:
+            return None
+        source_hash = chapter["content_hash"] or _content_fingerprint(chapter["content"] or "")
+        conn.execute(
+            "UPDATE chapters SET production_analysis_status='current',production_analysis_hash=?,"
+            "production_analyzed_at=? WHERE id=?", (source_hash, now, chapter_id),
+        )
+        return {"status": "current", "source_content_hash": source_hash, "analyzed_at": now}
+
+
 # ---------- AI Skills（用户可复用的 agent 指令模板）----------
 
 def _sync_builtin_agent_skills(conn, user_id=None):
@@ -3973,9 +4967,12 @@ def list_chapters(wid, user_id):
             "SELECT id, work_id, title, ord, created_at, length(content) AS chars, "
             "workflow_status, workflow_goal, workflow_summary, workflow_checked_at, "
             "branch_of_chapter_id, branch_from_revision_id, content_revision, analysis_status, "
-            "analysis_reason, analysis_checked_at, "
+            "analysis_reason, analysis_checked_at, production_analysis_status, production_analyzed_at, "
             "(SELECT COUNT(*) FROM story_memory_items m WHERE m.chapter_id=chapters.id "
-            "AND m.status='confirmed' AND m.stale=0) AS confirmed_memory_count "
+            "AND m.status='confirmed' AND m.stale=0) AS confirmed_memory_count, "
+            "(SELECT COUNT(*) FROM production_scenes s WHERE s.chapter_id=chapters.id) AS production_scene_count, "
+            "(SELECT COUNT(*) FROM production_proposals p WHERE p.chapter_id=chapters.id AND p.status='pending') "
+            "AS production_pending_count "
             "FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY ord", (wid,)
         )]
 
@@ -4033,7 +5030,8 @@ def get_chapter_meta(cid, user_id):
         r = conn.execute(
             "SELECT id, work_id, title, ord, content, notes, workflow_status, workflow_goal, "
             "workflow_summary, workflow_checked_at, branch_of_chapter_id, branch_from_revision_id, "
-            "content_hash, content_revision, analysis_status, analysis_reason, analysis_checked_at "
+            "content_hash, content_revision, analysis_status, analysis_reason, analysis_checked_at, "
+            "production_analysis_status, production_analysis_hash, production_analyzed_at "
             "FROM chapters WHERE id=? AND deleted_at IS NULL",
             (cid,),
         ).fetchone()
@@ -4183,6 +5181,7 @@ def _persist_chapter_content(conn, cid, content, now=None, reason="正文已修�
         "analysis_reason=?, analysis_checked_at=NULL, updated_at=? WHERE id=?",
         (content, new_hash, revision, (reason or "正文已修改，需重新分析")[:240], now, cid),
     )
+    _invalidate_production_chapter(conn, cid, reason)
     if invalidate:
         _invalidate_chapter_derived_state(conn, cid, reason)
     return {"changed": True, "content_hash": new_hash, "content_revision": revision}
@@ -4307,6 +5306,12 @@ def purge_chapter(cid, user_id):
         conn.execute("DELETE FROM plot_state_versions WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM plot_state_proposals WHERE chapter_id=?", (cid,))
         conn.execute("DELETE FROM chapter_consistency_alerts WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM production_proposals WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM production_scenes WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM production_card_versions WHERE chapter_id=?", (cid,))
+        conn.execute("DELETE FROM production_impact_flags WHERE source_chapter_id=? OR affected_chapter_id=?", (cid, cid))
+        conn.execute("DELETE FROM production_canvas_layouts WHERE chapter_id=?", (cid,))
+        conn.execute("UPDATE production_cards SET source_chapter_id=NULL WHERE source_chapter_id=?", (cid,))
         _delete_story_memories_for_chapter(conn, cid)
         conn.execute("DELETE FROM chapters WHERE id=?", (cid,))
         return True

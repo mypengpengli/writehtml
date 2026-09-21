@@ -72,6 +72,17 @@ let inspirationSearchTimer = null;
 let pendingInspirationFile = null;
 let inspirationPreviewUrl = null;
 let inspirationPendingPolls = 0;
+// 创作生产画布
+let productionMode = "overview";
+let productionChapterId = null;
+let productionOverviewData = null;
+let productionChapterData = null;
+let productionCards = [];
+let productionResourceCategory = "all";
+let productionSelected = null;
+let productionLayoutTimer = null;
+let productionInspectorSaveTimer = null;
+let productionZoom = 1;
 
 /* ---------- 图标（内联 SVG，Lucide 风格 24×24 描边） ---------- */
 const _W = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
@@ -116,6 +127,7 @@ const ICONS = {
   eye:      `<svg ${_W}><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="2.7"/></svg>`,
   refresh:  `<svg ${_W}><path d="M20 11a8 8 0 1 0 2 5.5"/><polyline points="20 4 20 11 13 11"/></svg>`,
   branch:   `<svg ${_W}><line x1="6" y1="3" x2="6" y2="15"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M6 6a12 12 0 0 0 12 0"/></svg>`,
+  nodes:    `<svg ${_W}><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="8.5" y="14" width="7" height="7" rx="1"/><path d="M6.5 10v2h11v-2M12 12v2"/></svg>`,
   alert:    `<svg ${_W}><path d="M10.3 3.8 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
   check:    `<svg ${_W}><polyline points="20 6 9 17 4 12"/></svg>`,
   bulb:     `<svg ${_W}><path d="M9 18h6"/><path d="M10 22h4"/><path d="M8.4 14.5A7 7 0 1 1 15.6 14.5C14.6 15.2 14 16.4 14 18h-4c0-1.6-.6-2.8-1.6-3.5z"/></svg>`,
@@ -288,6 +300,7 @@ function appendText(t) {
 
 function showLogin() {
   if (!$("inspirationWorkspace")?.classList.contains("hidden")) closeInspirationLibrary();
+  $("app")?.classList.remove("production-open");
   $("app").classList.add("hidden");
   $("reader")?.classList.add("hidden");
   $("login").classList.remove("hidden");
@@ -2548,7 +2561,7 @@ async function applyAgentResult(r, selection, baseMessages = null) {
     await loadAgentSessions(false);
   }
   if (r.compacted) showToast("已按上下文预算压缩早期对话", "ok");
-  let contentChanged = false, sidebarDirty = false, entitiesDirty = false;
+  let contentChanged = false, sidebarDirty = false, entitiesDirty = false, productionDirty = false;
   const changedChapterIds = new Set();
   for (const m of resultMessages) {
     if (m.role === "tool") {
@@ -2556,6 +2569,7 @@ async function applyAgentResult(r, selection, baseMessages = null) {
       if (rr.changed) contentChanged = true;
       if (rr.sidebar_dirty) sidebarDirty = true;
       if (rr.entities_dirty) entitiesDirty = true;
+      if (rr.production_dirty) productionDirty = true;
       if (rr.changed && Number.isInteger(rr.chapter_id)) changedChapterIds.add(rr.chapter_id);
     }
   }
@@ -2566,6 +2580,9 @@ async function applyAgentResult(r, selection, baseMessages = null) {
   }
   if (contentChanged && currentChapterId && (!changedChapterIds.size || changedChapterIds.has(currentChapterId))) {
     await loadChapter();
+  }
+  if ((productionDirty || r.production_analysis) && $("app").classList.contains("production-open")) {
+    await (productionMode === "chapter" ? loadProductionChapter() : loadProductionOverview());
   }
   await notifyStoryUpdates(r);
   if (!$('characterStateOverlay').classList.contains('hidden') && characterStateChapterId === currentChapterId) {
@@ -4669,6 +4686,824 @@ function readerToggleTTS() {
   speechSynthesis.speak(u); ttsPlaying = true; setReaderTts(true);
 }
 
+/* ---------- 创作生产画布 ---------- */
+
+const productionCategoryLabels = {
+  character: "人物", rule: "规则", location: "地点", skill: "技能", item: "道具", organization: "组织",
+};
+const productionCategoryIcons = {
+  character: "users", rule: "book", location: "focus", skill: "sparkles", item: "archive", organization: "panel",
+};
+const productionStateLabels = {
+  location: "地点", goal: "目标", emotion: "情绪", physical: "身体",
+  information: "已知", relationships: "关系", assets: "能力/物品", secrets: "秘密/承诺", notes: "补充",
+};
+
+function productionChapterOptions(selectedId = productionChapterId) {
+  return chapters.map(chapter => `<option value="${chapter.id}" ${chapter.id === +selectedId ? "selected" : ""}>第${chapter.ord}章《${esc(chapter.title || "未命名")}》</option>`).join("");
+}
+
+function syncProductionHeader() {
+  const select = $("productionChapterSelect");
+  if (select) {
+    select.innerHTML = productionChapterOptions();
+    select.disabled = !chapters.length;
+  }
+  $("productionOverviewBtn")?.classList.toggle("active", productionMode === "overview");
+  $("productionChapterBtn")?.classList.toggle("active", productionMode === "chapter");
+  const chapter = chapters.find(item => item.id === productionChapterId);
+  $("productionSubtitle").textContent = productionMode === "overview"
+    ? `${chapters.length} 章 · 全书脉络`
+    : (chapter ? `第${chapter.ord}章《${chapter.title || "未命名"}》` : "请选择章节");
+  $("productionAnalyzeBtn").disabled = productionMode !== "chapter" || !productionChapterId;
+}
+
+async function openProductionCanvas() {
+  if (!currentWorkId) { showToast("请先新建或选择一个作品", "err"); return; }
+  if (dirty) await saveNow();
+  closeStoryDrawer();
+  $("app").classList.remove("side-open");
+  $("app").classList.add("production-open");
+  const workspace = $("productionWorkspace");
+  workspace.classList.toggle("resources-closed", window.innerWidth < 1100);
+  productionChapterId = currentChapterId || chapters[chapters.length - 1]?.id || null;
+  productionMode = productionChapterId ? "chapter" : "overview";
+  syncProductionHeader();
+  if (productionMode === "chapter") await loadProductionChapter();
+  else await loadProductionOverview();
+}
+
+async function maybePromptProductionAnalysis() {
+  if (!productionChapterId || !productionChapterData?.settings?.auto_analyze_on_leave) return true;
+  const status = productionChapterData.chapter?.production_analysis_status;
+  if (status === "current" || !(productionChapterData.chapter?.content || "").trim()) return true;
+  const analyze = await askCard({
+    title: "本章画布尚未更新", msg: "正文已经保存，但场景与状态还没有重新分析。现在分析本章吗？",
+    okText: "分析本章",
+  });
+  if (analyze) await analyzeProductionChapter();
+  return true;
+}
+
+async function closeProductionCanvas() {
+  clearTimeout(productionInspectorSaveTimer);
+  await maybePromptProductionAnalysis();
+  $("app").classList.remove("production-open");
+  closeProductionInspector();
+  clearProductionAgentTarget();
+  if (currentChapterId) await loadChapter();
+}
+
+async function showProductionOverview() {
+  if (productionMode === "chapter") await maybePromptProductionAnalysis();
+  productionMode = "overview";
+  closeProductionInspector();
+  syncProductionHeader();
+  await loadProductionOverview();
+}
+
+async function showProductionChapter() {
+  if (!productionChapterId) productionChapterId = currentChapterId || chapters[chapters.length - 1]?.id || null;
+  if (!productionChapterId) { showToast("当前作品还没有章节", "err"); return; }
+  productionMode = "chapter";
+  syncProductionHeader();
+  await loadProductionChapter();
+}
+
+async function changeProductionChapter(value) {
+  const next = +value;
+  if (!next || next === productionChapterId) return;
+  await maybePromptProductionAnalysis();
+  productionChapterId = next;
+  if (currentChapterId !== next) await selectChapter(next);
+  productionMode = "chapter";
+  closeProductionInspector();
+  syncProductionHeader();
+  await loadProductionChapter();
+}
+
+function setProductionLoading(on) {
+  $("productionLoading")?.classList.toggle("hidden", !on);
+}
+
+async function loadProductionResources(chapterId = productionChapterId) {
+  if (!currentWorkId) return;
+  const query = chapterId ? `?chapter_id=${chapterId}` : "";
+  const [cards] = await Promise.all([
+    api(`/api/works/${currentWorkId}/production/cards${query}`, { method: "GET" }),
+    loadWikiEntities(),
+  ]);
+  productionCards = Array.isArray(cards) ? cards : [];
+  renderProductionResources();
+}
+
+async function loadProductionOverview() {
+  if (!currentWorkId) return;
+  setProductionLoading(true);
+  try {
+    const [overview] = await Promise.all([
+      api(`/api/works/${currentWorkId}/production`, { method: "GET" }),
+      loadProductionResources(null),
+    ]);
+    productionOverviewData = overview;
+    syncProductionSettings(overview.settings || {});
+    renderProductionOverview();
+    $("productionOverview").classList.remove("hidden");
+    $("productionCanvasViewport").classList.add("hidden");
+  } catch (e) {
+    $("productionOverview").innerHTML = `<div class="production-empty">${svg("alert")}<b>画布读取失败</b><span>${esc(e.message)}</span></div>`;
+  } finally { setProductionLoading(false); applyIcons(); }
+}
+
+async function loadProductionChapter() {
+  if (!productionChapterId) return;
+  setProductionLoading(true);
+  try {
+    productionChapterData = await api(`/api/chapters/${productionChapterId}/production`, { method: "GET" });
+    productionCards = productionChapterData.after?.cards || [];
+    syncProductionSettings(productionChapterData.settings || {});
+    renderProductionResources();
+    renderProductionCanvas();
+    $("productionOverview").classList.add("hidden");
+    $("productionCanvasViewport").classList.remove("hidden");
+  } catch (e) {
+    $("productionCanvas").innerHTML = `<div class="production-empty">${svg("alert")}<b>章节画布读取失败</b><span>${esc(e.message)}</span></div>`;
+  } finally { setProductionLoading(false); applyIcons(); }
+}
+
+function syncProductionSettings(settings) {
+  if ($("productionEvidenceEnabled")) $("productionEvidenceEnabled").checked = settings.evidence_enabled !== false;
+  if ($("productionAutoAnalyze")) $("productionAutoAnalyze").checked = !!settings.auto_analyze_on_leave;
+}
+
+function renderProductionOverview() {
+  const data = productionOverviewData;
+  if (!data) return;
+  const counts = data.card_counts || {};
+  const stats = [
+    ["章节", data.chapters?.length || 0], ["人物", entitiesCache.filter(item => item.kind === "人物").length],
+    ["规则", counts.rule || 0], ["地点", counts.location || 0], ["技能", counts.skill || 0],
+    ["道具", counts.item || 0], ["组织", counts.organization || 0],
+  ];
+  const cards = (data.chapters || []).map(chapter => {
+    const summary = chapter.workflow_summary || (chapter.chars ? `${chapter.chars} 字正文` : "尚未开始正文");
+    const warnings = (chapter.pending_count || 0) + (chapter.impact_count || 0);
+    return `<button class="production-chapter-card ${chapter.id === productionChapterId ? "active" : ""}" onclick="openProductionChapterFromOverview(${chapter.id})">
+      <span class="production-chapter-number">第 ${chapter.ord} 章</span>
+      <b>${esc(chapter.title || "未命名")}</b>
+      <p>${esc(summary)}</p>
+      <span class="production-chapter-meta">
+        <span>${chapter.scene_count || 0} 场</span><span>${esc(workflowLabel(chapter.workflow_status))}</span>
+        ${chapter.production_analysis_status === "current" ? "<span>已分析</span>" : '<span class="warning">待分析</span>'}
+        ${warnings ? `<span class="warning">${warnings} 项待处理</span>` : ""}
+      </span>
+    </button>`;
+  }).join("");
+  $("productionOverview").innerHTML = `
+    <div class="production-overview-head"><h2>${esc(works.find(item => item.id === currentWorkId)?.title || "当前作品")}</h2><p>从章节进入，可查看章前状态、场景结构、章后变化与待确认设定。</p></div>
+    <div class="production-stat-strip">${stats.map(([label, value]) => `<div><b>${value}</b><small>${label}</small></div>`).join("")}</div>
+    ${cards ? `<div class="production-timeline">${cards}</div>` : `<div class="production-empty">${svg("nodes")}<b>还没有章节</b><span>先回到编辑器新建章节。</span></div>`}`;
+}
+
+async function openProductionChapterFromOverview(chapterId) {
+  productionChapterId = chapterId;
+  if (currentChapterId !== chapterId) await selectChapter(chapterId);
+  productionMode = "chapter";
+  syncProductionHeader();
+  await loadProductionChapter();
+}
+
+function toggleProductionResources(force) {
+  const workspace = $("productionWorkspace");
+  const open = force == null ? workspace.classList.contains("resources-closed") : !!force;
+  workspace.classList.toggle("resources-closed", !open);
+}
+
+function setProductionResourceCategory(category) {
+  productionResourceCategory = category;
+  document.querySelectorAll("#productionResourceTabs button").forEach(button =>
+    button.classList.toggle("active", button.dataset.category === category));
+  renderProductionResources();
+}
+
+function productionResourceItems() {
+  const characters = (productionChapterData?.after?.characters || entitiesCache.filter(item => item.kind === "人物")).map(item => ({
+    ...item, resource_type: "character", category: "character",
+    resource_summary: item.summary || characterStateBrief(item.current_state || {}) || "人物卡",
+  }));
+  const cards = productionCards.map(item => ({
+    ...item, resource_type: "card", resource_summary: item.summary || item.detail || "尚未填写说明",
+  }));
+  return [...characters, ...cards];
+}
+
+function renderProductionResources() {
+  const host = $("productionResourceList");
+  if (!host) return;
+  const query = ($("productionResourceSearch")?.value || "").trim().toLowerCase();
+  const items = productionResourceItems().filter(item => {
+    if (productionResourceCategory !== "all" && item.category !== productionResourceCategory) return false;
+    return !query || `${item.name} ${item.resource_summary}`.toLowerCase().includes(query);
+  });
+  $("productionResourceCount").textContent = `${items.length} 项`;
+  host.innerHTML = items.length ? items.map(item => {
+    const active = productionSelected?.type === item.resource_type && productionSelected?.item?.id === item.id;
+    return `<button class="production-resource-row production-category-${item.category} ${active ? "active" : ""}" onclick="${item.resource_type === "character" ? `inspectProductionCharacter(${item.id})` : `inspectProductionCard(${item.id})`}">
+      <span class="production-resource-mark"></span>
+      <span class="production-resource-copy"><b>${esc(item.name)}</b><small>${esc(item.resource_summary)}</small></span>
+      <small>${esc(productionCategoryLabels[item.category] || item.category)}</small>
+    </button>`;
+  }).join("") : `<div class="production-empty">${svg("search")}<span>没有匹配的资源</span></div>`;
+}
+
+function productionStateBrief(state) {
+  if (!state || typeof state !== "object") return "暂无状态";
+  return Object.entries(state).filter(([, value]) => value != null && String(value).trim())
+    .slice(0, 4).map(([key, value]) => `${productionStateLabels[key] || key}：${value}`).join("；") || "暂无状态";
+}
+
+function productionRelatedCharacters(data) {
+  const ids = new Set();
+  (data.scenes || []).forEach(scene => (scene.refs?.character_ids || []).forEach(id => ids.add(+id)));
+  const all = data.after?.characters || [];
+  const related = all.filter(item => ids.has(item.id));
+  return related.length ? related : all.slice(0, 8);
+}
+
+function productionRelatedCards(data) {
+  const ids = new Set();
+  (data.scenes || []).forEach(scene => {
+    if (scene.location_card_id) ids.add(+scene.location_card_id);
+    ["card_ids", "skill_ids", "item_ids", "location_ids", "rule_ids"].forEach(key =>
+      (scene.refs?.[key] || []).forEach(id => ids.add(+id)));
+  });
+  const all = data.after?.cards || [];
+  const related = all.filter(item => ids.has(item.id) || item.related);
+  return related.length ? related : all.filter(item => item.category !== "rule").slice(0, 8);
+}
+
+function productionNodeRow({ icon = "book", title, summary, onclick = "", extra = "" }) {
+  return `<button class="production-node-row" ${onclick ? `onclick="${onclick}"` : ""}>
+    <span>${svg(icon)}</span><span class="production-node-row-copy"><b>${esc(title || "未命名")}</b><small>${esc(summary || "暂无说明")}</small>${extra}</span>
+  </button>`;
+}
+
+function productionDefaultLayout() {
+  return { nodes: {
+    rules: { x: 44, y: 34 }, before: { x: 44, y: 286 }, scenes: { x: 430, y: 118 },
+    changes: { x: 920, y: 34 }, after: { x: 920, y: 326 },
+  }};
+}
+
+function productionLayout() {
+  const saved = productionChapterData?.layout?.layout;
+  const base = productionDefaultLayout();
+  if (!saved || typeof saved !== "object") return base;
+  return { ...base, ...saved, nodes: { ...base.nodes, ...(saved.nodes || {}) } };
+}
+
+function productionNodeStyle(name, layout) {
+  const pos = layout.nodes[name] || productionDefaultLayout().nodes[name];
+  const x = Number.isFinite(+pos.x) ? Math.max(0, +pos.x) : 0;
+  const y = Number.isFinite(+pos.y) ? Math.max(0, +pos.y) : 0;
+  return `left:${x}px;top:${y}px`;
+}
+
+function renderProductionCanvas() {
+  const data = productionChapterData;
+  if (!data) return;
+  const layout = productionLayout();
+  const rules = (data.after?.cards || []).filter(item => item.category === "rule");
+  const beforeCharacters = data.before?.characters || [];
+  const beforeCards = data.before?.cards || [];
+  const afterCharacters = productionRelatedCharacters(data);
+  const afterCards = productionRelatedCards(data);
+  const proposals = (data.proposals || []).filter(item => item.status === "pending" || item.is_stale);
+  const impacts = data.impacts || [];
+  const beforeRows = [
+    ...beforeCharacters.slice(0, 8).map(item => productionNodeRow({
+      icon: "users", title: item.name, summary: productionStateBrief(item.current_state),
+      onclick: `inspectProductionCharacter(${item.id},'before')`,
+    })),
+    ...beforeCards.filter(item => item.current_state).slice(0, 8).map(item => productionNodeRow({
+      icon: productionCategoryIcons[item.category], title: item.name,
+      summary: productionStateBrief(item.current_state?.state), onclick: `inspectProductionCard(${item.id},'before')`,
+    })),
+  ].join("");
+  const afterRows = [
+    ...afterCharacters.map(item => productionNodeRow({
+      icon: "users", title: item.name, summary: productionStateBrief(item.current_state),
+      onclick: `inspectProductionCharacter(${item.id},'after')`,
+    })),
+    ...afterCards.map(item => productionNodeRow({
+      icon: productionCategoryIcons[item.category], title: item.name,
+      summary: productionStateBrief(item.current_state?.state || item.attributes), onclick: `inspectProductionCard(${item.id},'after')`,
+    })),
+  ].join("");
+  const sceneRows = (data.scenes || []).map((scene, index) => {
+    const tags = [scene.time_label, scene.location_name, scene.goal && `目标：${scene.goal}`].filter(Boolean);
+    return `<button class="production-node-row production-scene-row" onclick="inspectProductionScene(${scene.id})">
+      <span class="production-scene-order">${index + 1}</span>
+      <span class="production-node-row-copy"><b>${esc(scene.title)}</b><small>${esc(scene.summary || scene.conflict || "暂无场景摘要")}</small>
+        ${tags.length ? `<span class="production-scene-tags">${tags.slice(0, 3).map(tag => `<span>${esc(tag)}</span>`).join("")}</span>` : ""}
+      </span>
+    </button>`;
+  }).join("");
+  const proposalRows = proposals.map(item => `<div class="production-node-row production-proposal-row ${item.is_stale ? "stale" : ""}">
+    <span>${svg(item.is_stale ? "alert" : "sparkles")}</span>
+    <span class="production-node-row-copy"><b>${esc(item.name || item.change_summary || "设定变化")}</b><small>${esc(item.change_summary || "等待作者确认")}</small></span>
+    <span class="production-proposal-actions">
+      ${item.is_stale ? "" : `<button class="ic" onclick="acceptProductionProposal(${item.id})" title="确认">${svg("check")}</button>`}
+      <button class="ic" onclick="rejectProductionProposal(${item.id})" title="忽略">${svg("x")}</button>
+    </span>
+  </div>`).join("");
+  const impactRows = impacts.map(item => `<div class="production-impact"><b>前序第${item.source_chapter_ord}章已修改</b><span>${esc(item.summary)}</span><button onclick="resolveProductionImpact(${item.id})">已检查</button></div>`).join("");
+  const ruleRows = rules.map(item => productionNodeRow({
+    icon: "book", title: item.name, summary: item.summary || productionStateBrief(item.current_state?.state),
+    onclick: `inspectProductionCard(${item.id})`,
+  })).join("");
+  $("productionCanvas").innerHTML = `
+    <div class="production-canvas-toolbar">
+      <button class="ic" onclick="setProductionZoom(-0.1)" title="缩小">−</button>
+      <button class="ic" onclick="setProductionZoom(0.1)" title="放大">＋</button>
+      <button class="ic" data-ic="focus" onclick="resetProductionView()" title="复位视图"></button>
+    </div>
+    <svg class="production-links" aria-hidden="true">
+      <path data-from="rules" data-to="scenes"></path><path data-from="before" data-to="scenes"></path>
+      <path data-from="scenes" data-to="after"></path><path data-from="changes" data-to="after"></path>
+    </svg>
+    <section class="production-node rules" data-node="rules" style="${productionNodeStyle("rules", layout)}">
+      <div class="production-node-head"><span class="production-node-title"><span>${svg("book")}</span><div><b>规则约束</b><small>当前章节生效</small></div></span><button class="ic" onclick="event.stopPropagation();newProductionCard('rule')" title="新增规则">${svg("plus")}</button></div>
+      <div class="production-node-body">${ruleRows || `<div class="production-empty"><span>还没有正式规则卡</span></div>`}</div>
+    </section>
+    <section class="production-node before" data-node="before" style="${productionNodeStyle("before", layout)}">
+      <div class="production-node-head"><span class="production-node-title"><span>${svg("clock")}</span><div><b>章前状态</b><small>进入本章之前</small></div></span></div>
+      <div class="production-node-body production-state-grid">${beforeRows || `<div class="production-empty"><span>暂无章前状态</span></div>`}</div>
+    </section>
+    <section class="production-node scenes" data-node="scenes" style="${productionNodeStyle("scenes", layout)}">
+      <div class="production-node-head"><span class="production-node-title"><span>${svg("nodes")}</span><div><b>本章场景</b><small>${data.scenes?.length || 0} 个场景单元</small></div></span><button class="ic" onclick="event.stopPropagation();newProductionScene()" title="新增场景">${svg("plus")}</button></div>
+      <div class="production-node-body">${sceneRows || `<div class="production-empty">${svg("nodes")}<span>可手动新增，或点“分析本章”自动整理</span></div>`}<button class="production-add-row" onclick="newProductionScene()">${svg("plus")} 新增场景</button></div>
+    </section>
+    <section class="production-node changes" data-node="changes" style="${productionNodeStyle("changes", layout)}">
+      <div class="production-node-head"><span class="production-node-title"><span>${svg("sparkles")}</span><div><b>待确认变化</b><small>${proposals.length} 项提议 · ${impacts.length} 项影响</small></div></span></div>
+      <div class="production-node-body">${impactRows}${proposalRows || (!impactRows ? `<div class="production-empty"><span>没有待处理变化</span></div>` : "")}</div>
+    </section>
+    <section class="production-node after" data-node="after" style="${productionNodeStyle("after", layout)}">
+      <div class="production-node-head"><span class="production-node-title"><span>${svg("check")}</span><div><b>章后状态</b><small>截至本章结束</small></div></span></div>
+      <div class="production-node-body production-state-grid">${afterRows || `<div class="production-empty"><span>暂无章后状态</span></div>`}</div>
+    </section>`;
+  $("productionCanvas").style.zoom = productionZoom;
+  applyIcons();
+  initProductionNodeDrag();
+  requestAnimationFrame(updateProductionLinks);
+}
+
+function updateProductionLinks() {
+  const canvas = $("productionCanvas");
+  if (!canvas || window.innerWidth <= 700) return;
+  canvas.querySelectorAll(".production-links path").forEach(path => {
+    const from = canvas.querySelector(`[data-node="${path.dataset.from}"]`);
+    const to = canvas.querySelector(`[data-node="${path.dataset.to}"]`);
+    if (!from || !to) return;
+    const x1 = from.offsetLeft + from.offsetWidth, y1 = from.offsetTop + from.offsetHeight / 2;
+    const x2 = to.offsetLeft, y2 = to.offsetTop + to.offsetHeight / 2;
+    const bend = Math.max(50, Math.abs(x2 - x1) * .45);
+    path.setAttribute("d", `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`);
+  });
+}
+
+function initProductionNodeDrag() {
+  if (window.innerWidth <= 700) return;
+  $("productionCanvas").querySelectorAll(".production-node-head").forEach(head => {
+    head.addEventListener("pointerdown", event => {
+      if (event.target.closest("button")) return;
+      const node = head.closest(".production-node");
+      const startX = event.clientX, startY = event.clientY;
+      const left = node.offsetLeft, top = node.offsetTop;
+      head.setPointerCapture(event.pointerId);
+      const move = moveEvent => {
+        node.style.left = Math.max(0, left + (moveEvent.clientX - startX) / productionZoom) + "px";
+        node.style.top = Math.max(0, top + (moveEvent.clientY - startY) / productionZoom) + "px";
+        updateProductionLinks();
+      };
+      const up = () => {
+        head.removeEventListener("pointermove", move);
+        head.removeEventListener("pointerup", up);
+        head.removeEventListener("pointercancel", up);
+        const layout = productionLayout();
+        layout.nodes[node.dataset.node] = { x: Math.round(node.offsetLeft), y: Math.round(node.offsetTop) };
+        productionChapterData.layout = { ...(productionChapterData.layout || {}), layout };
+        queueProductionLayoutSave();
+      };
+      head.addEventListener("pointermove", move);
+      head.addEventListener("pointerup", up);
+      head.addEventListener("pointercancel", up);
+    });
+  });
+}
+
+function queueProductionLayoutSave() {
+  clearTimeout(productionLayoutTimer);
+  $("productionSaveStatus").textContent = "布局未保存";
+  productionLayoutTimer = setTimeout(async () => {
+    try {
+      await api(`/api/works/${currentWorkId}/production/layout`, { method: "PUT", body: {
+        chapter_id: productionChapterId, layout: productionLayout(),
+      }});
+      $("productionSaveStatus").textContent = "布局已保存";
+    } catch (e) { $("productionSaveStatus").textContent = "布局保存失败"; }
+  }, 500);
+}
+
+function setProductionZoom(delta) {
+  productionZoom = Math.max(.65, Math.min(1.25, +(productionZoom + delta).toFixed(2)));
+  $("productionCanvas").style.zoom = productionZoom;
+}
+
+function resetProductionView() {
+  productionZoom = window.innerWidth < 1200 ? .8 : 1;
+  $("productionCanvasViewport").scrollTo({ left: 0, top: 0, behavior: "smooth" });
+  $("productionCanvas").style.zoom = productionZoom;
+}
+
+function productionPairsText(value) {
+  if (!value || typeof value !== "object") return "";
+  return Object.entries(value).filter(([, item]) => item != null && String(item).trim())
+    .map(([key, item]) => `${key}：${typeof item === "object" ? JSON.stringify(item) : item}`).join("\n");
+}
+
+function parseProductionPairs(value) {
+  const result = {};
+  String(value || "").split(/\r?\n/).forEach(line => {
+    const index = line.search(/[：:]/);
+    if (index < 1) return;
+    const key = line.slice(0, index).trim();
+    let item = line.slice(index + 1).trim();
+    if (!key || !item) return;
+    if (/^-?\d+(\.\d+)?$/.test(item)) item = +item;
+    else if (item === "true" || item === "是") item = true;
+    else if (item === "false" || item === "否") item = false;
+    result[key] = item;
+  });
+  return result;
+}
+
+function productionCardById(cardId, point = "after") {
+  const timed = productionChapterData?.[point]?.cards || [];
+  return timed.find(item => item.id === cardId) || productionCards.find(item => item.id === cardId) || null;
+}
+
+function setProductionAgentTarget(type, item) {
+  if (!item) return;
+  let text = "";
+  if (type === "card") {
+    text = `[生产画布设定卡]\n类型：${productionCategoryLabels[item.category] || item.category}\n名称：${item.name}\n摘要：${item.summary || ""}\n详情：${item.detail || ""}\n当前状态：${productionStateBrief(item.current_state?.state)}`;
+  } else if (type === "scene") {
+    text = `[生产画布场景]\n名称：${item.title}\n摘要：${item.summary || ""}\n目标：${item.goal || ""}\n冲突：${item.conflict || ""}\n结果：${item.outcome || ""}`;
+  } else if (type === "character") {
+    text = `[生产画布人物]\n名称：${item.name}\n基础设定：${item.summary || ""}\n当前状态：${productionStateBrief(item.current_state)}`;
+  }
+  agentSelection = { context_kind: "canvas_target", target_type: type, target_id: item.id, text, title: item.name || item.title || "画布对象" };
+  renderAgentSelection();
+}
+
+function clearProductionAgentTarget() {
+  if (agentSelection?.context_kind === "canvas_target") clearAgentSelection();
+}
+
+function openProductionAI() {
+  if (!$("app").classList.contains("ai-open")) toggleAISide();
+  $("agentInput").focus();
+}
+
+function closeProductionInspector() {
+  clearTimeout(productionInspectorSaveTimer);
+  $("productionWorkspace")?.classList.remove("inspector-open");
+  productionSelected = null;
+  renderProductionResources();
+}
+
+function openProductionInspector(title, meta, html) {
+  $("productionInspectorTitle").textContent = title;
+  $("productionInspectorMeta").textContent = meta || "";
+  $("productionInspectorBody").innerHTML = html;
+  $("productionWorkspace").classList.add("inspector-open");
+  applyIcons();
+}
+
+function productionChapterSelectOptions(value) {
+  return `<option value="">不限</option>` + chapters.map(item =>
+    `<option value="${item.id}" ${item.id === +value ? "selected" : ""}>第${item.ord}章《${esc(item.title || "未命名")}》</option>`).join("");
+}
+
+function inspectProductionCard(cardId, point = "after") {
+  const item = productionCardById(cardId, point);
+  if (!item) return;
+  productionSelected = { type: "card", item, point };
+  setProductionAgentTarget("card", item);
+  renderProductionResources();
+  const truth = item.truth || {};
+  const state = item.current_state?.state || {};
+  const evidence = item.current_state?.evidence || "";
+  openProductionInspector(item.name, `${productionCategoryLabels[item.category] || item.category} · ${point === "before" ? "章前" : "章后"}`, `
+    <div class="production-inspector-form" oninput="queueProductionInspectorSave()">
+      <div class="production-form-grid">
+        <label>分类<select id="productionCardCategory">${Object.entries(productionCategoryLabels).filter(([key]) => key !== "character").map(([key, label]) => `<option value="${key}" ${item.category === key ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+        <label>生效范围<select id="productionCardScope"><option value="global" ${item.scope_type === "global" ? "selected" : ""}>全书</option><option value="chapter_range" ${item.scope_type === "chapter_range" ? "selected" : ""}>章节范围</option></select></label>
+      </div>
+      <label>名称<input id="productionCardName" value="${esc(item.name)}"></label>
+      <label>一句话设定<textarea id="productionCardSummary" rows="3">${esc(item.summary || "")}</textarea></label>
+      <label>详细说明<textarea id="productionCardDetail" rows="5">${esc(item.detail || "")}</textarea></label>
+      <label>自定义属性 <span>每行“字段：值”</span><textarea id="productionCardAttributes">${esc(productionPairsText(item.attributes))}</textarea></label>
+      <div class="production-form-grid">
+        <label>起始章节<select id="productionCardScopeStart">${productionChapterSelectOptions(item.scope_start_chapter_id)}</select></label>
+        <label>结束章节<select id="productionCardScopeEnd">${productionChapterSelectOptions(item.scope_end_chapter_id)}</select></label>
+      </div>
+      <div class="production-inspector-section"><h3>真相与信息边界</h3>
+        <label>客观真相<textarea id="productionTruthObjective">${esc(truth.objective || "")}</textarea></label>
+        <label>读者当前已知<textarea id="productionTruthReader">${esc(truth.reader_known || "")}</textarea></label>
+        <label>人物认知与误解<textarea id="productionTruthCharacters">${esc(truth.character_knowledge || "")}</textarea></label>
+        <label>保密边界<textarea id="productionTruthSecrecy">${esc(truth.secrecy || "")}</textarea></label>
+      </div>
+      <label>读者侧状态<textarea id="productionCardReaderState">${esc(item.reader_state || "")}</textarea></label>
+      <div class="production-inspector-section"><h3>本章状态版本</h3>
+        <label>当前状态 <span>每行“字段：值”</span><textarea id="productionCardState" oninput="event.stopPropagation()">${esc(productionPairsText(state))}</textarea></label>
+        <label>变化说明<input id="productionCardStateSummary" oninput="event.stopPropagation()" placeholder="例如：道具转由林晚持有"></label>
+        <button onclick="saveProductionCardStateFromInspector()">保存为本章状态</button>
+        ${evidence ? `<div class="production-evidence">证据：${esc(evidence)}${Number.isInteger(item.current_state?.evidence_start) ? `<button onclick="jumpToProductionEvidence(${item.current_state.evidence_start},${item.current_state.evidence_end})">查看正文</button>` : ""}</div>` : ""}
+      </div>
+      <div class="production-inspector-actions"><button onclick="saveProductionCardFromInspector()">保存设定卡</button><button class="danger-link" onclick="archiveProductionCard(${item.id})">归档</button></div>
+    </div>`);
+}
+
+function newProductionCard(category = "rule") {
+  const item = { id: null, category, name: "", summary: "", detail: "", attributes: {}, truth: {}, reader_state: "", scope_type: "global" };
+  productionSelected = { type: "card", item, point: "after" };
+  openProductionInspector("新建设定卡", productionCategoryLabels[category] || "设定", `
+    <div class="production-inspector-form">
+      <div class="production-form-grid">
+        <label>分类<select id="productionCardCategory">${Object.entries(productionCategoryLabels).filter(([key]) => key !== "character").map(([key, label]) => `<option value="${key}" ${category === key ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+        <label>生效范围<select id="productionCardScope"><option value="global">全书</option><option value="chapter_range">章节范围</option></select></label>
+      </div>
+      <label>名称<input id="productionCardName" placeholder="例如：灵力等级"></label>
+      <label>一句话设定<textarea id="productionCardSummary" rows="3"></textarea></label>
+      <label>详细说明<textarea id="productionCardDetail" rows="5"></textarea></label>
+      <label>自定义属性 <span>每行“字段：值”</span><textarea id="productionCardAttributes"></textarea></label>
+      <div class="production-form-grid"><label>起始章节<select id="productionCardScopeStart">${productionChapterSelectOptions()}</select></label><label>结束章节<select id="productionCardScopeEnd">${productionChapterSelectOptions()}</select></label></div>
+      <div class="production-inspector-section"><h3>真相与信息边界</h3>
+        <label>客观真相<textarea id="productionTruthObjective"></textarea></label><label>读者当前已知<textarea id="productionTruthReader"></textarea></label>
+        <label>人物认知与误解<textarea id="productionTruthCharacters"></textarea></label><label>保密边界<textarea id="productionTruthSecrecy"></textarea></label>
+      </div>
+      <label>读者侧状态<textarea id="productionCardReaderState"></textarea></label>
+      <div class="production-inspector-actions"><button onclick="saveProductionCardFromInspector()">创建设定卡</button><button onclick="closeProductionInspector()">取消</button></div>
+    </div>`);
+  setTimeout(() => $("productionCardName")?.focus(), 30);
+}
+
+function readProductionCardForm() {
+  return {
+    category: $("productionCardCategory").value, name: $("productionCardName").value.trim(),
+    summary: $("productionCardSummary").value, detail: $("productionCardDetail").value,
+    attributes: parseProductionPairs($("productionCardAttributes").value),
+    truth: { objective: $("productionTruthObjective").value, reader_known: $("productionTruthReader").value,
+      character_knowledge: $("productionTruthCharacters").value, secrecy: $("productionTruthSecrecy").value },
+    reader_state: $("productionCardReaderState").value, scope_type: $("productionCardScope").value,
+    scope_start_chapter_id: +$("productionCardScopeStart").value || null,
+    scope_end_chapter_id: +$("productionCardScopeEnd").value || null,
+  };
+}
+
+function queueProductionInspectorSave() {
+  if (!productionSelected?.item?.id || !["card", "scene"].includes(productionSelected.type)) return;
+  clearTimeout(productionInspectorSaveTimer);
+  $("productionSaveStatus").textContent = "未保存";
+  productionInspectorSaveTimer = setTimeout(() => {
+    if (productionSelected?.type === "card") saveProductionCardFromInspector(true);
+    else if (productionSelected?.type === "scene") saveProductionSceneFromInspector(true);
+  }, 1000);
+}
+
+async function saveProductionCardFromInspector(quiet = false) {
+  if (productionSelected?.type !== "card") return;
+  const cardId = productionSelected.item.id;
+  const body = readProductionCardForm();
+  if (!body.name) { if (!quiet) showToast("请填写设定卡名称", "err"); return; }
+  try {
+    const saved = await api(cardId ? `/api/production/cards/${cardId}` : `/api/works/${currentWorkId}/production/cards`, {
+      method: cardId ? "PUT" : "POST", body,
+    });
+    $("productionSaveStatus").textContent = "已自动保存";
+    productionSelected.item = saved;
+    const index = productionCards.findIndex(item => item.id === saved.id);
+    if (index >= 0) productionCards[index] = { ...productionCards[index], ...saved };
+    else productionCards.push(saved);
+    if (productionChapterData?.after?.cards) {
+      const at = productionChapterData.after.cards.findIndex(item => item.id === saved.id);
+      if (at >= 0) productionChapterData.after.cards[at] = { ...productionChapterData.after.cards[at], ...saved };
+      else productionChapterData.after.cards.push(saved);
+    }
+    renderProductionResources();
+    if (productionMode === "chapter") renderProductionCanvas();
+    if (!quiet) { showToast(cardId ? "设定卡已保存" : "设定卡已创建", "ok"); inspectProductionCard(saved.id); }
+  } catch (e) { $("productionSaveStatus").textContent = "保存失败"; if (!quiet) showToast(e.message, "err"); }
+}
+
+async function saveProductionCardStateFromInspector() {
+  const item = productionSelected?.item;
+  if (!item?.id || !productionChapterId) return;
+  const state = parseProductionPairs($("productionCardState").value);
+  if (!Object.keys(state).length) { showToast("请至少填写一项状态", "err"); return; }
+  try {
+    await api(`/api/production/cards/${item.id}/versions`, { body: {
+      chapter_id: productionChapterId, state, change_summary: $("productionCardStateSummary").value,
+    }});
+    showToast("本章状态已保存", "ok");
+    await loadProductionChapter();
+    inspectProductionCard(item.id);
+  } catch (e) { showToast(e.message, "err"); }
+}
+
+async function archiveProductionCard(cardId) {
+  const ok = await askCard({ title: "归档设定卡", msg: "归档后不会再进入后续写作上下文，历史状态仍保留。", okText: "归档", danger: true });
+  if (!ok) return;
+  try {
+    await api(`/api/production/cards/${cardId}`, { method: "DELETE" });
+    closeProductionInspector();
+    await (productionMode === "chapter" ? loadProductionChapter() : loadProductionOverview());
+    showToast("设定卡已归档", "ok");
+  } catch (e) { showToast(e.message, "err"); }
+}
+
+function inspectProductionCharacter(entityId, point = "after") {
+  const item = (productionChapterData?.[point]?.characters || entitiesCache).find(entity => entity.id === entityId);
+  if (!item) return;
+  productionSelected = { type: "character", item, point };
+  setProductionAgentTarget("character", item);
+  renderProductionResources();
+  const state = item.current_state || {};
+  openProductionInspector(item.name, `人物 · ${point === "before" ? "章前" : "章后"}`, `
+    <div class="production-inspector-form">
+      <label>基础设定<textarea readonly>${esc(item.summary || "暂无")}</textarea></label>
+      <label>详细档案<textarea readonly rows="6">${esc(item.detail || "暂无")}</textarea></label>
+      <div class="production-inspector-section"><h3>当前状态</h3>${Object.entries(productionStateLabels).map(([key, label]) => state[key] ? `<div class="production-evidence"><b>${label}</b><br>${esc(state[key])}</div>` : "").join("") || '<div class="production-empty"><span>暂无动态状态</span></div>'}</div>
+      <div class="production-inspector-actions"><button onclick="openCharacterState(${item.id},'profile')">打开人物卡</button><button onclick="openProductionAI()">交给 AI</button></div>
+    </div>`);
+}
+
+function productionLocationOptions(value) {
+  const locations = productionCards.filter(item => item.category === "location");
+  return `<option value="">未关联地点卡</option>` + locations.map(item => `<option value="${item.id}" ${item.id === +value ? "selected" : ""}>${esc(item.name)}</option>`).join("");
+}
+
+function inspectProductionScene(sceneId) {
+  const item = productionChapterData?.scenes?.find(scene => scene.id === sceneId);
+  if (!item) return;
+  productionSelected = { type: "scene", item };
+  setProductionAgentTarget("scene", item);
+  openProductionInspector(item.title, `场景 ${item.ord}`, productionSceneForm(item));
+}
+
+function newProductionScene() {
+  if (!productionChapterId) return;
+  const item = { id: null, title: "", summary: "", time_label: "", location_card_id: null, goal: "", conflict: "", outcome: "", refs: {} };
+  productionSelected = { type: "scene", item };
+  openProductionInspector("新建场景", "本章场景", productionSceneForm(item));
+  setTimeout(() => $("productionSceneTitle")?.focus(), 30);
+}
+
+function productionSceneForm(item) {
+  return `<div class="production-inspector-form" ${item.id ? 'oninput="queueProductionInspectorSave()"' : ""}>
+    <label>场景标题<input id="productionSceneTitle" value="${esc(item.title || "")}" placeholder="例如：雨夜抵达旧码头"></label>
+    <div class="production-form-grid"><label>时间<input id="productionSceneTime" value="${esc(item.time_label || "")}"></label><label>地点<select id="productionSceneLocation">${productionLocationOptions(item.location_card_id)}</select></label></div>
+    <label>场景摘要<textarea id="productionSceneSummary">${esc(item.summary || "")}</textarea></label>
+    <label>目标<textarea id="productionSceneGoal">${esc(item.goal || "")}</textarea></label>
+    <label>冲突<textarea id="productionSceneConflict">${esc(item.conflict || "")}</textarea></label>
+    <label>结果<textarea id="productionSceneOutcome">${esc(item.outcome || "")}</textarea></label>
+    <label>关联人物 ID <span>多个 ID 用逗号分隔</span><input id="productionSceneCharacters" value="${esc((item.refs?.character_ids || []).join(','))}"></label>
+    ${item.evidence ? `<div class="production-evidence">证据：${esc(item.evidence)}${Number.isInteger(item.evidence_start) ? `<button onclick="jumpToProductionEvidence(${item.evidence_start},${item.evidence_end})">查看正文</button>` : ""}</div>` : ""}
+    <div class="production-inspector-actions"><button onclick="saveProductionSceneFromInspector()">${item.id ? "保存场景" : "创建场景"}</button>${item.id ? `<button class="danger-link" onclick="deleteProductionScene(${item.id})">删除</button>` : '<button onclick="closeProductionInspector()">取消</button>'}</div>
+  </div>`;
+}
+
+function readProductionSceneForm() {
+  const characterIds = $("productionSceneCharacters").value.split(/[,，\s]+/).map(Number).filter(Number.isInteger);
+  return { chapter_id: productionChapterId, title: $("productionSceneTitle").value.trim(),
+    summary: $("productionSceneSummary").value, time_label: $("productionSceneTime").value,
+    location_card_id: +$("productionSceneLocation").value || null, goal: $("productionSceneGoal").value,
+    conflict: $("productionSceneConflict").value, outcome: $("productionSceneOutcome").value,
+    refs: { ...(productionSelected?.item?.refs || {}), character_ids: [...new Set(characterIds)] } };
+}
+
+async function saveProductionSceneFromInspector(quiet = false) {
+  if (productionSelected?.type !== "scene") return;
+  const sceneId = productionSelected.item.id;
+  const body = readProductionSceneForm();
+  if (!body.title) { if (!quiet) showToast("请填写场景标题", "err"); return; }
+  try {
+    const saved = await api(sceneId ? `/api/production/scenes/${sceneId}` : `/api/chapters/${productionChapterId}/production/scenes`, {
+      method: sceneId ? "PUT" : "POST", body,
+    });
+    $("productionSaveStatus").textContent = "已自动保存";
+    productionSelected.item = saved;
+    if (productionChapterData?.scenes) {
+      const index = productionChapterData.scenes.findIndex(item => item.id === saved.id);
+      if (index >= 0) productionChapterData.scenes[index] = saved; else productionChapterData.scenes.push(saved);
+    }
+    renderProductionCanvas();
+    if (!quiet) { showToast(sceneId ? "场景已保存" : "场景已创建", "ok"); inspectProductionScene(saved.id); }
+  } catch (e) { $("productionSaveStatus").textContent = "保存失败"; if (!quiet) showToast(e.message, "err"); }
+}
+
+async function deleteProductionScene(sceneId) {
+  const ok = await askCard({ title: "删除场景", msg: "只删除画布场景节点，不会删除正文。", okText: "删除", danger: true });
+  if (!ok) return;
+  try { await api(`/api/production/scenes/${sceneId}`, { method: "DELETE" }); closeProductionInspector(); await loadProductionChapter(); }
+  catch (e) { showToast(e.message, "err"); }
+}
+
+async function acceptProductionProposal(proposalId) {
+  try { await api(`/api/production/proposals/${proposalId}/accept`); await loadProductionChapter(); showToast("变化已确认", "ok"); }
+  catch (e) { showToast(e.message, "err"); }
+}
+
+async function rejectProductionProposal(proposalId) {
+  try { await api(`/api/production/proposals/${proposalId}/reject`); await loadProductionChapter(); }
+  catch (e) { showToast(e.message, "err"); }
+}
+
+async function resolveProductionImpact(impactId) {
+  try { await api(`/api/production/impacts/${impactId}/resolve`); await loadProductionChapter(); }
+  catch (e) { showToast(e.message, "err"); }
+}
+
+async function analyzeProductionChapter() {
+  if (!productionChapterId) return;
+  if (dirty && currentChapterId === productionChapterId) await saveNow();
+  const button = $("productionAnalyzeBtn");
+  busy(button, true, "分析中");
+  try {
+    const result = await api(`/api/chapters/${productionChapterId}/production/analyze`, { body: {} });
+    productionChapterData = result.production;
+    productionCards = productionChapterData.after?.cards || [];
+    renderProductionResources(); renderProductionCanvas(); syncProductionHeader();
+    showToast(`已整理 ${result.scene_count || 0} 个场景和 ${result.changes?.length || 0} 项变化`, "ok");
+  } catch (e) { showToast("分析失败：" + e.message, "err"); }
+  finally { busy(button, false, "分析本章"); applyIcons(); }
+}
+
+async function jumpToProductionEvidence(start, end) {
+  if (!Number.isInteger(start)) return;
+  await closeProductionCanvas();
+  const editor = $("content");
+  editor.focus(); editor.setSelectionRange(start, Number.isInteger(end) ? end : start);
+  typewriterCenter(); updateSelectionTools();
+}
+
+function toggleProductionSettings() { $("productionSettingsBar").classList.toggle("hidden"); }
+
+async function saveProductionSettings() {
+  if (!currentWorkId) return;
+  try {
+    const old = productionChapterData?.settings || productionOverviewData?.settings || {};
+    const settings = await api(`/api/works/${currentWorkId}/production/settings`, { method: "PUT", body: {
+      evidence_enabled: $("productionEvidenceEnabled").checked,
+      auto_analyze_on_leave: $("productionAutoAnalyze").checked,
+      custom_fields: old.custom_fields || [],
+    }});
+    if (productionChapterData) productionChapterData.settings = settings;
+    if (productionOverviewData) productionOverviewData.settings = settings;
+    $("productionSaveStatus").textContent = "设置已保存";
+  } catch (e) { showToast(e.message, "err"); }
+}
+
+function editProductionCustomFields() {
+  const settings = productionChapterData?.settings || productionOverviewData?.settings || {};
+  const value = (settings.custom_fields || []).map(field =>
+    `${field.name}|${field.type}${field.options?.length ? `|${field.options.join(",")}` : ""}`).join("\n");
+  productionSelected = { type: "settings", item: settings };
+  openProductionInspector("自定义字段", "本作品", `<div class="production-inspector-form">
+    <div class="production-evidence">每行一个字段：名称|类型|选项。类型可用 text、number、level、enum、boolean、hidden；enum/level 的选项用逗号分隔。</div>
+    <label>字段定义<textarea id="productionCustomFields" rows="12">${esc(value)}</textarea></label>
+    <div class="production-inspector-actions"><button onclick="saveProductionCustomFields()">保存字段</button><button onclick="closeProductionInspector()">取消</button></div>
+  </div>`);
+}
+
+async function saveProductionCustomFields() {
+  const fields = $("productionCustomFields").value.split(/\r?\n/).map((line, index) => {
+    const [name, type = "text", options = ""] = line.split("|").map(item => item.trim());
+    return name ? { id: `custom_${index}_${name}`, name, type, options: options.split(/[,，]/).map(item => item.trim()).filter(Boolean) } : null;
+  }).filter(Boolean);
+  try {
+    const settings = await api(`/api/works/${currentWorkId}/production/settings`, { method: "PUT", body: {
+      evidence_enabled: $("productionEvidenceEnabled").checked,
+      auto_analyze_on_leave: $("productionAutoAnalyze").checked, custom_fields: fields,
+    }});
+    if (productionChapterData) productionChapterData.settings = settings;
+    if (productionOverviewData) productionOverviewData.settings = settings;
+    closeProductionInspector(); showToast("自定义字段已保存", "ok");
+  } catch (e) { showToast(e.message, "err"); }
+}
+
 /* ---------- 多模态创意灵感库 ---------- */
 
 const inspirationTypeLabels = {
@@ -5256,9 +6091,12 @@ function typewriterCenter() {
 
 document.addEventListener("keydown", (e) => {
   const inspirationOpen = !$("inspirationWorkspace")?.classList.contains("hidden");
+  const productionOpen = $("app")?.classList.contains("production-open");
   if ((e.ctrlKey || e.metaKey) && e.key === "s") {
     e.preventDefault();
     if (inspirationOpen && $("inspirationSaveBtn")) saveInspirationCapture();
+    else if (productionOpen && productionSelected?.type === "card") saveProductionCardFromInspector();
+    else if (productionOpen && productionSelected?.type === "scene") saveProductionSceneFromInspector();
     else saveNow();
   }
   if ((e.ctrlKey || e.metaKey) && e.key === "f") {
@@ -5266,12 +6104,20 @@ document.addEventListener("keydown", (e) => {
     if (inspirationOpen) {
       $("inspirationSearch")?.focus();
       $("inspirationSearch")?.select();
+    } else if (productionOpen) {
+      toggleProductionResources(true);
+      $("productionResourceSearch")?.focus();
+      $("productionResourceSearch")?.select();
     } else toggleFind();
   }
   if (e.key === "Escape" && !$("inspirationWorkspace")?.classList.contains("hidden")) {
     const actions = $("inspirationActions");
     if (actions && !actions.classList.contains("hidden")) actions.classList.add("hidden");
     else closeInspirationLibrary();
+  }
+  if (e.key === "Escape" && productionOpen && !inspirationOpen) {
+    if ($("productionWorkspace").classList.contains("inspector-open")) closeProductionInspector();
+    else closeProductionCanvas();
   }
 });
 $("content").addEventListener("input", onContentInput);
