@@ -182,6 +182,41 @@ accepted_card = db.get_production_card(proposal_accept["result"]["card_id"], _ui
 ok(proposal_accept["status"] == "accepted" and accepted_card["name"] == "青铜令牌"
    and accepted_card["attributes"]["owner"] == "小明", "重大新设定经确认后写入正式卡片")
 
+# 生产画布历史时点：新设定从来源章节出现，信息边界按章节版本读取。
+production_later_chapter = c.post(
+    f"/api/works/{wid}/chapters", json={"title": "画布历史时点"}, headers=H(tokA),
+).json()["id"]
+later_card = c.post(
+    f"/api/works/{wid}/production/cards",
+    json={"category": "item", "name": "后章密钥", "summary": "只在后章出现",
+          "source_chapter_id": production_later_chapter}, headers=H(tokA),
+).json()
+ok(not any(item["id"] == later_card["id"] for item in db.list_production_cards(wid, _uidA_early, cid))
+   and any(item["id"] == later_card["id"] for item in db.list_production_cards(wid, _uidA_early, production_later_chapter)),
+   "设定卡按来源章节进入历史时点")
+c.post(f"/api/production/cards/{production_card['id']}/versions", json={
+    "chapter_id": production_later_chapter,
+    "state": {"status": "代价已揭示", "_reader_known": "读者已知道代价来自寿命",
+              "_character_knowledge": "林晚仍不知道", "_secrecy": "不得揭示幕后制定者"},
+    "change_summary": "读者信息边界推进",
+}, headers=H(tokA))
+ok("代价来自寿命" not in db.production_context_digest(wid, _uidA_early, cid)
+   and "代价来自寿命" in db.production_context_digest(wid, _uidA_early, production_later_chapter),
+   "读者已知和保密边界按章节版本生效")
+
+# 作者编辑 AI 场景后，该场景升级为人工内容，后续分析替换不能覆盖。
+ai_scene_id = db.replace_ai_production_scenes(cid, _uidA_early, [{"title": "AI 临时场景"}])["scene_ids"][0]
+edited_ai_scene = c.put(f"/api/production/scenes/{ai_scene_id}", json={
+    "chapter_id": cid, "title": "作者保留场景", "summary": "人工修订后的结构",
+}, headers=H(tokA)).json()
+db.replace_ai_production_scenes(cid, _uidA_early, [])
+ok(edited_ai_scene["source"] == "manual"
+   and any(item["id"] == ai_scene_id and item["title"] == "作者保留场景"
+           for item in db.list_production_scenes(cid, _uidA_early)),
+   "作者编辑过的 AI 场景不会被重新分析覆盖")
+c.delete(f"/api/chapters/{production_later_chapter}", headers=H(tokA))
+c.post(f"/api/chapters/{production_later_chapter}/purge", headers=H(tokA))
+
 # 每用户大模型设置
 c.post("/api/settings", json={
     "base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a",
@@ -517,14 +552,21 @@ ok(len(_sandbox_saved["data"]["nodes"]) == 2 and _sandbox_saved["data"]["nodes"]
 ok(c.get(f"/api/sandboxes/{_sandbox['id']}", headers=H(tokB)).status_code == 404,
    "其他用户无法读取情节沙盘")
 _orig_sandbox_chat = llm.chat
-llm.chat = lambda *args, **kwargs: json.dumps([
-    {"title": "陌生来信", "summary": "新人物带来另一条线索", "direction": "发散", "characters": "林晚"},
-    {"title": "核对证词", "summary": "回收旧码头证词矛盾", "direction": "收束", "characters": "林晚"},
-    {"title": "潜入码头", "summary": "冲突推进到正面调查", "direction": "推进", "characters": "林晚"},
-], ensure_ascii=False)
+_sandbox_prompt = {}
+def _sandbox_expand_chat(messages, **kwargs):
+    _sandbox_prompt.update(json.loads(messages[-1]["content"]))
+    return json.dumps([
+        {"title": "陌生来信", "summary": "新人物带来另一条线索", "direction": "发散", "characters": "林晚"},
+        {"title": "核对证词", "summary": "回收旧码头证词矛盾", "direction": "收束", "characters": "林晚"},
+        {"title": "潜入码头", "summary": "冲突推进到正面调查", "direction": "推进", "characters": "林晚"},
+    ], ensure_ascii=False)
+llm.chat = _sandbox_expand_chat
 _expanded = c.post(f"/api/sandboxes/{_sandbox['id']}/expand", json={"node_id": "branch-a"}, headers=H(tokA)).json()
 ok([item["direction"] for item in _expanded["candidates"]] == ["发散", "收束", "推进"],
    "沙盘 AI 展开返回发散、收束、推进三类候选且不直接改正文")
+ok([item["title"] for item in _sandbox_prompt["branch_path"]] == ["抵达北城", "追向旧码头"]
+   and "灵力守恒" in _sandbox_prompt["confirmed_world_state"],
+   "沙盘 AI 展开读取当前分支路径与统一 World State")
 llm.chat = _orig_sandbox_chat
 
 # 拆书：自动切章后逐章分析；每章成果立即落到目标作品，任务可以再次读取。
@@ -818,24 +860,35 @@ ok(_state_at_c1["current_state"]["location"] == "北城" and _state_at_c2["curre
    "不同章节看到各自时点的人物状态")
 ok("旧码头" in main._agent_bible(wid, uidA, state_c2), "Agent 上下文带当前章节人物状态")
 
-# 手动触发提取：模型输出只生成 pending，不直接覆盖刚确认的版本。
+# 手动触发统一 World State：重大人物变化只生成 pending，不直接覆盖刚确认的版本。
 c.put(f"/api/chapters/{state_c2}", json={"content": "林晚在旧码头得知失踪者仍然活着。"}, headers=H(tokA))
 _orig_character_chat = llm.chat
 _character_prompt = {}
 def _character_extract(messages, **kw):
     _character_prompt["messages"] = messages
-    return json.dumps({"updates": [{
+    return json.dumps({"plot": {}, "memories": [], "scenes": [], "changes": [], "character_changes": [{
         "entity_id": ent["id"],
+        "severity": "major",
         "state": {"location": "旧码头", "goal": "救出失踪者", "information": "失踪者仍然活着"},
         "change_summary": "获得失踪者生还线索", "evidence": "正文明确得知其仍然活着",
     }]}, ensure_ascii=False)
 llm.chat = _character_extract
 _analyzed = c.post(f"/api/chapters/{state_c2}/character-state-proposals/analyze", json={}, headers=H(tokA)).json()
 ok(len(_analyzed["proposals"]) == 1 and _analyzed["proposals"][0]["status"] == "pending", "AI 提取人物状态为待确认提议")
-ok("confirmed_state_at_this_point" in _character_prompt["messages"][-1]["content"], "状态提取收到当前已确认人物状态")
+ok("known_characters" in _character_prompt["messages"][-1]["content"], "统一分析收到当前已确认人物状态")
 _after_analyze = c.get(f"/api/works/{wid}/entities?chapter_id={state_c2}", headers=H(tokA)).json()[0]
 ok(_after_analyze["current_state"]["goal"] == "追查目击者" and _after_analyze["pending_count"] == 1,
    "待确认提议不改变后续 AI 上下文")
+# 模型分析期间正文若变化，整批 World State 结果必须作废，不能部分落库。
+stale_world_cid = c.post(f"/api/works/{wid}/chapters", json={"title": "并发分析"}, headers=H(tokA)).json()["id"]
+c.put(f"/api/chapters/{stale_world_cid}", json={"content": "分析开始时的正文"}, headers=H(tokA))
+def _stale_world_state(messages, **kw):
+    db.update_chapter(stale_world_cid, uidA, None, "分析期间作者已经修改正文", None)
+    return '{"plot":{},"memories":[],"scenes":[{"title":"过期场景"}],"changes":[],"character_changes":[]}'
+llm.chat = _stale_world_state
+stale_world = c.post(f"/api/chapters/{stale_world_cid}/production/analyze", json={}, headers=H(tokA))
+ok(stale_world.status_code == 409 and not db.list_production_scenes(stale_world_cid, uidA),
+   "正文并发变化时统一 World State 整批拒绝落库")
 # 后续 Agent 写作测试不联网，但保留新的自动提议调用链。
 llm.chat = lambda *args, **kw: '{"updates": []}'
 
@@ -959,11 +1012,12 @@ def _review_story_chat(messages, **kw):
             "category": "伏笔", "severity": "notice", "title": "确认线索来源", "detail": "来源仍待展开",
             "evidence": "旧码头消息", "suggestion": "在下一章给出侧面印证",
         }]}, ensure_ascii=False)
-    if "人物动态变化" in task:
-        return '{"updates": []}'
-    if "故事状态" in task:
-        return json.dumps({"state": {"mainline": "确认失踪者仍然活着", "current_event": "旧码头线索待核验", "open_threads": "谁在控制旧码头", "next_goal": "核验线索来源"}, "change_summary": "线索进入核验阶段", "evidence": "本章旧码头消息"}, ensure_ascii=False)
-    return '{"updates": []}'
+    if "World State" in task:
+        return json.dumps({
+            "plot": {"state": {"mainline": "确认失踪者仍然活着", "current_event": "旧码头线索待核验", "open_threads": "谁在控制旧码头", "next_goal": "核验线索来源"}, "change_summary": "线索进入核验阶段", "evidence": "本章旧码头消息"},
+            "memories": [], "scenes": [], "changes": [], "character_changes": [],
+        }, ensure_ascii=False)
+    return '{}'
 llm.chat = _review_story_chat
 review = c.post(f"/api/chapters/{state_c2}/review", json={}, headers=H(tokA)).json()
 ok(review["workflow"]["workflow_status"] == "review" and any(item["status"] == "open" for item in review["alerts"]) and review["plot_state_proposal"], "AI 复核产生提醒和待确认剧情状态")
@@ -988,7 +1042,7 @@ def _make_agent(stub):
 _agent_tool_names = {item["function"]["name"] for item in main.AGENT_TOOLS}
 ok({"list_characters", "save_character_card"}.issubset(_agent_tool_names), "Agent 暴露人物卡读写工具")
 ok({"list_story_cards", "save_story_card", "save_story_card_state", "list_chapter_scenes",
-    "save_chapter_scene", "analyze_chapter_production"}.issubset(_agent_tool_names),
+    "save_chapter_scene", "analyze_chapter_production", "analyze_world_state"}.issubset(_agent_tool_names),
    "Agent 暴露生产画布读写与分析工具")
 _character_tool_prompt = main._agent_system(uidA, cid, "按正文自动建立人物卡")["content"]
 ok("save_character_card" in _character_tool_prompt and "不能用故事记忆替代" in _character_tool_prompt,
@@ -1199,8 +1253,8 @@ llm.agent_chat = _make_agent([
     _msg("已改好。"),
 ])
 _orig_agent_state_chat = llm.chat
-llm.chat = lambda *args, **kw: json.dumps({"updates": [{
-    "entity_id": ent["id"], "state": {"location": "测试房间"},
+llm.chat = lambda *args, **kw: json.dumps({"plot": {}, "memories": [], "scenes": [], "changes": [], "character_changes": [{
+    "entity_id": ent["id"], "severity": "major", "state": {"location": "测试房间"},
     "change_summary": "正文改动后生成的状态提议", "evidence": "测试提取",
 }]}, ensure_ascii=False)
 ag = c.post("/api/agent", json={"text": "把你好改成你好呀", "chapter_id": cid}, headers=H(tokA)).json()
@@ -1306,6 +1360,11 @@ ok(len(_tr2) == 1 and isinstance(json.loads(_tr2[0]["content"]).get("revisions")
 c.delete(f"/api/agent/conversation?chapter_id={cid}", headers=H(tokA))  # 清空，避免影响后续
 
 # 同一会话可连续创建并写入多章，也可按 chapter_id 覆盖指定章节。
+_world_state_calls = []
+def _empty_world_state(messages, **kw):
+    _world_state_calls.append(json.loads(messages[-1]["content"]).get("chapter", {}).get("id"))
+    return '{"plot":{},"memories":[],"scenes":[],"changes":[],"character_changes":[]}'
+llm.chat = _empty_world_state
 llm.agent_chat = _make_agent([
     _msg(None, [
         ("multi-1", "create_chapter", json.dumps({"title": "多章甲", "content": "甲章正文"})),
@@ -1320,6 +1379,9 @@ ok(len(_multi_ids) == 2
    and c.get(f"/api/chapters/{_multi_ids[0]}", headers=H(tokA)).json()["content"] == "甲章正文"
    and c.get(f"/api/chapters/{_multi_ids[1]}", headers=H(tokA)).json()["content"] == "乙章正文",
    "Agent 同一会话连续创建并写入多章")
+ok([item["chapter_id"] for item in _multi.get("world_state_updates", [])] == _multi_ids
+   and _world_state_calls == _multi_ids,
+   "Agent 多章改写按章节排队且每章只执行一次统一 World State 分析")
 llm.agent_chat = _make_agent([
     _msg(None, [("multi-write", "write_chapter", json.dumps({
         "chapter_id": _multi_ids[0], "content": "甲章重写正文",

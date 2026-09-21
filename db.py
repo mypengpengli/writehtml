@@ -3633,20 +3633,39 @@ def create_character_state_version(eid, user_id, chapter_id, state, change_summa
         normalized = normalize_character_state(state)
         if not character_state_has_content(normalized):
             return {"empty_state": True}
-        cur = conn.execute(
-            "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,"
-            "source_content_hash,stale,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (eid, chapter_id, json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1000],
-             (evidence or "").strip()[:3000], source, proposal_id,
-             chapter_source["content_hash"] if source == "ai" else "", 0, now),
+        payload = (
+            json.dumps(normalized, ensure_ascii=False), (change_summary or "").strip()[:1000],
+            (evidence or "").strip()[:3000], source, proposal_id,
+            chapter_source["content_hash"] if source == "ai" else "", now,
         )
+        # Automated analysis is derived data. Re-analysis refreshes the snapshot
+        # instead of accumulating equivalent versions for the same chapter.
+        existing = None
+        if source == "ai":
+            existing = conn.execute(
+                "SELECT id FROM entity_state_versions WHERE entity_id=? AND chapter_id=? "
+                "AND source='ai' ORDER BY id DESC LIMIT 1", (eid, chapter_id),
+            ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE entity_state_versions SET state_json=?,change_summary=?,evidence=?,source=?,proposal_id=?,"
+                "source_content_hash=?,stale=0,created_at=? WHERE id=?", (*payload, existing["id"]),
+            )
+            version_id = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO entity_state_versions(entity_id,chapter_id,state_json,change_summary,evidence,source,proposal_id,"
+                "source_content_hash,stale,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (eid, chapter_id, *payload[:-1], 0, now),
+            )
+            version_id = cur.lastrowid
         row = conn.execute(
             "SELECT v.id, v.entity_id, v.chapter_id, v.state_json, v.change_summary, v.evidence, "
             "v.source, v.proposal_id, v.source_content_hash, v.stale, v.created_at, "
             "c.title AS chapter_title, c.ord AS chapter_ord, "
             "CASE WHEN v.source_content_hash='' OR v.source_content_hash=c.content_hash THEN 1 ELSE 0 END AS source_hash_matches "
             "FROM entity_state_versions v JOIN chapters c ON c.id=v.chapter_id WHERE v.id=?",
-            (cur.lastrowid,),
+            (version_id,),
         ).fetchone()
         return _state_version_payload(row)
 
@@ -4038,6 +4057,14 @@ def list_production_cards(wid, user_id, at_chapter_id=None, before=False, includ
             return None
         where = "work_id=? AND status<>'archived'"
         params = [wid]
+        if at_chapter_id is not None:
+            op = "<" if before else "<="
+            where += (
+                " AND (source_chapter_id IS NULL OR EXISTS (SELECT 1 FROM chapters source "
+                "JOIN chapters target ON target.id=? WHERE source.id=production_cards.source_chapter_id "
+                f"AND source.work_id=target.work_id AND source.ord {op} target.ord))"
+            )
+            params.append(at_chapter_id)
         if not include_pending:
             where += " AND status='confirmed'"
         rows = conn.execute(
@@ -4107,6 +4134,14 @@ def save_production_card(wid, user_id, values, card_id=None):
         for chapter_id in (start_id, end_id, source_id):
             if chapter_id is not None and not _chapter_for_work(conn, chapter_id, wid):
                 return {"invalid_chapter": True}
+        scene_id = chosen("scope_scene_id", None)
+        if scene_id is not None and not conn.execute(
+            "SELECT 1 FROM production_scenes s JOIN chapters c ON c.id=s.chapter_id "
+            "WHERE s.id=? AND c.work_id=?", (scene_id, wid),
+        ).fetchone():
+            return {"invalid_scene": True}
+        if scope_type == "scene" and scene_id is None:
+            return {"invalid_scene": True}
         status = str(chosen("status", "confirmed") or "confirmed")
         if status not in {"confirmed", "pending", "archived"}:
             status = "confirmed"
@@ -4114,7 +4149,7 @@ def save_production_card(wid, user_id, values, card_id=None):
             category, name, str(chosen("summary", "") or "")[:4000],
             str(chosen("detail", "") or "")[:16000], json.dumps(attrs, ensure_ascii=False),
             json.dumps(truth, ensure_ascii=False), str(chosen("reader_state", "") or "")[:6000],
-            scope_type, start_id, end_id, chosen("scope_scene_id", None), status, source_id, now,
+            scope_type, start_id, end_id, scene_id, status, source_id, now,
         )
         if old:
             conn.execute(
@@ -4232,7 +4267,7 @@ def save_production_scene(chapter_id, user_id, values, scene_id=None):
         def chosen(key, default=""):
             return values[key] if key in values else (old[key] if old else default)
         title = str(chosen("title", "新场景") or "新场景").strip()[:160]
-        refs = chosen("refs", _production_json_object(old["refs_json"]) if old else {})
+        refs = values["refs"] if "refs" in values else (_production_json_object(old["refs_json"]) if old else {})
         if not isinstance(refs, dict):
             return {"invalid_refs": True}
         location_id = chosen("location_card_id", None)
@@ -4253,8 +4288,11 @@ def save_production_scene(chapter_id, user_id, values, scene_id=None):
             ord_ = max(1, int(chosen("ord", default_ord)))
         except Exception:
             ord_ = default_ord
-        source = str(chosen("source", "manual") or "manual")[:40]
-        source_hash = str(chosen("source_content_hash", "") or "")
+        # Once an author edits an AI scene it becomes authored content and must
+        # survive subsequent replacement of disposable AI analysis results.
+        author_edit = bool(old and old["source"] == "ai" and "source" not in values)
+        source = "manual" if author_edit else str(chosen("source", "manual") or "manual")[:40]
+        source_hash = "" if author_edit else str(chosen("source_content_hash", "") or "")
         if source == "ai" and not source_hash:
             source_hash = chapter["content_hash"] or _content_fingerprint(chapter["content"] or "")
         payload = (
@@ -4491,6 +4529,10 @@ def resolve_production_proposal(proposal_id, user_id, accept=True):
             result = {"card_id": row["target_id"]}
         elif row["proposal_type"] == "card_state" and row["target_id"]:
             state = after.get("state") if isinstance(after.get("state"), dict) else after
+            conn.execute(
+                "DELETE FROM production_card_versions WHERE card_id=? AND chapter_id=? AND source='ai'",
+                (row["target_id"], row["chapter_id"]),
+            )
             cur = conn.execute(
                 "INSERT INTO production_card_versions(card_id,chapter_id,state_json,change_summary,evidence,"
                 "evidence_start,evidence_end,source_content_hash,source,stale,created_at) "
@@ -4558,14 +4600,20 @@ def production_context_digest(wid, user_id, chapter_id=None, limit=80):
             if state:
                 pieces.append("当前状态：" + "；".join(f"{key}={value}" for key, value in state.items() if value))
             truth = card.get("truth") or {}
+            reader_known = state.get("_reader_known", truth.get("reader_known"))
+            character_knowledge = state.get("_character_knowledge", truth.get("character_knowledge"))
+            secrecy = state.get("_secrecy", truth.get("secrecy"))
+            reader_state = state.get("_reader_state", card.get("reader_state"))
             if truth.get("objective"):
                 pieces.append("客观真相：" + str(truth["objective"]))
-            if truth.get("reader_known"):
-                pieces.append("读者已知：" + str(truth["reader_known"]))
-            if truth.get("character_knowledge"):
-                pieces.append("人物认知：" + str(truth["character_knowledge"]))
-            if truth.get("secrecy"):
-                pieces.append("保密边界（未到揭示时不得写出）：" + str(truth["secrecy"]))
+            if reader_known:
+                pieces.append("读者已知：" + str(reader_known))
+            if character_knowledge:
+                pieces.append("人物认知：" + str(character_knowledge))
+            if secrecy:
+                pieces.append("保密边界（未到揭示时不得写出）：" + str(secrecy))
+            if reader_state:
+                pieces.append("读者侧状态：" + str(reader_state))
             content = "；".join(piece for piece in pieces if piece)
             lines.append(f"[{card['category_label']}] {card['name']}：{content}")
     return "生产画布已确认设定（按当前章节时点生效）：\n" + "\n".join(lines) if lines else ""

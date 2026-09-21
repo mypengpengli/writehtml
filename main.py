@@ -645,20 +645,56 @@ async def expand_sandbox_node(sid: int, request: Request):
     model = settings.get("llm_model") or config.LLM_MODEL
     if not api_key:
         raise HTTPException(500, "未配置 API Key，请先在设置中配置文字模型")
-    work = db.get_work(sandbox["work_id"], uid) or {}
-    notes = (work.get("notes") or "")[:6000]
-    instruction = str(body.get("instruction") or "").strip()[:1000]
-    prompt = (
-        "请为小说情节沙盘中的当前节点生成三个明显不同、可以继续写下去的候选子节点。"
-        "三个方向依次必须是：发散（开启新可能）、收束（回收已有线索）、推进（顺势推进冲突）。"
-        "只输出 JSON 数组，每项字段为 title、summary、direction、characters；不要 Markdown。\n"
-        f"作品设定：{notes or '未提供'}\n当前节点标题：{node.get('title')}\n"
-        f"当前节点摘要：{node.get('summary') or '未填写'}\n作者补充要求：{instruction or '无'}"
+    data = sandbox.get("data") or {}
+    nodes = data.get("nodes") if isinstance(data.get("nodes"), list) else []
+    edges = data.get("edges") if isinstance(data.get("edges"), list) else []
+    by_id = {str(item.get("id")): item for item in nodes if isinstance(item, dict) and item.get("id") is not None}
+    incoming = {str(edge.get("to")): str(edge.get("from")) for edge in edges if isinstance(edge, dict)}
+    path = []
+    cursor = node_id
+    seen = set()
+    while cursor in by_id and cursor not in seen and len(path) < 40:
+        seen.add(cursor)
+        path.append(by_id[cursor])
+        cursor = incoming.get(cursor)
+    path.reverse()
+    context_chapter_id = next(
+        (item.get("chapter_id") for item in reversed(path)
+         if isinstance(item.get("chapter_id"), int) and not isinstance(item.get("chapter_id"), bool)),
+        None,
     )
+    if context_chapter_id is None:
+        work_chapters = db.list_chapters(sandbox["work_id"], uid) or []
+        context_chapter_id = work_chapters[-1]["id"] if work_chapters else None
+    context = context_builder.build_context(
+        uid, "answer_story_question", sandbox["work_id"], context_chapter_id, token_budget=14000,
+    ) or {"context_items": []}
+    confirmed_context = context_builder.render_context(
+        context,
+        {"work_bible", "production_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"},
+    )[:22000]
+    instruction = str(body.get("instruction") or "").strip()[:1000]
+    prompt = {
+        "task": "为小说情节沙盘当前节点生成三个明显不同、可以继续写下去的候选子节点。",
+        "output": [{"title": "短标题", "summary": "可作为章节计划的具体推进", "direction": "发散|收束|推进", "characters": "涉及人物"}],
+        "rules": [
+            "三个方向依次为发散、收束、推进。",
+            "只返回 JSON 数组，不要 Markdown 或解释。",
+            "候选必须遵守 confirmed_world_state，不能把未揭露真相提前写出。",
+            "branch_path 是当前分支已经决定的剧情，不得退回或重复成长。",
+        ],
+        "branch_path": [{"title": item.get("title") or "", "summary": item.get("summary") or "",
+                         "direction": item.get("direction") or "", "chapter_id": item.get("chapter_id")}
+                        for item in path],
+        "confirmed_world_state": confirmed_context,
+        "current_node": {"title": node.get("title") or "", "summary": node.get("summary") or "",
+                         "characters": node.get("characters") or ""},
+        "author_instruction": instruction,
+    }
     try:
         parsed = _parse_json_from_model(llm.chat(
             [{"role": "system", "content": "你是小说策划编辑，候选分支要互有差异且不替作者强行定稿。"},
-             {"role": "user", "content": prompt}],
+             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
             base_url=base_url, api_key=api_key, model=model,
         ))
     except Exception as exc:
@@ -741,7 +777,8 @@ def _production_error(result):
         messages = {
             "invalid_category": "设定卡分类无效", "invalid_name": "设定卡名称不能为空",
             "invalid_scope": "设定卡生效范围无效", "invalid_chapter": "章节不存在",
-            "invalid_location": "地点卡不存在", "invalid_refs": "场景引用格式无效",
+            "invalid_location": "地点卡不存在", "invalid_scene": "请选择属于当前作品的场景",
+            "invalid_refs": "场景引用格式无效",
             "invalid_fields": "自定义字段格式无效", "invalid_layout": "画布布局格式无效",
             "invalid_type": "变化提议类型无效", "invalid_target": "目标卡片不存在",
             "invalid_json": "设定卡结构化数据格式无效", "empty_state": "请填写至少一项状态",
@@ -1135,7 +1172,8 @@ async def get_character_state_proposals(cid: int, request: Request):
 @app.post("/api/chapters/{cid}/character-state-proposals/analyze")
 async def analyze_character_state_proposals(cid: int, request: Request):
     uid = _auth(request)
-    proposals = _generate_character_state_proposals(uid, cid, raise_on_error=True)
+    analysis = _generate_production_analysis(uid, cid, raise_on_error=True)
+    proposals = analysis.get("character_state_proposals") or []
     return {"proposals": proposals}
 
 
@@ -1207,7 +1245,8 @@ async def save_plot_state_version(wid: int, request: Request):
 
 @app.post("/api/chapters/{cid}/plot-state-proposals/analyze")
 async def analyze_plot_state_proposals(cid: int, request: Request):
-    proposal = _generate_plot_state_proposal(_auth(request), cid, raise_on_error=True)
+    analysis = _generate_production_analysis(_auth(request), cid, raise_on_error=True)
+    proposal = analysis.get("plot_state_proposal")
     return {"proposal": proposal}
 
 
@@ -1299,7 +1338,8 @@ async def search_story_memories_api(wid: int, request: Request):
 
 @app.post("/api/chapters/{cid}/story-memories/analyze")
 async def analyze_story_memories(cid: int, request: Request):
-    proposals = _generate_story_memory_proposals(_auth(request), cid, raise_on_error=True)
+    analysis = _generate_production_analysis(_auth(request), cid, raise_on_error=True)
+    proposals = analysis.get("memory_proposals") or []
     return {"proposals": proposals}
 
 
@@ -1951,10 +1991,14 @@ async def apply_edit_proposal(cid: int, request: Request):
     if result.get("invalid"):
         raise HTTPException(400, "改稿预览已经失效")
     # 只有作者确认落稿后才生成状态建议，避免预览阶段产生幽灵剧情记录。
-    character_proposals = _generate_character_state_proposals(uid, cid)
-    plot_proposal = _generate_plot_state_proposal(uid, cid)
-    return {**result, "character_state_proposals": character_proposals,
-            "plot_state_proposal": plot_proposal}
+    analysis = _generate_production_analysis(uid, cid)
+    return {
+        **result,
+        "character_state_proposals": (analysis or {}).get("character_state_proposals") or [],
+        "plot_state_proposal": (analysis or {}).get("plot_state_proposal"),
+        "memory_proposals": (analysis or {}).get("memory_proposals") or [],
+        "production_analysis": analysis,
+    }
 
 
 # ---------- AI 处理 ----------
@@ -2036,17 +2080,16 @@ async def do_process(request: Request):
     seg = None
     if cid and mode in ("转写", "润色", "扩写", "续写", "找回"):
         seg = db.add_segment(cid, uid, seg_raw, result, mode)
-    proposals = []
-    plot_proposal = None
+    world_state = None
     if seg and mode in ("润色", "扩写", "续写", "找回"):
-        proposals = _generate_character_state_proposals(
-            uid, cid, base_url=base_url, api_key=api_key, model=model,
-        )
-        plot_proposal = _generate_plot_state_proposal(
+        world_state = _generate_production_analysis(
             uid, cid, base_url=base_url, api_key=api_key, model=model,
         )
     return {"result": result, "raw": seg_raw, "mode": mode, "content": seg["content"] if seg else None,
-            "character_state_proposals": proposals, "plot_state_proposal": plot_proposal}
+            "character_state_proposals": (world_state or {}).get("character_state_proposals") or [],
+            "plot_state_proposal": (world_state or {}).get("plot_state_proposal"),
+            "memory_proposals": (world_state or {}).get("memory_proposals") or [],
+            "production_analysis": world_state}
 
 
 @app.post("/api/chat")
@@ -2948,7 +2991,11 @@ AGENT_TOOLS = [
             "refs": {"type": "object", "additionalProperties": True}}, "required": ["title"]}}},
     {"type": "function", "function": {
         "name": "analyze_chapter_production",
-        "description": "用当前文字模型分析指定章节的场景和设定变化。场景与普通状态自动记录，新设定和重大变化生成待作者确认项。",
+        "description": "执行指定章节的统一 World State 分析，同时整理剧情、人物、记忆、设定卡和场景。普通动态自动记录，新设定和重大变化生成待作者确认项。",
+        "parameters": {"type": "object", "properties": {"chapter_id": _CHAPTER_ID_PROPERTY}}}},
+    {"type": "function", "function": {
+        "name": "analyze_world_state",
+        "description": "执行指定章节的统一 World State 分析；适用于作者要求更新人物卡、剧情状态、设定、记忆或场景时。一次调用会同步处理这些视图。",
         "parameters": {"type": "object", "properties": {"chapter_id": _CHAPTER_ID_PROPERTY}}}},
     {"type": "function", "function": {
         "name": "web_search",
@@ -2999,8 +3046,9 @@ def _production_evidence_span(content, evidence):
     return (start, start + len(evidence)) if start >= 0 else (None, None)
 
 
-def _generate_production_analysis(uid, cid, *, raise_on_error=False):
-    """Analyze scenes and state changes in one model call; major facts remain author proposals."""
+def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, model=None,
+                                  raise_on_error=False):
+    """Run the canonical World State pass and persist every derived chapter view once."""
     chapter = db.get_chapter_meta(cid, uid) if cid else None
     if not chapter:
         if raise_on_error:
@@ -3011,34 +3059,46 @@ def _generate_production_analysis(uid, cid, *, raise_on_error=False):
         if raise_on_error:
             raise HTTPException(400, "本章为空，无法分析生产画布")
         return None
+    source_content_hash = chapter.get("content_hash") or ""
     settings = db.get_settings(uid) or {}
-    base_url = settings.get("llm_base_url") or config.LLM_BASE_URL
-    api_key = settings.get("llm_api_key") or config.LLM_API_KEY
-    model = settings.get("llm_model") or config.LLM_MODEL
+    base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
+    api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
+    model = model or settings.get("llm_model") or config.LLM_MODEL
     if not api_key:
         if raise_on_error:
             raise HTTPException(500, "未配置 API Key，无法分析生产画布")
         return None
     work_settings = db.get_production_settings(chapter["work_id"], uid) or {}
     evidence_enabled = work_settings.get("evidence_enabled", True)
-    cards = db.list_production_cards(chapter["work_id"], uid, cid, before=True, include_pending=False) or []
-    characters = db.list_character_cards(chapter["work_id"], uid, cid, before=True) or []
+    cards = db.list_production_cards(chapter["work_id"], uid, cid, include_pending=False) or []
+    characters = db.list_character_cards(chapter["work_id"], uid, cid) or []
+    plot_overview = db.get_plot_state_overview(chapter["work_id"], uid, cid) or {}
+    plot_before = _short_plot_state(plot_overview.get("current_state"))
     compact_cards = [{
         "id": item["id"], "category": item["category"], "name": item["name"],
-        "summary": item.get("summary") or "", "detail": (item.get("detail") or "")[:2000],
+        "summary": (item.get("summary") or "")[:600], "detail": (item.get("detail") or "")[:800],
         "attributes": item.get("attributes") or {}, "truth": item.get("truth") or {},
         "current_state": (item.get("current_state") or {}).get("state") or {},
-    } for item in cards[:120]]
+    } for item in cards[:80]]
     compact_characters = [{
-        "id": item["id"], "name": item["name"], "summary": item.get("summary") or "",
+        "id": item["id"], "name": item["name"], "summary": (item.get("summary") or "")[:600],
         "current_state": item.get("current_state") or {},
-    } for item in characters[:100]]
+    } for item in characters[:80]]
     base_context = context_builder.build_context(
-        uid, "chapter_review", chapter["work_id"], cid, token_budget=16000,
+        uid, "analyze_world_state", chapter["work_id"], cid, token_budget=16000,
     ) or {"context_items": []}
     prompt = {
-        "task": "把当前小说章节整理成创作生产画布：划分有戏剧意义的场景，并识别本章造成的状态变化。",
+        "task": "对当前小说章节执行一次完整 World State 分析。一次性返回剧情、人物、故事记忆、设定卡变化和场景结构，所有结果必须来自同一份正文与同一时点。",
         "output": {
+            "plot": {
+                "state": {field: "" for field in db.PLOT_STATE_FIELDS},
+                "change_summary": "一句话概括本章推进", "evidence": "正文中的短事实依据",
+            },
+            "memories": [{
+                "memory_type": "event|fact|knowledge|relationship_change|item_change|location_change|ability_change|world_rule|promise|secret",
+                "entity_ids": [1], "entity_names": ["可选实体名"], "title": "短标题",
+                "content": "截至本章结束仍成立的事实", "evidence": "正文短证据", "importance": 1,
+            }],
             "scenes": [{
                 "title": "场景短标题", "summary": "发生了什么", "time_label": "时间",
                 "location_card_id": None, "goal": "人物/剧情目标", "conflict": "阻力",
@@ -3060,11 +3120,14 @@ def _generate_production_analysis(uid, cid, *, raise_on_error=False):
         },
         "rules": [
             "只返回 JSON 对象，不要 Markdown 或解释。",
+            "plot.state 和人物 state 必须是截至本章结束的完整状态；仍成立的旧事实必须保留。",
+            "memories 只记录会影响后续写作的明确事实；宁缺毋滥，同一事实不要拆成重复项目。",
             "场景按正文顺序排列；不要按自然段机械切分，地点、目标或冲突明显变化时才分场。",
             "只记录本章正文明确支持的变化，不预测后续，不把临时动作误写成长期设定。",
             "已存在卡片必须填写 target_id；正文首次出现且确有后续价值的规则、地点、技能、道具或组织才用 new_card。",
             "普通变化仅指位置、持有状态、熟练度、短期可逆状态；新卡、死亡、能力获得/失去、规则真相、归属永久变化均为 major。",
             "after 对 new_card 使用 name/summary/detail/attributes/truth/reader_state；对 card_state 使用 state 对象。",
+            "设定卡随章节变化的读者已知、人物认知、保密边界、读者侧状态分别写入 state 的 _reader_known、_character_knowledge、_secrecy、_reader_state，不要用后期信息覆盖早期时点。",
             "人物 state 必须给出截至本章结束的完整状态，未变化字段沿用 known_characters 的 current_state。",
             "truth 可区分 objective、reader_known、character_knowledge、secrecy；不得提前打破 secrecy。",
             ("每条场景和变化都提供能在正文中逐字找到的短证据。" if evidence_enabled
@@ -3072,15 +3135,16 @@ def _generate_production_analysis(uid, cid, *, raise_on_error=False):
         ],
         "known_cards": compact_cards,
         "known_characters": compact_characters,
+        "confirmed_plot_state": plot_before,
         "confirmed_context": context_builder.render_context(
             base_context, {"work_bible", "plot_state", "relationships", "memory", "chapter_summary"}
-        )[:22000],
+        )[:16000],
         "chapter": {"id": cid, "title": chapter["title"], "notes": chapter.get("notes") or "",
-                    "content": content[-40000:]},
+                    "content": content[-30000:]},
     }
     try:
         parsed = _parse_json_from_model(llm.chat([
-            {"role": "system", "content": "你是长篇小说的连续性编辑和场景制片。输出必须是严格 JSON。"},
+            {"role": "system", "content": "你是长篇小说的 World State 连续性编辑。一次分析必须让剧情、人物、设定、记忆和场景彼此一致；输出严格 JSON。"},
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ], base_url=base_url, api_key=api_key, model=model))
     except Exception as exc:
@@ -3091,6 +3155,13 @@ def _generate_production_analysis(uid, cid, *, raise_on_error=False):
         if raise_on_error:
             raise HTTPException(502, "生产画布分析没有返回有效 JSON")
         return None
+    current = db.get_chapter_meta(cid, uid)
+    if not current or (current.get("content_hash") or "") != source_content_hash:
+        if raise_on_error:
+            raise HTTPException(409, "分析期间正文已变化，本轮结果未保存，请重新分析")
+        return {"ok": False, "stale": True, "chapter_id": cid, "scene_count": 0,
+                "changes": [], "character_changes": [], "memory_proposals": [],
+                "plot_state_proposal": None}
     scenes = parsed.get("scenes") if isinstance(parsed.get("scenes"), list) else []
     clean_scenes = []
     for raw in scenes[:40]:
@@ -3122,25 +3193,64 @@ def _generate_production_analysis(uid, cid, *, raise_on_error=False):
     character_results = []
     known_character_ids = {item["id"] for item in characters}
     for raw in (parsed.get("character_changes") if isinstance(parsed.get("character_changes"), list) else [])[:40]:
-        if not isinstance(raw, dict) or raw.get("entity_id") not in known_character_ids:
+        if not isinstance(raw, dict):
+            continue
+        entity_id = raw.get("entity_id")
+        if isinstance(entity_id, str) and entity_id.isdigit():
+            entity_id = int(entity_id)
+        if entity_id not in known_character_ids:
+            continue
+        known_character = next(item for item in characters if item["id"] == entity_id)
+        before = _short_character_state(known_character.get("current_state"))
+        state = db.normalize_character_state(raw.get("state"), before)
+        summary = str(raw.get("change_summary") or "").strip()
+        if state == before or not db.character_state_has_content(state) or not summary:
             continue
         evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
         if raw.get("severity") == "ordinary":
             saved = db.create_character_state_version(
-                raw["entity_id"], uid, cid, raw.get("state"), raw.get("change_summary", ""), evidence, source="ai",
+                entity_id, uid, cid, state, summary, evidence, source="ai",
             )
             kind = "version"
         else:
             saved = db.upsert_character_state_proposal(
-                raw["entity_id"], uid, cid, raw.get("state"), raw.get("change_summary", ""), evidence,
+                entity_id, uid, cid, state, summary, evidence,
             )
             kind = "proposal"
         if saved and not saved.get("empty_state"):
             character_results.append({"kind": kind, "item": saved})
+    plot_proposal = None
+    plot_raw = parsed.get("plot") if isinstance(parsed.get("plot"), dict) else parsed.get("plot_state")
+    if isinstance(plot_raw, dict):
+        raw_state = plot_raw.get("state") if isinstance(plot_raw.get("state"), dict) else {
+            field: plot_raw.get(field, "") for field in db.PLOT_STATE_FIELDS
+        }
+        plot_state = db.normalize_plot_state(raw_state, plot_before)
+        plot_summary = str(plot_raw.get("change_summary") or "").strip()
+        if plot_summary and plot_state != plot_before and db.plot_state_has_content(plot_state):
+            plot_proposal = db.upsert_plot_state_proposal(
+                chapter["work_id"], uid, cid, plot_state, plot_summary,
+                str(plot_raw.get("evidence") or "") if evidence_enabled else "",
+            )
+            if plot_proposal and plot_proposal.get("empty_state"):
+                plot_proposal = None
+    memory_proposals = []
+    memory_items = parsed.get("memories") if isinstance(parsed.get("memories"), list) else parsed.get("memory_items")
+    for item in memory_items[:24] if isinstance(memory_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if not evidence_enabled:
+            item = {**item, "evidence": ""}
+        saved = db.upsert_story_memory_proposal(chapter["work_id"], uid, cid, item)
+        if saved and not saved.get("invalid") and not saved.get("invalid_type"):
+            memory_proposals.append(saved)
     db.mark_production_analysis_current(cid, uid)
     return {
         "ok": True, "model": model, "scene_count": len(clean_scenes),
         "changes": saved_changes, "character_changes": character_results,
+        "character_state_proposals": [item["item"] for item in character_results if item["kind"] == "proposal"],
+        "plot_state_proposal": plot_proposal, "memory_proposals": memory_proposals,
+        "source_content_hash": source_content_hash,
         "production": db.get_chapter_production(cid, uid),
     }
 
@@ -3509,16 +3619,12 @@ def _run_chapter_review(uid, cid, *, base_url=None, api_key=None, model=None, ra
     summary = parsed.get("summary") if isinstance(parsed.get("summary"), str) else ""
     alerts = db.replace_chapter_consistency_alerts(cid, uid, parsed.get("alerts") or [])
     workflow = db.update_chapter_workflow(cid, uid, status="review", summary=summary, checked=True)
-    character_state_proposals = _generate_character_state_proposals(
+    production_analysis = _generate_production_analysis(
         uid, cid, base_url=base_url, api_key=api_key, model=model,
     )
-    plot_state_proposal = _generate_plot_state_proposal(
-        uid, cid, base_url=base_url, api_key=api_key, model=model,
-    )
-    memory_proposals = _generate_story_memory_proposals(
-        uid, cid, base_url=base_url, api_key=api_key, model=model,
-    )
-    production_analysis = _generate_production_analysis(uid, cid)
+    character_state_proposals = (production_analysis or {}).get("character_state_proposals") or []
+    plot_state_proposal = (production_analysis or {}).get("plot_state_proposal")
+    memory_proposals = (production_analysis or {}).get("memory_proposals") or []
     analysis = db.mark_chapter_analysis_reviewed(cid, uid)
     return {
         "workflow": workflow,
@@ -3681,7 +3787,8 @@ def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
         "已有章节整章写入可用 write_chapter。不要人为限制每次只能处理一章；"
         "11) 规则、地点、技能、道具和组织属于生产设定卡，使用 list_story_cards、save_story_card "
         "和 save_story_card_state 读写；章节场景使用 list_chapter_scenes、save_chapter_scene。"
-        "新设定或重大剧情变化应先通过 analyze_chapter_production 形成作者待确认项，不能默认为既定事实；"
+        "正文变更后使用 analyze_world_state 可一次更新剧情、人物、记忆、设定卡和场景；"
+        "新设定或重大剧情变化只形成作者待确认项，不能默认为既定事实；"
         "12) 回答简洁，做完事说一句即可。"
     ]
     if cid:
@@ -4189,6 +4296,8 @@ def _tool_save_story_card(uid, cid, cfg, args):
         "category", "name", "summary", "detail", "attributes", "truth", "reader_state",
         "scope_type", "scope_start_chapter_id", "scope_end_chapter_id",
     ) if key in args}
+    if card_id is None and isinstance(cid, int) and not isinstance(cid, bool):
+        values["source_chapter_id"] = cid
     saved = db.save_production_card(work_id, uid, values, card_id)
     if not saved or saved.get("invalid_category") or saved.get("invalid_name") or saved.get("invalid_scope"):
         return _agent_err("设定卡数据无效，未保存")
@@ -4251,9 +4360,13 @@ def _tool_analyze_chapter_production(uid, cid, cfg, args):
     if not result:
         return _agent_err("生产画布分析失败，请检查正文和模型设置")
     return {"changed": False, "production_dirty": True,
-            "summary": f"已分析《{chapter['title']}》：{result['scene_count']} 个场景，"
-                       f"{len(result['changes'])} 项设定变化",
-            "scene_count": result["scene_count"], "changes": result["changes"]}
+            "summary": f"已完成《{chapter['title']}》的 World State 分析：{result['scene_count']} 个场景，"
+                       f"{len(result['changes'])} 项设定变化，"
+                       f"{len(result.get('character_changes') or [])} 项人物变化",
+            "scene_count": result["scene_count"], "changes": result["changes"],
+            "character_changes": result.get("character_changes") or [],
+            "plot_state_proposal": result.get("plot_state_proposal"),
+            "memory_proposals": result.get("memory_proposals") or []}
 
 
 def _tool_list_revisions(uid, cid, cfg, args):
@@ -4545,11 +4658,13 @@ def _tool_get_memory_source(uid, cid, cfg, args):
 def _tool_analyze_chapter_memory(uid, cid, cfg, args):
     if not _current_story_work(uid, cid):
         return _agent_err("当前没有可用章节")
-    proposals = _generate_story_memory_proposals(
+    analysis = _generate_production_analysis(
         uid, cid, base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
     )
+    proposals = (analysis or {}).get("memory_proposals") or []
     return {"changed": False, "proposals": _memory_tool_rows(proposals),
-            "summary": f"已生成 {len(proposals)} 条待确认故事记忆"}
+            "production_dirty": True,
+            "summary": f"已完成统一 World State 分析，并生成 {len(proposals)} 条待确认故事记忆"}
 
 
 def _tool_accept_memory_proposal(uid, cid, cfg, args):
@@ -4790,6 +4905,7 @@ _AGENT_TOOLS = {
     "save_story_card_state": _tool_save_story_card_state,
     "list_chapter_scenes": _tool_list_chapter_scenes, "save_chapter_scene": _tool_save_chapter_scene,
     "analyze_chapter_production": _tool_analyze_chapter_production,
+    "analyze_world_state": _tool_analyze_chapter_production,
     "web_search": _tool_web_search,
 }
 
@@ -5024,7 +5140,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
         raise HTTPException(500, "未配置 API Key，请在设置里填写 base_url / key / 模型")
     cfg = {
         "base_url": base_url, "api_key": api_key, "model": model, "active_skill_ids": set(),
-        "character_state_dirty": False, "character_state_chapter_id": cid,
+        "world_state_dirty_chapter_ids": [],
         "turn_audio": audio, "work_id": work_id,
     }
     conv = (
@@ -5078,9 +5194,9 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
         result.pop("_resource_truncated", None)
         state_chapter_id = result.pop("_character_state_chapter_id", None)
         if result.pop("_character_state_dirty", False):
-            cfg["character_state_dirty"] = True
             if isinstance(state_chapter_id, int) and not isinstance(state_chapter_id, bool):
-                cfg["character_state_chapter_id"] = state_chapter_id
+                if state_chapter_id not in cfg["world_state_dirty_chapter_ids"]:
+                    cfg["world_state_dirty_chapter_ids"].append(state_chapter_id)
         if skill_system:
             additions.append(skill_system)
             cfg["skill_instructions"] = ((cfg.get("skill_instructions") or "") + "\n\n" + skill_system).strip()
@@ -5142,11 +5258,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
             pass
 
     display_messages = _pi_messages_for_frontend(raw_messages)
-    state_chapter_id = cfg.get("character_state_chapter_id")
-    state_request = (
-        {"chapter_id": state_chapter_id, "base_url": base_url, "api_key": api_key, "model": model}
-        if state_chapter_id and cfg.get("character_state_dirty") else None
-    )
+    state_requests = _world_state_requests(cfg, base_url, api_key, model, uid)
     if persist:
         saved = db.save_conversation(
             uid, cid, raw_messages, summary, session_id=session_id, work_id=work_id,
@@ -5161,8 +5273,8 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
             "temporary": not retain_history, "context_usage": context_usage,
             "conversation_summary": summary if retain_history else "",
         }
-        if state_request:
-            result["_character_state_request"] = state_request
+        if state_requests:
+            result["_world_state_requests"] = state_requests
         return result
     return {
         "reply": reply, "messages": display_messages, "compacted": compacted,
@@ -5174,7 +5286,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
             "work_id": work_id, "retain_history": retain_history, "title_hint": history_text,
             "model": model,
         },
-        "_character_state_request": state_request,
+        "_world_state_requests": state_requests,
     }
 
 
@@ -5205,7 +5317,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
                 break
     cfg = {
         "base_url": base_url, "api_key": api_key, "model": model, "active_skill_ids": set(),
-        "character_state_dirty": False, "character_state_chapter_id": cid,
+        "world_state_dirty_chapter_ids": [],
         "turn_audio": turn_audio, "work_id": work_id,
     }
 
@@ -5318,9 +5430,9 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
             result.pop("_resource_truncated", None) if isinstance(result, dict) else None
             state_chapter_id = result.pop("_character_state_chapter_id", None) if isinstance(result, dict) else None
             if isinstance(result, dict) and result.pop("_character_state_dirty", False):
-                cfg["character_state_dirty"] = True
                 if isinstance(state_chapter_id, int) and not isinstance(state_chapter_id, bool):
-                    cfg["character_state_chapter_id"] = state_chapter_id
+                    if state_chapter_id not in cfg["world_state_dirty_chapter_ids"]:
+                        cfg["world_state_dirty_chapter_ids"].append(state_chapter_id)
             tm = {"role": "tool", "tool_call_id": tc.id,
                   "content": json.dumps(result, ensure_ascii=False)}
             messages.append(tm)
@@ -5345,11 +5457,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
         except Exception:
             pass
 
-    state_chapter_id = cfg.get("character_state_chapter_id")
-    state_request = (
-        {"chapter_id": state_chapter_id, "base_url": base_url, "api_key": api_key, "model": model}
-        if state_chapter_id and cfg.get("character_state_dirty") else None
-    )
+    state_requests = _world_state_requests(cfg, base_url, api_key, model, uid)
     if persist:
         saved = db.save_conversation(
             uid, cid, msgs, summary, session_id=session_id, work_id=work_id,
@@ -5364,8 +5472,8 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
             "temporary": not retain_history, "context_usage": context_usage,
             "conversation_summary": summary if retain_history else "",
         }
-        if state_request:
-            result["_character_state_request"] = state_request
+        if state_requests:
+            result["_world_state_requests"] = state_requests
         return result
     return {
         "reply": reply, "messages": msgs, "compacted": compacted,
@@ -5377,7 +5485,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
             "work_id": work_id, "retain_history": retain_history, "title_hint": history_text,
             "model": model,
         },
-        "_character_state_request": state_request,
+        "_world_state_requests": state_requests,
     }
 
 
@@ -5395,20 +5503,50 @@ def _runtime_request_payload(uid, cid, history_text, selection, session_id=None,
     }
 
 
-def _apply_story_update_proposals(uid, state_request):
-    if not state_request:
-        return [], None, [], None
-    kwargs = {
-        "base_url": state_request["base_url"],
-        "api_key": state_request["api_key"],
-        "model": state_request["model"],
+def _world_state_requests(cfg, base_url, api_key, model, uid):
+    """Build a stable, chapter-ordered queue for every chapter changed in this turn."""
+    items = []
+    seen = set()
+    for chapter_id in cfg.get("world_state_dirty_chapter_ids") or []:
+        if chapter_id in seen:
+            continue
+        chapter = db.get_chapter_meta(chapter_id, uid)
+        if not chapter:
+            continue
+        seen.add(chapter_id)
+        items.append((chapter.get("ord") or 0, chapter_id))
+    return [{"chapter_id": chapter_id, "base_url": base_url, "api_key": api_key, "model": model}
+            for _, chapter_id in sorted(items)]
+
+
+def _apply_story_update_proposals(uid, state_requests):
+    requests = state_requests if isinstance(state_requests, list) else [state_requests] if state_requests else []
+    analyses = []
+    character_proposals = []
+    plot_proposals = []
+    memory_proposals = []
+    for request in requests:
+        if not isinstance(request, dict) or not request.get("chapter_id"):
+            continue
+        analysis = _generate_production_analysis(
+            uid, request["chapter_id"], base_url=request.get("base_url"),
+            api_key=request.get("api_key"), model=request.get("model"),
+        )
+        if not analysis:
+            continue
+        analyses.append({"chapter_id": request["chapter_id"], **analysis})
+        character_proposals.extend(analysis.get("character_state_proposals") or [])
+        if analysis.get("plot_state_proposal"):
+            plot_proposals.append(analysis["plot_state_proposal"])
+        memory_proposals.extend(analysis.get("memory_proposals") or [])
+    return {
+        "world_state_updates": analyses,
+        "character_state_proposals": character_proposals,
+        "plot_state_proposal": plot_proposals[-1] if plot_proposals else None,
+        "plot_state_proposals": plot_proposals,
+        "memory_proposals": memory_proposals,
+        "production_analysis": analyses[-1] if analyses else None,
     }
-    return (
-        _generate_character_state_proposals(uid, state_request["chapter_id"], **kwargs),
-        _generate_plot_state_proposal(uid, state_request["chapter_id"], **kwargs),
-        _generate_story_memory_proposals(uid, state_request["chapter_id"], **kwargs),
-        _generate_production_analysis(uid, state_request["chapter_id"]),
-    )
 
 
 def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
@@ -5474,15 +5612,11 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
         raise
 
     # 人物状态提取要等主回复/本机回合已确认后再落库，避免失败回合留下幽灵状态。
-    state_request = result.pop("_character_state_request", None)
+    state_requests = result.pop("_world_state_requests", None)
     if not turn:
-        if state_request:
-            emit({"type": "status", "stage": "story_state", "message": "正在整理人物与剧情状态"})
-            character_proposals, plot_proposal, memory_proposals, production_analysis = _apply_story_update_proposals(uid, state_request)
-            result["character_state_proposals"] = character_proposals
-            result["plot_state_proposal"] = plot_proposal
-            result["memory_proposals"] = memory_proposals
-            result["production_analysis"] = production_analysis
+        if state_requests:
+            emit({"type": "status", "stage": "story_state", "message": "正在按章节整理统一 World State"})
+            result.update(_apply_story_update_proposals(uid, state_requests))
         return result
 
     pending = result.pop("_pending_conversation")
@@ -5516,13 +5650,9 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
     result["session_title"] = saved["title"] if saved else "临时一问"
     result["temporary"] = not retain_history
     result["conversation_summary"] = pending.get("summary") if retain_history else ""
-    if state_request:
-        emit({"type": "status", "stage": "story_state", "message": "正在整理人物与剧情状态"})
-        character_proposals, plot_proposal, memory_proposals, production_analysis = _apply_story_update_proposals(uid, state_request)
-        result["character_state_proposals"] = character_proposals
-        result["plot_state_proposal"] = plot_proposal
-        result["memory_proposals"] = memory_proposals
-        result["production_analysis"] = production_analysis
+    if state_requests:
+        emit({"type": "status", "stage": "story_state", "message": "正在按章节整理统一 World State"})
+        result.update(_apply_story_update_proposals(uid, state_requests))
     return result
 
 

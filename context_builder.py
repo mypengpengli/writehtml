@@ -16,6 +16,7 @@ TASK_LABELS = {
     "extract_character_state": "人物状态提取",
     "extract_plot_state": "剧情状态提取",
     "analyze_production": "生产画布分析",
+    "analyze_world_state": "统一 World State 分析",
     "answer_story_question": "故事问答",
 }
 

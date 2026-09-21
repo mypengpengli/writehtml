@@ -82,6 +82,7 @@ let productionResourceCategory = "all";
 let productionSelected = null;
 let productionLayoutTimer = null;
 let productionInspectorSaveTimer = null;
+let productionInspectorSaving = false;
 let productionZoom = 1;
 
 /* ---------- 图标（内联 SVG，Lucide 风格 24×24 描边） ---------- */
@@ -1701,9 +1702,16 @@ async function adoptSandboxNode() {
   const node = selectedSandboxNode(); if (!node || node.chapter_id) return;
   try {
     const chapter = await api(`/api/works/${currentWorkId}/chapters`, { body: { title: node.title || "沙盘章节" } });
+    const path = sandboxExportMarkdown(node.id);
+    const notes = [node.summary, node.characters ? `涉及人物：${node.characters}` : "", path]
+      .filter(Boolean).join("\n\n");
+    await api(`/api/chapters/${chapter.id}`, { method: "PUT", body: { notes } });
+    await api(`/api/chapters/${chapter.id}/workflow`, { method: "PUT", body: {
+      status: "planning", goal: node.summary || node.title || "完善本章计划", summary: node.summary || "",
+    }});
     node.chapter_id = chapter.id; node.kind = "chapter";
     await saveOutlineSandbox(false); await loadChapters(); renderOutlineSandbox(); renderSandboxInspector();
-    showToast("已采纳为正文章节，沙盘草案仍保留", "ok");
+    showToast("已采纳为正文章节，节点摘要和分支计划已带入", "ok");
   } catch (e) { showToast(e.message, "err"); }
 }
 async function openSandboxChapter() {
@@ -4746,10 +4754,9 @@ async function maybePromptProductionAnalysis() {
 }
 
 async function closeProductionCanvas() {
-  clearTimeout(productionInspectorSaveTimer);
+  await closeProductionInspector();
   await maybePromptProductionAnalysis();
   $("app").classList.remove("production-open");
-  closeProductionInspector();
   clearProductionAgentTarget();
   if (currentChapterId) await loadChapter();
 }
@@ -4757,7 +4764,7 @@ async function closeProductionCanvas() {
 async function showProductionOverview() {
   if (productionMode === "chapter") await maybePromptProductionAnalysis();
   productionMode = "overview";
-  closeProductionInspector();
+  await closeProductionInspector();
   syncProductionHeader();
   await loadProductionOverview();
 }
@@ -4774,10 +4781,10 @@ async function changeProductionChapter(value) {
   const next = +value;
   if (!next || next === productionChapterId) return;
   await maybePromptProductionAnalysis();
+  await closeProductionInspector();
   productionChapterId = next;
   if (currentChapterId !== next) await selectChapter(next);
   productionMode = "chapter";
-  closeProductionInspector();
   syncProductionHeader();
   await loadProductionChapter();
 }
@@ -4820,6 +4827,14 @@ async function loadProductionChapter() {
   setProductionLoading(true);
   try {
     productionChapterData = await api(`/api/chapters/${productionChapterId}/production`, { method: "GET" });
+    const layoutDraftKey = `productionLayoutDraft:${currentUsername || "user"}:${currentWorkId}:${productionChapterId}`;
+    try {
+      const draft = JSON.parse(localStorage.getItem(layoutDraftKey) || "null");
+      if (draft?.layout && (!productionChapterData.layout?.updated_at || draft.saved_at / 1000 > productionChapterData.layout.updated_at)) {
+        productionChapterData.layout = { ...(productionChapterData.layout || {}), layout: draft.layout };
+        $("productionSaveStatus").textContent = "已恢复本机布局";
+      }
+    } catch (e) { /* ignore malformed local draft */ }
     productionCards = productionChapterData.after?.cards || [];
     syncProductionSettings(productionChapterData.settings || {});
     renderProductionResources();
@@ -4918,8 +4933,12 @@ function renderProductionResources() {
 
 function productionStateBrief(state) {
   if (!state || typeof state !== "object") return "暂无状态";
-  return Object.entries(state).filter(([, value]) => value != null && String(value).trim())
+  return Object.entries(state).filter(([key, value]) => !key.startsWith("_") && value != null && String(value).trim())
     .slice(0, 4).map(([key, value]) => `${productionStateLabels[key] || key}：${value}`).join("；") || "暂无状态";
+}
+
+function productionPublicState(state) {
+  return Object.fromEntries(Object.entries(state || {}).filter(([key]) => !key.startsWith("_")));
 }
 
 function productionRelatedCharacters(data) {
@@ -4940,6 +4959,42 @@ function productionRelatedCards(data) {
   const all = data.after?.cards || [];
   const related = all.filter(item => ids.has(item.id) || item.related);
   return related.length ? related : all.filter(item => item.category !== "rule").slice(0, 8);
+}
+
+function productionStateDiffs(data) {
+  const rows = [];
+  const knowledgeLabels = {
+    _reader_known: "读者已知", _character_knowledge: "人物认知",
+    _secrecy: "保密边界", _reader_state: "读者侧状态",
+  };
+  const collect = (kind, beforeItems, afterItems, stateOf) => {
+    const beforeById = new Map((beforeItems || []).map(item => [item.id, item]));
+    (afterItems || []).forEach(item => {
+      const before = stateOf(beforeById.get(item.id)) || {};
+      const after = stateOf(item) || {};
+      const changes = [];
+      new Set([...Object.keys(before), ...Object.keys(after)]).forEach(key => {
+        const oldValue = before[key] == null ? "" : String(before[key]);
+        const newValue = after[key] == null ? "" : String(after[key]);
+        if (oldValue === newValue) return;
+        changes.push({ label: knowledgeLabels[key] || productionStateLabels[key] || key,
+          before: oldValue || "未记录", after: newValue || "已清除" });
+      });
+      if (changes.length) rows.push({ kind, id: item.id, name: item.name, changes });
+    });
+  };
+  collect("character", data.before?.characters, data.after?.characters, item => item?.current_state);
+  collect("card", data.before?.cards, data.after?.cards, item => item?.current_state?.state);
+  return rows;
+}
+
+function productionDiffRows(data) {
+  return productionStateDiffs(data).map(item => `
+    <button class="production-node-row production-diff-row" onclick="${item.kind === "character" ? `inspectProductionCharacter(${item.id},'after')` : `inspectProductionCard(${item.id},'after')`}">
+      <span>${svg(item.kind === "character" ? "users" : "refresh")}</span>
+      <span class="production-node-row-copy"><b>${esc(item.name)}</b>${item.changes.slice(0, 4).map(change =>
+        `<small><strong>${esc(change.label)}</strong>：${esc(change.before)} → ${esc(change.after)}</small>`).join("")}</span>
+    </button>`).join("");
 }
 
 function productionNodeRow({ icon = "book", title, summary, onclick = "", extra = "" }) {
@@ -4980,6 +5035,7 @@ function renderProductionCanvas() {
   const afterCards = productionRelatedCards(data);
   const proposals = (data.proposals || []).filter(item => item.status === "pending" || item.is_stale);
   const impacts = data.impacts || [];
+  const confirmedDiffRows = productionDiffRows(data);
   const beforeRows = [
     ...beforeCharacters.slice(0, 8).map(item => productionNodeRow({
       icon: "users", title: item.name, summary: productionStateBrief(item.current_state),
@@ -5045,8 +5101,8 @@ function renderProductionCanvas() {
       <div class="production-node-body">${sceneRows || `<div class="production-empty">${svg("nodes")}<span>可手动新增，或点“分析本章”自动整理</span></div>`}<button class="production-add-row" onclick="newProductionScene()">${svg("plus")} 新增场景</button></div>
     </section>
     <section class="production-node changes" data-node="changes" style="${productionNodeStyle("changes", layout)}">
-      <div class="production-node-head"><span class="production-node-title"><span>${svg("sparkles")}</span><div><b>待确认变化</b><small>${proposals.length} 项提议 · ${impacts.length} 项影响</small></div></span></div>
-      <div class="production-node-body">${impactRows}${proposalRows || (!impactRows ? `<div class="production-empty"><span>没有待处理变化</span></div>` : "")}</div>
+      <div class="production-node-head"><span class="production-node-title"><span>${svg("sparkles")}</span><div><b>本章变化</b><small>${productionStateDiffs(data).length} 项已记录 · ${proposals.length} 项待确认</small></div></span></div>
+      <div class="production-node-body">${confirmedDiffRows}${impactRows}${proposalRows || (!confirmedDiffRows && !impactRows ? `<div class="production-empty"><span>本章暂无状态变化</span></div>` : "")}</div>
     </section>
     <section class="production-node after" data-node="after" style="${productionNodeStyle("after", layout)}">
       <div class="production-node-head"><span class="production-node-title"><span>${svg("check")}</span><div><b>章后状态</b><small>截至本章结束</small></div></span></div>
@@ -5104,14 +5160,19 @@ function initProductionNodeDrag() {
 
 function queueProductionLayoutSave() {
   clearTimeout(productionLayoutTimer);
-  $("productionSaveStatus").textContent = "布局未保存";
+  const workId = currentWorkId, chapterId = productionChapterId, layout = productionLayout();
+  const key = `productionLayoutDraft:${currentUsername || "user"}:${workId}:${chapterId}`;
+  localStorage.setItem(key, JSON.stringify({ layout, saved_at: Date.now() }));
+  $("productionSaveStatus").textContent = "布局已本机暂存";
   productionLayoutTimer = setTimeout(async () => {
     try {
-      await api(`/api/works/${currentWorkId}/production/layout`, { method: "PUT", body: {
-        chapter_id: productionChapterId, layout: productionLayout(),
+      const saved = await api(`/api/works/${workId}/production/layout`, { method: "PUT", body: {
+        chapter_id: chapterId, layout,
       }});
-      $("productionSaveStatus").textContent = "布局已保存";
-    } catch (e) { $("productionSaveStatus").textContent = "布局保存失败"; }
+      if (productionChapterData && productionChapterId === chapterId) productionChapterData.layout = saved;
+      localStorage.removeItem(key);
+      $("productionSaveStatus").textContent = "布局已同步";
+    } catch (e) { $("productionSaveStatus").textContent = "布局同步失败，草稿仍在本机"; }
   }, 500);
 }
 
@@ -5176,8 +5237,66 @@ function openProductionAI() {
   $("agentInput").focus();
 }
 
-function closeProductionInspector() {
+function productionDraftKey(selection = productionSelected) {
+  if (!selection || !currentWorkId) return "";
+  const item = selection.item || {};
+  const identity = item.id || `new-${item.category || "item"}`;
+  return `productionDraft:${currentUsername || "user"}:${currentWorkId}:${productionChapterId || 0}:${selection.type}:${selection.point || "after"}:${identity}`;
+}
+
+function stashProductionInspectorDraft() {
+  const key = productionDraftKey();
+  const form = $("productionInspectorBody")?.querySelector(".production-inspector-form");
+  if (!key || !form || !["card", "scene"].includes(productionSelected?.type)) return;
+  const values = {};
+  form.querySelectorAll("input[id],textarea[id],select[id]").forEach(input => {
+    values[input.id] = input.type === "checkbox" ? input.checked : input.value;
+  });
+  localStorage.setItem(key, JSON.stringify({ values, saved_at: Date.now() }));
+}
+
+function restoreProductionInspectorDraft() {
+  const key = productionDraftKey();
+  if (!key) return;
+  let draft = null;
+  try { draft = JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { draft = null; }
+  if (!draft?.values) return;
+  Object.entries(draft.values).forEach(([id, value]) => {
+    const input = $(id);
+    if (!input) return;
+    if (input.type === "checkbox") input.checked = !!value;
+    else input.value = value == null ? "" : value;
+  });
+  $("productionSaveStatus").textContent = "已恢复本机草稿";
+}
+
+function clearProductionInspectorDraft(key = productionDraftKey()) {
+  if (key) localStorage.removeItem(key);
+}
+
+function markProductionInspectorDraft() {
+  stashProductionInspectorDraft();
+  if ($("productionSaveStatus")) $("productionSaveStatus").textContent = "已本机暂存";
+}
+
+window.addEventListener("pagehide", stashProductionInspectorDraft);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") stashProductionInspectorDraft();
+});
+
+async function closeProductionInspector(options = {}) {
+  const { flush = true, discard = false } = options;
+  const selection = productionSelected;
+  const shouldFlush = !!productionInspectorSaveTimer && !!productionSelected?.item?.id;
+  if (!discard) stashProductionInspectorDraft();
   clearTimeout(productionInspectorSaveTimer);
+  productionInspectorSaveTimer = null;
+  while (productionInspectorSaving) await new Promise(resolve => setTimeout(resolve, 30));
+  if (flush && shouldFlush && productionSelected === selection) {
+    if (productionSelected?.type === "card") await saveProductionCardFromInspector(true);
+    else if (productionSelected?.type === "scene") await saveProductionSceneFromInspector(true);
+  }
+  if (discard) clearProductionInspectorDraft(productionDraftKey(selection));
   $("productionWorkspace")?.classList.remove("inspector-open");
   productionSelected = null;
   renderProductionResources();
@@ -5188,6 +5307,7 @@ function openProductionInspector(title, meta, html) {
   $("productionInspectorMeta").textContent = meta || "";
   $("productionInspectorBody").innerHTML = html;
   $("productionWorkspace").classList.add("inspector-open");
+  restoreProductionInspectorDraft();
   applyIcons();
 }
 
@@ -5196,20 +5316,48 @@ function productionChapterSelectOptions(value) {
     `<option value="${item.id}" ${item.id === +value ? "selected" : ""}>第${item.ord}章《${esc(item.title || "未命名")}》</option>`).join("");
 }
 
+function productionSceneSelectOptions(value) {
+  return `<option value="">未限定场景</option>` + (productionChapterData?.scenes || []).map(scene =>
+    `<option value="${scene.id}" ${scene.id === +value ? "selected" : ""}>${scene.ord}. ${esc(scene.title || "未命名场景")}</option>`).join("");
+}
+
 function inspectProductionCard(cardId, point = "after") {
   const item = productionCardById(cardId, point);
   if (!item) return;
+  stashProductionInspectorDraft();
+  clearTimeout(productionInspectorSaveTimer);
   productionSelected = { type: "card", item, point };
   setProductionAgentTarget("card", item);
   renderProductionResources();
   const truth = item.truth || {};
   const state = item.current_state?.state || {};
+  const publicState = productionPublicState(state);
   const evidence = item.current_state?.evidence || "";
+  const stateSection = point === "before" ? `
+      <div class="production-inspector-section"><h3>章前状态快照</h3>
+        <p class="production-inspector-note">这里展示进入本章前已经成立的状态，仅供核对，不能写回本章。</p>
+        <label>当前状态<textarea readonly>${esc(productionPairsText(publicState) || "暂无")}</textarea></label>
+        <label>读者已知<textarea readonly>${esc(state._reader_known ?? truth.reader_known ?? "暂无")}</textarea></label>
+        <label>人物认知<textarea readonly>${esc(state._character_knowledge ?? truth.character_knowledge ?? "暂无")}</textarea></label>
+        <label>保密边界<textarea readonly>${esc(state._secrecy ?? truth.secrecy ?? "暂无")}</textarea></label>
+        <label>读者侧状态<textarea readonly>${esc(state._reader_state ?? item.reader_state ?? "暂无")}</textarea></label>
+        ${evidence ? `<div class="production-evidence">证据：${esc(evidence)}${Number.isInteger(item.current_state?.evidence_start) ? `<button onclick="jumpToProductionEvidence(${item.current_state.evidence_start},${item.current_state.evidence_end})">查看正文</button>` : ""}</div>` : ""}
+      </div>` : `
+      <div class="production-inspector-section"><h3>本章状态版本</h3>
+        <label>当前状态 <span>每行“字段：值”</span><textarea id="productionCardState" oninput="markProductionInspectorDraft();event.stopPropagation()">${esc(productionPairsText(publicState))}</textarea></label>
+        <label>截至本章读者已知<textarea id="productionStateReaderKnown" oninput="markProductionInspectorDraft();event.stopPropagation()">${esc(state._reader_known ?? truth.reader_known ?? "")}</textarea></label>
+        <label>截至本章人物认知<textarea id="productionStateCharacterKnowledge" oninput="markProductionInspectorDraft();event.stopPropagation()">${esc(state._character_knowledge ?? truth.character_knowledge ?? "")}</textarea></label>
+        <label>截至本章保密边界<textarea id="productionStateSecrecy" oninput="markProductionInspectorDraft();event.stopPropagation()">${esc(state._secrecy ?? truth.secrecy ?? "")}</textarea></label>
+        <label>截至本章读者侧状态<textarea id="productionStateReaderState" oninput="markProductionInspectorDraft();event.stopPropagation()">${esc(state._reader_state ?? item.reader_state ?? "")}</textarea></label>
+        <label>变化说明<input id="productionCardStateSummary" oninput="markProductionInspectorDraft();event.stopPropagation()" placeholder="例如：道具转由林晚持有"></label>
+        <button onclick="saveProductionCardStateFromInspector()">保存为本章状态</button>
+        ${evidence ? `<div class="production-evidence">证据：${esc(evidence)}${Number.isInteger(item.current_state?.evidence_start) ? `<button onclick="jumpToProductionEvidence(${item.current_state.evidence_start},${item.current_state.evidence_end})">查看正文</button>` : ""}</div>` : ""}
+      </div>`;
   openProductionInspector(item.name, `${productionCategoryLabels[item.category] || item.category} · ${point === "before" ? "章前" : "章后"}`, `
     <div class="production-inspector-form" oninput="queueProductionInspectorSave()">
       <div class="production-form-grid">
         <label>分类<select id="productionCardCategory">${Object.entries(productionCategoryLabels).filter(([key]) => key !== "character").map(([key, label]) => `<option value="${key}" ${item.category === key ? "selected" : ""}>${label}</option>`).join("")}</select></label>
-        <label>生效范围<select id="productionCardScope"><option value="global" ${item.scope_type === "global" ? "selected" : ""}>全书</option><option value="chapter_range" ${item.scope_type === "chapter_range" ? "selected" : ""}>章节范围</option></select></label>
+        <label>生效范围<select id="productionCardScope"><option value="global" ${item.scope_type === "global" ? "selected" : ""}>全书</option><option value="chapter_range" ${item.scope_type === "chapter_range" ? "selected" : ""}>章节范围</option><option value="scene" ${item.scope_type === "scene" ? "selected" : ""}>本章场景</option></select></label>
       </div>
       <label>名称<input id="productionCardName" value="${esc(item.name)}"></label>
       <label>一句话设定<textarea id="productionCardSummary" rows="3">${esc(item.summary || "")}</textarea></label>
@@ -5219,37 +5367,36 @@ function inspectProductionCard(cardId, point = "after") {
         <label>起始章节<select id="productionCardScopeStart">${productionChapterSelectOptions(item.scope_start_chapter_id)}</select></label>
         <label>结束章节<select id="productionCardScopeEnd">${productionChapterSelectOptions(item.scope_end_chapter_id)}</select></label>
       </div>
-      <div class="production-inspector-section"><h3>真相与信息边界</h3>
+      <label>限定场景<select id="productionCardScopeScene">${productionSceneSelectOptions(item.scope_scene_id)}</select></label>
+      <div class="production-inspector-section"><h3>固定真相与初始边界</h3>
         <label>客观真相<textarea id="productionTruthObjective">${esc(truth.objective || "")}</textarea></label>
-        <label>读者当前已知<textarea id="productionTruthReader">${esc(truth.reader_known || "")}</textarea></label>
-        <label>人物认知与误解<textarea id="productionTruthCharacters">${esc(truth.character_knowledge || "")}</textarea></label>
-        <label>保密边界<textarea id="productionTruthSecrecy">${esc(truth.secrecy || "")}</textarea></label>
+        <label>初始读者已知<textarea id="productionTruthReader">${esc(truth.reader_known || "")}</textarea></label>
+        <label>初始人物认知<textarea id="productionTruthCharacters">${esc(truth.character_knowledge || "")}</textarea></label>
+        <label>初始保密边界<textarea id="productionTruthSecrecy">${esc(truth.secrecy || "")}</textarea></label>
       </div>
-      <label>读者侧状态<textarea id="productionCardReaderState">${esc(item.reader_state || "")}</textarea></label>
-      <div class="production-inspector-section"><h3>本章状态版本</h3>
-        <label>当前状态 <span>每行“字段：值”</span><textarea id="productionCardState" oninput="event.stopPropagation()">${esc(productionPairsText(state))}</textarea></label>
-        <label>变化说明<input id="productionCardStateSummary" oninput="event.stopPropagation()" placeholder="例如：道具转由林晚持有"></label>
-        <button onclick="saveProductionCardStateFromInspector()">保存为本章状态</button>
-        ${evidence ? `<div class="production-evidence">证据：${esc(evidence)}${Number.isInteger(item.current_state?.evidence_start) ? `<button onclick="jumpToProductionEvidence(${item.current_state.evidence_start},${item.current_state.evidence_end})">查看正文</button>` : ""}</div>` : ""}
-      </div>
+      <label>初始读者侧状态<textarea id="productionCardReaderState">${esc(item.reader_state || "")}</textarea></label>
+      ${stateSection}
       <div class="production-inspector-actions"><button onclick="saveProductionCardFromInspector()">保存设定卡</button><button class="danger-link" onclick="archiveProductionCard(${item.id})">归档</button></div>
     </div>`);
 }
 
 function newProductionCard(category = "rule") {
+  stashProductionInspectorDraft();
+  clearTimeout(productionInspectorSaveTimer);
   const item = { id: null, category, name: "", summary: "", detail: "", attributes: {}, truth: {}, reader_state: "", scope_type: "global" };
   productionSelected = { type: "card", item, point: "after" };
   openProductionInspector("新建设定卡", productionCategoryLabels[category] || "设定", `
-    <div class="production-inspector-form">
+    <div class="production-inspector-form" oninput="queueProductionInspectorSave()">
       <div class="production-form-grid">
         <label>分类<select id="productionCardCategory">${Object.entries(productionCategoryLabels).filter(([key]) => key !== "character").map(([key, label]) => `<option value="${key}" ${category === key ? "selected" : ""}>${label}</option>`).join("")}</select></label>
-        <label>生效范围<select id="productionCardScope"><option value="global">全书</option><option value="chapter_range">章节范围</option></select></label>
+        <label>生效范围<select id="productionCardScope"><option value="global">全书</option><option value="chapter_range">章节范围</option><option value="scene">本章场景</option></select></label>
       </div>
       <label>名称<input id="productionCardName" placeholder="例如：灵力等级"></label>
       <label>一句话设定<textarea id="productionCardSummary" rows="3"></textarea></label>
       <label>详细说明<textarea id="productionCardDetail" rows="5"></textarea></label>
       <label>自定义属性 <span>每行“字段：值”</span><textarea id="productionCardAttributes"></textarea></label>
       <div class="production-form-grid"><label>起始章节<select id="productionCardScopeStart">${productionChapterSelectOptions()}</select></label><label>结束章节<select id="productionCardScopeEnd">${productionChapterSelectOptions()}</select></label></div>
+      <label>限定场景<select id="productionCardScopeScene">${productionSceneSelectOptions()}</select></label>
       <div class="production-inspector-section"><h3>真相与信息边界</h3>
         <label>客观真相<textarea id="productionTruthObjective"></textarea></label><label>读者当前已知<textarea id="productionTruthReader"></textarea></label>
         <label>人物认知与误解<textarea id="productionTruthCharacters"></textarea></label><label>保密边界<textarea id="productionTruthSecrecy"></textarea></label>
@@ -5261,7 +5408,7 @@ function newProductionCard(category = "rule") {
 }
 
 function readProductionCardForm() {
-  return {
+  const body = {
     category: $("productionCardCategory").value, name: $("productionCardName").value.trim(),
     summary: $("productionCardSummary").value, detail: $("productionCardDetail").value,
     attributes: parseProductionPairs($("productionCardAttributes").value),
@@ -5270,14 +5417,21 @@ function readProductionCardForm() {
     reader_state: $("productionCardReaderState").value, scope_type: $("productionCardScope").value,
     scope_start_chapter_id: +$("productionCardScopeStart").value || null,
     scope_end_chapter_id: +$("productionCardScopeEnd").value || null,
+    scope_scene_id: +$("productionCardScopeScene").value || null,
   };
+  if (!productionSelected?.item?.id && productionChapterId) body.source_chapter_id = productionChapterId;
+  return body;
 }
 
 function queueProductionInspectorSave() {
-  if (!productionSelected?.item?.id || !["card", "scene"].includes(productionSelected.type)) return;
+  if (!["card", "scene"].includes(productionSelected?.type)) return;
+  stashProductionInspectorDraft();
   clearTimeout(productionInspectorSaveTimer);
-  $("productionSaveStatus").textContent = "未保存";
+  $("productionSaveStatus").textContent = "已本机暂存";
+  if (!productionSelected?.item?.id) return;
   productionInspectorSaveTimer = setTimeout(() => {
+    productionInspectorSaveTimer = null;
+    $("productionSaveStatus").textContent = "正在同步";
     if (productionSelected?.type === "card") saveProductionCardFromInspector(true);
     else if (productionSelected?.type === "scene") saveProductionSceneFromInspector(true);
   }, 1000);
@@ -5286,13 +5440,16 @@ function queueProductionInspectorSave() {
 async function saveProductionCardFromInspector(quiet = false) {
   if (productionSelected?.type !== "card") return;
   const cardId = productionSelected.item.id;
+  const draftKey = productionDraftKey();
   const body = readProductionCardForm();
   if (!body.name) { if (!quiet) showToast("请填写设定卡名称", "err"); return; }
   try {
+    productionInspectorSaving = true;
     const saved = await api(cardId ? `/api/production/cards/${cardId}` : `/api/works/${currentWorkId}/production/cards`, {
       method: cardId ? "PUT" : "POST", body,
     });
-    $("productionSaveStatus").textContent = "已自动保存";
+    clearProductionInspectorDraft(draftKey);
+    $("productionSaveStatus").textContent = "已同步";
     productionSelected.item = saved;
     const index = productionCards.findIndex(item => item.id === saved.id);
     if (index >= 0) productionCards[index] = { ...productionCards[index], ...saved };
@@ -5305,18 +5462,26 @@ async function saveProductionCardFromInspector(quiet = false) {
     renderProductionResources();
     if (productionMode === "chapter") renderProductionCanvas();
     if (!quiet) { showToast(cardId ? "设定卡已保存" : "设定卡已创建", "ok"); inspectProductionCard(saved.id); }
-  } catch (e) { $("productionSaveStatus").textContent = "保存失败"; if (!quiet) showToast(e.message, "err"); }
+  } catch (e) { $("productionSaveStatus").textContent = "同步失败，草稿仍在本机"; if (!quiet) showToast(e.message, "err"); }
+  finally { productionInspectorSaving = false; }
 }
 
 async function saveProductionCardStateFromInspector() {
   const item = productionSelected?.item;
-  if (!item?.id || !productionChapterId) return;
+  if (!item?.id || !productionChapterId || productionSelected?.point === "before") return;
   const state = parseProductionPairs($("productionCardState").value);
+  state._reader_known = $("productionStateReaderKnown").value;
+  state._character_knowledge = $("productionStateCharacterKnowledge").value;
+  state._secrecy = $("productionStateSecrecy").value;
+  state._reader_state = $("productionStateReaderState").value;
+  Object.keys(state).forEach(key => { if (!String(state[key] ?? "").trim()) delete state[key]; });
   if (!Object.keys(state).length) { showToast("请至少填写一项状态", "err"); return; }
+  const draftKey = productionDraftKey();
   try {
     await api(`/api/production/cards/${item.id}/versions`, { body: {
       chapter_id: productionChapterId, state, change_summary: $("productionCardStateSummary").value,
     }});
+    clearProductionInspectorDraft(draftKey);
     showToast("本章状态已保存", "ok");
     await loadProductionChapter();
     inspectProductionCard(item.id);
@@ -5326,9 +5491,11 @@ async function saveProductionCardStateFromInspector() {
 async function archiveProductionCard(cardId) {
   const ok = await askCard({ title: "归档设定卡", msg: "归档后不会再进入后续写作上下文，历史状态仍保留。", okText: "归档", danger: true });
   if (!ok) return;
+  const draftKey = productionDraftKey();
   try {
+    await closeProductionInspector({ flush: false });
     await api(`/api/production/cards/${cardId}`, { method: "DELETE" });
-    closeProductionInspector();
+    clearProductionInspectorDraft(draftKey);
     await (productionMode === "chapter" ? loadProductionChapter() : loadProductionOverview());
     showToast("设定卡已归档", "ok");
   } catch (e) { showToast(e.message, "err"); }
@@ -5337,6 +5504,8 @@ async function archiveProductionCard(cardId) {
 function inspectProductionCharacter(entityId, point = "after") {
   const item = (productionChapterData?.[point]?.characters || entitiesCache).find(entity => entity.id === entityId);
   if (!item) return;
+  stashProductionInspectorDraft();
+  clearTimeout(productionInspectorSaveTimer);
   productionSelected = { type: "character", item, point };
   setProductionAgentTarget("character", item);
   renderProductionResources();
@@ -5355,9 +5524,21 @@ function productionLocationOptions(value) {
   return `<option value="">未关联地点卡</option>` + locations.map(item => `<option value="${item.id}" ${item.id === +value ? "selected" : ""}>${esc(item.name)}</option>`).join("");
 }
 
+function productionCharacterPicker(selected = []) {
+  const chosen = new Set((selected || []).map(Number));
+  const characters = entitiesCache.filter(item => item.kind === "人物");
+  if (!characters.length) return '<div class="production-empty compact"><span>还没有人物卡</span></div>';
+  return `<div class="production-character-picker">${characters.map(item => `
+    <label><input id="productionSceneCharacter${item.id}" type="checkbox" data-production-character="${item.id}" ${chosen.has(item.id) ? "checked" : ""}>
+      <span><b>${esc(item.name)}</b><small>${esc(item.summary || productionStateBrief(item.current_state))}</small></span>
+    </label>`).join("")}</div>`;
+}
+
 function inspectProductionScene(sceneId) {
   const item = productionChapterData?.scenes?.find(scene => scene.id === sceneId);
   if (!item) return;
+  stashProductionInspectorDraft();
+  clearTimeout(productionInspectorSaveTimer);
   productionSelected = { type: "scene", item };
   setProductionAgentTarget("scene", item);
   openProductionInspector(item.title, `场景 ${item.ord}`, productionSceneForm(item));
@@ -5365,6 +5546,8 @@ function inspectProductionScene(sceneId) {
 
 function newProductionScene() {
   if (!productionChapterId) return;
+  stashProductionInspectorDraft();
+  clearTimeout(productionInspectorSaveTimer);
   const item = { id: null, title: "", summary: "", time_label: "", location_card_id: null, goal: "", conflict: "", outcome: "", refs: {} };
   productionSelected = { type: "scene", item };
   openProductionInspector("新建场景", "本章场景", productionSceneForm(item));
@@ -5372,21 +5555,22 @@ function newProductionScene() {
 }
 
 function productionSceneForm(item) {
-  return `<div class="production-inspector-form" ${item.id ? 'oninput="queueProductionInspectorSave()"' : ""}>
+  return `<div class="production-inspector-form" oninput="queueProductionInspectorSave()">
     <label>场景标题<input id="productionSceneTitle" value="${esc(item.title || "")}" placeholder="例如：雨夜抵达旧码头"></label>
     <div class="production-form-grid"><label>时间<input id="productionSceneTime" value="${esc(item.time_label || "")}"></label><label>地点<select id="productionSceneLocation">${productionLocationOptions(item.location_card_id)}</select></label></div>
     <label>场景摘要<textarea id="productionSceneSummary">${esc(item.summary || "")}</textarea></label>
     <label>目标<textarea id="productionSceneGoal">${esc(item.goal || "")}</textarea></label>
     <label>冲突<textarea id="productionSceneConflict">${esc(item.conflict || "")}</textarea></label>
     <label>结果<textarea id="productionSceneOutcome">${esc(item.outcome || "")}</textarea></label>
-    <label>关联人物 ID <span>多个 ID 用逗号分隔</span><input id="productionSceneCharacters" value="${esc((item.refs?.character_ids || []).join(','))}"></label>
+    <label>关联人物 <span>按姓名勾选</span>${productionCharacterPicker(item.refs?.character_ids || [])}</label>
     ${item.evidence ? `<div class="production-evidence">证据：${esc(item.evidence)}${Number.isInteger(item.evidence_start) ? `<button onclick="jumpToProductionEvidence(${item.evidence_start},${item.evidence_end})">查看正文</button>` : ""}</div>` : ""}
     <div class="production-inspector-actions"><button onclick="saveProductionSceneFromInspector()">${item.id ? "保存场景" : "创建场景"}</button>${item.id ? `<button class="danger-link" onclick="deleteProductionScene(${item.id})">删除</button>` : '<button onclick="closeProductionInspector()">取消</button>'}</div>
   </div>`;
 }
 
 function readProductionSceneForm() {
-  const characterIds = $("productionSceneCharacters").value.split(/[,，\s]+/).map(Number).filter(Number.isInteger);
+  const characterIds = [...document.querySelectorAll("[data-production-character]:checked")]
+    .map(input => +input.dataset.productionCharacter).filter(Number.isInteger);
   return { chapter_id: productionChapterId, title: $("productionSceneTitle").value.trim(),
     summary: $("productionSceneSummary").value, time_label: $("productionSceneTime").value,
     location_card_id: +$("productionSceneLocation").value || null, goal: $("productionSceneGoal").value,
@@ -5397,13 +5581,16 @@ function readProductionSceneForm() {
 async function saveProductionSceneFromInspector(quiet = false) {
   if (productionSelected?.type !== "scene") return;
   const sceneId = productionSelected.item.id;
+  const draftKey = productionDraftKey();
   const body = readProductionSceneForm();
   if (!body.title) { if (!quiet) showToast("请填写场景标题", "err"); return; }
   try {
+    productionInspectorSaving = true;
     const saved = await api(sceneId ? `/api/production/scenes/${sceneId}` : `/api/chapters/${productionChapterId}/production/scenes`, {
       method: sceneId ? "PUT" : "POST", body,
     });
-    $("productionSaveStatus").textContent = "已自动保存";
+    clearProductionInspectorDraft(draftKey);
+    $("productionSaveStatus").textContent = "已同步";
     productionSelected.item = saved;
     if (productionChapterData?.scenes) {
       const index = productionChapterData.scenes.findIndex(item => item.id === saved.id);
@@ -5411,13 +5598,20 @@ async function saveProductionSceneFromInspector(quiet = false) {
     }
     renderProductionCanvas();
     if (!quiet) { showToast(sceneId ? "场景已保存" : "场景已创建", "ok"); inspectProductionScene(saved.id); }
-  } catch (e) { $("productionSaveStatus").textContent = "保存失败"; if (!quiet) showToast(e.message, "err"); }
+  } catch (e) { $("productionSaveStatus").textContent = "同步失败，草稿仍在本机"; if (!quiet) showToast(e.message, "err"); }
+  finally { productionInspectorSaving = false; }
 }
 
 async function deleteProductionScene(sceneId) {
   const ok = await askCard({ title: "删除场景", msg: "只删除画布场景节点，不会删除正文。", okText: "删除", danger: true });
   if (!ok) return;
-  try { await api(`/api/production/scenes/${sceneId}`, { method: "DELETE" }); closeProductionInspector(); await loadProductionChapter(); }
+  const draftKey = productionDraftKey();
+  try {
+    await closeProductionInspector({ flush: false });
+    await api(`/api/production/scenes/${sceneId}`, { method: "DELETE" });
+    clearProductionInspectorDraft(draftKey);
+    await loadProductionChapter();
+  }
   catch (e) { showToast(e.message, "err"); }
 }
 
