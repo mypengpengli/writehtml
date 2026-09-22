@@ -3157,56 +3157,27 @@ def _production_evidence_span(content, evidence):
     return (start, start + len(evidence)) if start >= 0 else (None, None)
 
 
-WORLD_STATE_ANALYZER_VERSION = "world-state-v3"
+WORLD_STATE_ANALYZER_VERSION = "world-state-v4"
 
 
-def _cached_world_state_result(uid, chapter, analysis, model, input_hash):
-    production = db.get_chapter_production(chapter["id"], uid) or {}
-    character_data = db.list_character_state_proposals(chapter["id"], uid) or {}
-    character_proposals = [
-        item for item in character_data.get("proposals", [])
-        if item.get("status") == "pending" and not item.get("is_stale")
-    ]
-    memory_data = db.get_story_memory_overview(chapter["work_id"], uid, chapter["id"]) or {}
-    production_proposals = [
-        item for item in production.get("proposals", [])
-        if item.get("status") == "pending" and not item.get("is_stale")
-    ]
-    return {
-        "ok": True, "model": model, "cache_hit": True,
-        "analysis_id": analysis["id"], "analysis_generation": analysis["generation"],
-        "analysis_input_hash": input_hash,
-        "scene_count": len(production.get("scenes") or []),
-        "changes": production_proposals, "character_changes": [],
-        "character_state_proposals": character_proposals,
-        "plot_state_proposal": None, "memory_proposals": memory_data.get("proposals") or [],
-        "source_content_hash": analysis.get("source_content_hash") or "",
-        "production": production,
-    }
+class _AppliedWorldStateAnalysis(RuntimeError):
+    def __init__(self, analysis):
+        super().__init__("World State analysis already applied")
+        self.analysis = analysis
 
 
-def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, model=None,
-                                  raise_on_error=False, force=False):
-    """Run the canonical World State pass and persist every derived chapter view once."""
+def _build_world_state_input(uid, cid, *, base_url=None, api_key=None, model=None):
+    """Build the complete, deterministic input used for analysis and commit validation."""
     chapter = db.get_chapter_meta(cid, uid) if cid else None
     if not chapter:
-        if raise_on_error:
-            raise HTTPException(404, "章节不存在")
         return None
-    content = (chapter.get("content") or "").strip()
-    if not content:
-        if raise_on_error:
-            raise HTTPException(400, "本章为空，无法分析生产画布")
-        return None
-    source_content_hash = chapter.get("content_hash") or ""
+    raw_content = chapter.get("content") or ""
+    content = raw_content.strip()
+    source_content_hash = chapter.get("content_hash") or hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
     settings = db.get_settings(uid) or {}
-    base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
-    api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
-    model = model or settings.get("llm_model") or config.LLM_MODEL
-    if not api_key:
-        if raise_on_error:
-            raise HTTPException(500, "未配置 API Key，无法分析生产画布")
-        return None
+    resolved_base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
+    resolved_api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
+    resolved_model = model or settings.get("llm_model") or config.LLM_MODEL
     work_settings = db.get_production_settings(chapter["work_id"], uid) or {}
     evidence_enabled = work_settings.get("evidence_enabled", True)
     cards = db.list_production_cards(chapter["work_id"], uid, cid, include_pending=False) or []
@@ -3282,29 +3253,106 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
             base_context, {"work_bible", "plot_state", "relationships", "memory", "chapter_summary"}
         )[:16000],
         "chapter": {"id": cid, "ord": chapter.get("ord"), "title": chapter["title"],
-                    "notes": chapter.get("notes") or "",
-                    "content": content[-30000:]},
+                    "notes": chapter.get("notes") or "", "content": content[-30000:]},
     }
-    system_prompt = "你是长篇小说的 World State 连续性编辑。一次分析必须让剧情、人物、设定、记忆和场景彼此一致；输出严格 JSON。"
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": "你是长篇小说的 World State 连续性编辑。一次分析必须让剧情、人物、设定、记忆和场景彼此一致；输出严格 JSON。"},
         {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
     ]
-    provider = str(base_url or "").strip().rstrip("/")
-    analysis_input_hash = hashlib.sha256(json.dumps(
-        {"messages": messages, "provider": provider, "model": model or ""},
+    provider = str(resolved_base_url or "").strip().rstrip("/")
+    input_hash = hashlib.sha256(json.dumps(
+        {"messages": messages, "provider": provider, "model": resolved_model or "",
+         "source_content_hash": source_content_hash},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
-    snapshot = None if force else db.get_world_state_analysis(
-        cid, uid, analysis_input_hash, WORLD_STATE_ANALYZER_VERSION, provider, model,
-    )
+    return {
+        "chapter": chapter, "content": content, "source_content_hash": source_content_hash,
+        "base_url": resolved_base_url, "api_key": resolved_api_key, "model": resolved_model,
+        "provider": provider, "work_settings": work_settings, "evidence_enabled": evidence_enabled,
+        "cards": cards, "characters": characters, "plot_before": plot_before,
+        "messages": messages, "input_hash": input_hash,
+    }
+
+
+def _world_state_result(uid, chapter, analysis, model, input_hash, cache_hit, fresh=None):
+    """Rehydrate response state without holding SQLite's writer lock."""
+    with db.atomic_transaction():
+        production = db.get_chapter_production(chapter["id"], uid) or {}
+        character_data = db.list_character_state_proposals(chapter["id"], uid) or {}
+        plot_data = db.get_plot_state_overview(chapter["work_id"], uid, chapter["id"]) or {}
+        memory_data = db.get_story_memory_overview(chapter["work_id"], uid, chapter["id"]) or {}
+    character_proposals = [
+        item for item in character_data.get("proposals", [])
+        if item.get("status") == "pending" and not item.get("is_stale")
+    ]
+    plot_proposal = next((
+        item for item in plot_data.get("proposals", [])
+        if item.get("status") == "pending" and not item.get("is_stale")
+    ), None)
+    production_proposals = [
+        item for item in production.get("proposals", [])
+        if item.get("status") == "pending" and not item.get("is_stale")
+    ]
+    result = {
+        "ok": True, "model": model, "cache_hit": cache_hit,
+        "analysis_id": analysis["id"], "analysis_generation": analysis["generation"],
+        "analysis_input_hash": input_hash,
+        "scene_count": len(production.get("scenes") or []),
+        "changes": production_proposals,
+        "character_changes": [{"kind": "proposal", "item": item} for item in character_proposals],
+        "character_state_proposals": character_proposals,
+        "plot_state_proposal": plot_proposal,
+        "memory_proposals": memory_data.get("proposals") or [],
+        "source_content_hash": analysis.get("source_content_hash") or "",
+        "production": production,
+    }
+    if fresh:
+        result.update(fresh)
+    return result
+
+
+def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, model=None,
+                                  raise_on_error=False, force=False):
+    """Run the canonical World State pass and persist every derived chapter view once."""
+    with db.atomic_transaction():
+        prepared = _build_world_state_input(
+            uid, cid, base_url=base_url, api_key=api_key, model=model,
+        )
+        snapshot = None if force or not prepared else db.get_world_state_analysis(
+            cid, uid, prepared["input_hash"], WORLD_STATE_ANALYZER_VERSION,
+            prepared["provider"], prepared["model"],
+        )
+    if not prepared:
+        if raise_on_error:
+            raise HTTPException(404, "章节不存在")
+        return None
+    if not prepared["content"]:
+        if raise_on_error:
+            raise HTTPException(400, "本章为空，无法分析生产画布")
+        return None
+    if not prepared["api_key"]:
+        if raise_on_error:
+            raise HTTPException(500, "未配置 API Key，无法分析生产画布")
+        return None
+    chapter = prepared["chapter"]
+    source_content_hash = prepared["source_content_hash"]
+    resolved_base_url = prepared["base_url"]
+    resolved_api_key = prepared["api_key"]
+    resolved_model = prepared["model"]
+    provider = prepared["provider"]
+    messages = prepared["messages"]
+    analysis_input_hash = prepared["input_hash"]
+    if snapshot and snapshot.get("applied_at") is not None:
+        return _world_state_result(
+            uid, chapter, snapshot, resolved_model, analysis_input_hash, True,
+        )
     cache_hit = bool(snapshot and isinstance(snapshot.get("result"), dict))
     if cache_hit:
         parsed = snapshot["result"]
     else:
         try:
             parsed = _parse_json_from_model(llm.chat(
-                messages, base_url=base_url, api_key=api_key, model=model,
+                messages, base_url=resolved_base_url, api_key=resolved_api_key, model=resolved_model,
             ))
         except Exception as exc:
             if raise_on_error:
@@ -3316,9 +3364,19 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
         return None
     try:
         with db.world_state_transaction(cid, uid, source_content_hash):
+            current = _build_world_state_input(
+                uid, cid, base_url=base_url, api_key=api_key, model=model,
+            )
+            if not current or current["input_hash"] != analysis_input_hash:
+                raise db.StaleWorldStateError("World State inputs changed during analysis")
+            chapter = current["chapter"]
+            content = current["content"]
+            evidence_enabled = current["evidence_enabled"]
+            characters = current["characters"]
+            plot_before = current["plot_before"]
             analysis = db.create_world_state_analysis(
                 cid, uid, analysis_input_hash, source_content_hash,
-                WORLD_STATE_ANALYZER_VERSION, provider, model, parsed, force=force,
+                WORLD_STATE_ANALYZER_VERSION, provider, resolved_model, parsed, force=force,
             )
             if not analysis:
                 raise RuntimeError("failed to persist World State analysis")
@@ -3326,7 +3384,7 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
                 cache_hit = True
                 parsed = analysis["result"]
             if analysis.get("applied_at") is not None:
-                return _cached_world_state_result(uid, chapter, analysis, model, analysis_input_hash)
+                raise _AppliedWorldStateAnalysis(analysis)
             scenes = parsed.get("scenes") if isinstance(parsed.get("scenes"), list) else []
             clean_scenes = []
             for raw in scenes[:40]:
@@ -3415,23 +3473,24 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
                 db.propagate_world_state_impact(cid, uid, impact_summary)
             if not db.mark_world_state_analysis_applied(analysis["id"], uid):
                 raise RuntimeError("World State analysis was already applied")
-            result = {
-                "ok": True, "model": model, "cache_hit": cache_hit, "scene_count": len(clean_scenes),
-                "analysis_id": analysis["id"], "analysis_generation": analysis["generation"],
-                "analysis_input_hash": analysis_input_hash,
+            fresh = {
                 "changes": saved_changes, "character_changes": character_results,
                 "character_state_proposals": [item["item"] for item in character_results if item["kind"] == "proposal"],
                 "plot_state_proposal": plot_proposal, "memory_proposals": memory_proposals,
-                "source_content_hash": source_content_hash,
-                "production": db.get_chapter_production(cid, uid),
             }
+    except _AppliedWorldStateAnalysis as exc:
+        return _world_state_result(
+            uid, chapter, exc.analysis, resolved_model, analysis_input_hash, True,
+        )
     except db.StaleWorldStateError:
         if raise_on_error:
-            raise HTTPException(409, "分析期间正文已变化，本轮结果未保存，请重新分析")
+            raise HTTPException(409, "分析期间正文或故事上下文已变化，本轮结果未保存，请重新分析")
         return {"ok": False, "stale": True, "chapter_id": cid, "scene_count": 0,
                 "changes": [], "character_changes": [], "memory_proposals": [],
                 "plot_state_proposal": None}
-    return result
+    return _world_state_result(
+        uid, chapter, analysis, resolved_model, analysis_input_hash, cache_hit, fresh=fresh,
+    )
 
 
 def _parse_json_from_model(raw):

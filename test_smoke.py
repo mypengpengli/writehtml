@@ -944,6 +944,9 @@ ok("custom_fields" in _character_prompt["messages"][-1]["content"], "生产画�
 _cached_analysis = c.post(f"/api/chapters/{state_c2}/production/analyze", json={}, headers=H(tokA)).json()
 ok(_cached_analysis["cache_hit"] and _character_prompt["count"] == 1,
    "同正文同模型的 World State 分析复用持久化快照")
+ok(len(_cached_analysis["character_changes"]) == 1
+   and _cached_analysis["character_changes"][0]["kind"] == "proposal",
+   "World State cache hit rebuilds pending character changes")
 _after_analyze = c.get(f"/api/works/{wid}/entities?chapter_id={state_c2}", headers=H(tokA)).json()[0]
 ok(_after_analyze["current_state"]["goal"] == "追查目击者" and _after_analyze["pending_count"] == 1,
    "待确认提议不改变后续 AI 上下文")
@@ -974,6 +977,84 @@ _forced_analysis = c.post(
 ok(not _forced_analysis["cache_hit"]
    and _forced_analysis["analysis_generation"] == _changed_context_analysis["analysis_generation"] + 1,
    "forced World State analysis creates a new generation")
+
+# A long chapter can have identical model-visible tails across revisions. The
+# full source hash must still make those revisions distinct cache inputs.
+_long_world_cid = c.post(
+    f"/api/works/{wid}/chapters", json={"title": "长章缓存"}, headers=H(tokA),
+).json()["id"]
+_long_suffix = "尾" * 30000
+c.put(f"/api/chapters/{_long_world_cid}", json={"content": "甲" * 10000 + _long_suffix}, headers=H(tokA))
+_long_calls = {"count": 0}
+def _long_world_state(messages, **kw):
+    _long_calls["count"] += 1
+    return '{"plot":{},"memories":[],"scenes":[],"changes":[],"character_changes":[]}'
+llm.chat = _long_world_state
+_long_first = c.post(
+    f"/api/chapters/{_long_world_cid}/production/analyze", json={}, headers=H(tokA),
+).json()
+c.put(f"/api/chapters/{_long_world_cid}", json={"content": "乙" * 10000 + _long_suffix}, headers=H(tokA))
+_long_second = c.post(
+    f"/api/chapters/{_long_world_cid}/production/analyze", json={}, headers=H(tokA),
+).json()
+ok(_long_calls["count"] == 2 and not _long_second["cache_hit"]
+   and _long_first["analysis_input_hash"] != _long_second["analysis_input_hash"],
+   "full chapter hash prevents cache reuse when only the truncated prefix changes")
+c.delete(f"/api/chapters/{_long_world_cid}", headers=H(tokA))
+c.post(f"/api/chapters/{_long_world_cid}/purge", headers=H(tokA))
+
+# Mutating a non-prose input while the model is running must reject the whole
+# result, just like a concurrent chapter edit.
+_context_world_cid = c.post(
+    f"/api/works/{wid}/chapters", json={"title": "上下文并发"}, headers=H(tokA),
+).json()["id"]
+c.put(f"/api/chapters/{_context_world_cid}", json={"content": "人物状态保持一致。"}, headers=H(tokA))
+def _context_stale_world_state(messages, **kw):
+    db.update_entity(ent["id"], uidA, None, None, "模型运行期间人物卡改变", None)
+    return '{"plot":{},"memories":[],"scenes":[{"title":"不应保存"}],"changes":[],"character_changes":[]}'
+llm.chat = _context_stale_world_state
+_context_stale = c.post(
+    f"/api/chapters/{_context_world_cid}/production/analyze", json={}, headers=H(tokA),
+)
+ok(_context_stale.status_code == 409
+   and not db.list_production_scenes(_context_world_cid, uidA, include_stale=True),
+   "World State rejects results when character context changes during the model call")
+db.update_entity(ent["id"], uidA, None, None, "女主角，冷静，人物卡已更新", None)
+c.delete(f"/api/chapters/{_context_world_cid}", headers=H(tokA))
+c.post(f"/api/chapters/{_context_world_cid}/purge", headers=H(tokA))
+
+# Cached responses must rehydrate the pending plot proposal and must not enter
+# the BEGIN IMMEDIATE World State transaction at all.
+_plot_cache_cid = c.post(
+    f"/api/works/{wid}/chapters", json={"title": "剧情缓存"}, headers=H(tokA),
+).json()["id"]
+c.put(f"/api/chapters/{_plot_cache_cid}", json={"content": "主角决定进入南城。"}, headers=H(tokA))
+def _plot_cache_world_state(messages, **kw):
+    return json.dumps({
+        "plot": {"state": {"mainline": "进入南城", "current_event": "启程",
+                             "next_goal": "找到向导"},
+                 "change_summary": "主角启程前往南城", "evidence": "主角决定进入南城"},
+        "memories": [], "scenes": [], "changes": [], "character_changes": [],
+    }, ensure_ascii=False)
+llm.chat = _plot_cache_world_state
+_plot_first = c.post(
+    f"/api/chapters/{_plot_cache_cid}/plot-state-proposals/analyze", json={}, headers=H(tokA),
+).json()["proposal"]
+_real_world_state_transaction = db.world_state_transaction
+def _forbid_cached_writer_lock(*args, **kwargs):
+    raise AssertionError("cache hit attempted to acquire the World State writer lock")
+db.world_state_transaction = _forbid_cached_writer_lock
+try:
+    _plot_second_response = c.post(
+        f"/api/chapters/{_plot_cache_cid}/plot-state-proposals/analyze", json={}, headers=H(tokA),
+    )
+finally:
+    db.world_state_transaction = _real_world_state_transaction
+_plot_second = _plot_second_response.json()["proposal"]
+ok(_plot_second_response.status_code == 200 and _plot_first["id"] == _plot_second["id"],
+   "cache hit returns the pending plot proposal without taking a SQLite writer lock")
+c.delete(f"/api/chapters/{_plot_cache_cid}", headers=H(tokA))
+c.post(f"/api/chapters/{_plot_cache_cid}/purge", headers=H(tokA))
 
 stale_world_cid = c.post(f"/api/works/{wid}/chapters", json={"title": "并发分析"}, headers=H(tokA)).json()["id"]
 c.put(f"/api/chapters/{stale_world_cid}", json={"content": "分析开始时的正文"}, headers=H(tokA))
