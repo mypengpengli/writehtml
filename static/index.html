@@ -921,10 +921,17 @@
         <label>文字 / Agent API Key</label>
         <input id="setApiKey" type="password" placeholder="sk-…（已设置则显示 ****，留空=不改）">
         <label>当前模型 ID</label>
-        <input id="setModel" list="modelIdOptions" placeholder="deepseek-chat">
+        <input id="setModel" list="modelIdOptions" placeholder="deepseek-chat" onchange="loadModelRuntimeFields(this.value)">
         <label>常用模型 ID</label>
         <textarea id="setModels" rows="4" placeholder="每行一个模型 ID，例如：&#10;deepseek-chat&#10;qwen-plus"></textarea>
         <p class="set-hint">保存后可在编辑器顶栏或 AI 助手中快速切换；所有常用模型共用上方 Base URL 和 API Key。</p>
+        <hr class="sep settings-sep">
+        <div class="settings-section-head"><b>上下文</b><span>按当前模型 ID 保存</span></div>
+        <label>模型上下文窗口（Tokens）</label>
+        <input id="setContextWindowTokens" type="number" min="1" step="1000" inputmode="numeric" placeholder="200000">
+        <label>World State 正文上限（字符）</label>
+        <input id="setWorldStateContentChars" type="number" min="1" step="1000" inputmode="numeric" placeholder="30000">
+        <p class="set-hint">上下文窗口用于 Agent 压缩预算；World State 超出上限时保留章节开头和结尾。请按模型能力填写，实际硬限制由模型服务返回。</p>
         <datalist id="modelIdOptions"></datalist>
         <hr class="sep settings-sep">
         <div class="settings-section-head"><b>联网搜索</b><span id="tavilyKeyStatus"></span></div>

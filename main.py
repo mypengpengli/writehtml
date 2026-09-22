@@ -148,6 +148,32 @@ def _model_options_payload(body):
     return values
 
 
+def _positive_int_payload(body, key):
+    if key not in body:
+        return None
+    value = body.get(key)
+    labels = {
+        "context_window_tokens": "模型上下文窗口",
+        "world_state_content_chars": "World State 正文上限",
+    }
+    label = labels.get(key, key)
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise HTTPException(400, f"{label}必须是正整数")
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(400, f"{label}必须是正整数")
+    if value <= 0:
+        raise HTTPException(400, f"{label}必须是正整数")
+    return value
+
+
+def _model_runtime_limits(settings, model=None):
+    settings = settings or {}
+    resolved_model = (model or settings.get("llm_model") or config.LLM_MODEL or "").strip()
+    return db.model_runtime_limits(settings.get("llm_model_options") or {}, resolved_model)
+
+
 def _tavily_keys_payload(body):
     if "tavily_api_keys" not in body:
         return None
@@ -272,6 +298,7 @@ async def get_settings(request: Request):
     # 明文 key 不回传，只给掩码提示是否已填
     masked = ("****" + key[-4:]) if key else ""
     model, models = _model_options(s)
+    runtime_limits = _model_runtime_limits(s, model)
     tavily_keys, tavily_user_keys, tavily_source = _tavily_key_state(s)
     image_key = s.get("image_api_key") or key or config.LLM_API_KEY
     return {
@@ -280,6 +307,10 @@ async def get_settings(request: Request):
         "has_key": bool(key),
         "model": model,
         "models": models,
+        **runtime_limits,
+        "model_runtime_options": {
+            item: _model_runtime_limits(s, item) for item in models
+        },
         "asr_base_url": s.get("asr_base_url") or config.ASR_BASE_URL,
         "asr_api_key_masked": _mask_key(asr_key),
         "asr_has_key": bool(asr_key),
@@ -315,12 +346,17 @@ async def save_settings(request: Request):
         image_api_key=(body.get("image_api_key") or "").strip() if "image_api_key" in body else None,
         image_model=(body.get("image_model") or "").strip() if "image_model" in body else None,
         image_size=(body.get("image_size") or "").strip() if "image_size" in body else None,
+        context_window_tokens=_positive_int_payload(body, "context_window_tokens"),
+        world_state_content_chars=_positive_int_payload(body, "world_state_content_chars"),
     )
     _reset_tavily_client(uid)
     saved = db.get_settings(uid) or {}
     tavily_keys, tavily_user_keys, tavily_source = _tavily_key_state(saved)
     return {
         "ok": True, **result,
+        "model_runtime_options": {
+            item: _model_runtime_limits(saved, item) for item in result.get("models", [])
+        },
         "tavily_key_count": len(tavily_keys),
         "tavily_user_key_count": len(tavily_user_keys),
         "tavily_key_source": tavily_source,
@@ -3166,6 +3202,21 @@ class _AppliedWorldStateAnalysis(RuntimeError):
         self.analysis = analysis
 
 
+def _clip_world_state_content(content, limit):
+    """Keep both setup and latest state when a chapter exceeds its configured input size."""
+    content = content or ""
+    limit = max(1, int(limit))
+    if len(content) <= limit:
+        return content, False
+    marker = "\n\n[...正文中段因 World State 输入上限省略...]\n\n"
+    if limit <= len(marker) + 2:
+        return content[-limit:], True
+    available = limit - len(marker)
+    head_size = max(1, available // 3)
+    tail_size = max(1, available - head_size)
+    return content[:head_size] + marker + content[-tail_size:], True
+
+
 def _build_world_state_input(uid, cid, *, base_url=None, api_key=None, model=None):
     """Build the complete, deterministic input used for analysis and commit validation."""
     chapter = db.get_chapter_meta(cid, uid) if cid else None
@@ -3178,6 +3229,9 @@ def _build_world_state_input(uid, cid, *, base_url=None, api_key=None, model=Non
     resolved_base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
     resolved_api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
     resolved_model = model or settings.get("llm_model") or config.LLM_MODEL
+    runtime_limits = _model_runtime_limits(settings, resolved_model)
+    content_limit = runtime_limits["world_state_content_chars"]
+    visible_content, content_truncated = _clip_world_state_content(content, content_limit)
     work_settings = db.get_production_settings(chapter["work_id"], uid) or {}
     evidence_enabled = work_settings.get("evidence_enabled", True)
     cards = db.list_production_cards(chapter["work_id"], uid, cid, include_pending=False) or []
@@ -3252,8 +3306,15 @@ def _build_world_state_input(uid, cid, *, base_url=None, api_key=None, model=Non
         "confirmed_context": context_builder.render_context(
             base_context, {"work_bible", "plot_state", "relationships", "memory", "chapter_summary"}
         )[:16000],
+        "input_policy": {
+            "model_context_window_tokens": runtime_limits["context_window_tokens"],
+            "world_state_content_chars": content_limit,
+            "source_content_chars": len(content),
+            "content_truncated": content_truncated,
+            "truncation_strategy": "chapter_start_and_end" if content_truncated else "full_chapter",
+        },
         "chapter": {"id": cid, "ord": chapter.get("ord"), "title": chapter["title"],
-                    "notes": chapter.get("notes") or "", "content": content[-30000:]},
+                    "notes": chapter.get("notes") or "", "content": visible_content},
     }
     messages = [
         {"role": "system", "content": "你是长篇小说的 World State 连续性编辑。一次分析必须让剧情、人物、设定、记忆和场景彼此一致；输出严格 JSON。"},
@@ -3269,6 +3330,7 @@ def _build_world_state_input(uid, cid, *, base_url=None, api_key=None, model=Non
         "chapter": chapter, "content": content, "source_content_hash": source_content_hash,
         "base_url": resolved_base_url, "api_key": resolved_api_key, "model": resolved_model,
         "provider": provider, "work_settings": work_settings, "evidence_enabled": evidence_enabled,
+        "runtime_limits": runtime_limits,
         "cards": cards, "characters": characters, "plot_before": plot_before,
         "messages": messages, "input_hash": input_hash,
     }
@@ -3634,11 +3696,15 @@ def _estimated_message_tokens(message):
     return 8 + _estimated_text_tokens(message)
 
 
-def _agent_context_budget():
-    window = max(8192, int(config.AGENT_CONTEXT_WINDOW_TOKENS))
+def _agent_context_budget(context_window_tokens=None):
+    configured_window = (
+        config.AGENT_CONTEXT_WINDOW_TOKENS
+        if context_window_tokens is None else context_window_tokens
+    )
+    window = max(1, int(configured_window))
     ratio = min(0.95, max(0.50, float(config.AGENT_CONTEXT_TRIGGER_RATIO)))
-    trigger = max(4096, int(window * ratio))
-    output_reserve = min(max(1024, int(config.AGENT_MAX_OUTPUT_TOKENS)), trigger // 2)
+    trigger = max(1, int(window * ratio))
+    output_reserve = min(max(1, int(config.AGENT_MAX_OUTPUT_TOKENS)), max(1, trigger // 2))
     return {
         "window_tokens": window,
         "trigger_tokens": trigger,
@@ -3659,10 +3725,10 @@ def _agent_request_token_estimate(system_prompt, history, prompt):
 
 
 def _compact_agent_history(messages, summary, *, system_prompt, prompt, base_url, api_key,
-                           model, summary_messages=None):
+                           model, summary_messages=None, context_window_tokens=None):
     """Compact only when the projected full request reaches its token budget."""
     messages = list(messages or [])
-    budget = _agent_context_budget()
+    budget = _agent_context_budget(context_window_tokens)
     estimated = _agent_request_token_estimate(system_prompt, messages, prompt)
     char_override = max(0, int(getattr(config, "AGENT_COMPACT_CHARS", 0) or 0))
     message_chars = sum(_pi_message_size(message) for message in messages)
@@ -3988,8 +4054,12 @@ def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instructio
     estimated_tokens = _agent_request_token_estimate(
         system_prompt, conversation.get("messages") or [], instruction
     )
-    budget = _agent_context_budget()
-    tavily_keys, _, tavily_source = _tavily_key_state(db.get_settings(uid) or {})
+    settings = db.get_settings(uid) or {}
+    active_model = settings.get("llm_model") or config.LLM_MODEL
+    budget = _agent_context_budget(
+        _model_runtime_limits(settings, active_model)["context_window_tokens"]
+    )
+    tavily_keys, _, tavily_source = _tavily_key_state(settings)
     return {
         "engine": "Pi Coding Agent" if config.PI_AGENT_ENABLED else "兼容 Agent 运行时",
         "chapter": ({"id": chapter["id"], "title": chapter["title"], "ord": chapter.get("ord"),
@@ -5097,6 +5167,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
     base_url = st.get("llm_base_url") or config.LLM_BASE_URL
     api_key = st.get("llm_api_key") or config.LLM_API_KEY
     model = st.get("llm_model") or config.LLM_MODEL
+    runtime_limits = _model_runtime_limits(st, model)
     if not api_key:
         raise HTTPException(500, "未配置 API Key，请在设置里填写 base_url / key / 模型")
     cfg = {
@@ -5120,7 +5191,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
     )
     pre_compacted = False
     context_usage = {
-        **_agent_context_budget(),
+        **_agent_context_budget(runtime_limits["context_window_tokens"]),
         "estimated_input_tokens": _agent_request_token_estimate(system_prompt, history, history_text),
     }
     if use_history and history:
@@ -5129,6 +5200,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
                 history, summary, system_prompt=system_prompt, prompt=history_text,
                 base_url=base_url, api_key=api_key, model=model,
                 summary_messages=_pi_messages_for_frontend,
+                context_window_tokens=runtime_limits["context_window_tokens"],
             )
             if pre_compacted:
                 stored_history = list(history)
@@ -5185,7 +5257,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
             f"{config.AGENT_SKILL_AGENT_ID}:user-{uid}:session-"
             f"{session_id if session_id is not None else 'temporary'}"
         ),
-        "contextWindow": config.AGENT_CONTEXT_WINDOW_TOKENS,
+        "contextWindow": runtime_limits["context_window_tokens"],
         "maxTokens": config.AGENT_MAX_OUTPUT_TOKENS,
         "cwd": config.PI_AGENT_WORKSPACE_DIR,
         "skillDirs": [config.PI_AGENT_SKILL_DIR] if config.PI_AGENT_SKILL_DIR else [],
@@ -5213,6 +5285,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
                 raw_messages, summary, system_prompt=system_prompt, prompt="",
                 base_url=base_url, api_key=api_key, model=model,
                 summary_messages=_pi_messages_for_frontend,
+                context_window_tokens=runtime_limits["context_window_tokens"],
             )
             compacted = compacted or post_compacted
         except Exception:
@@ -5264,6 +5337,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
     base_url = st.get("llm_base_url") or config.LLM_BASE_URL
     api_key = st.get("llm_api_key") or config.LLM_API_KEY
     model = st.get("llm_model") or config.LLM_MODEL
+    runtime_limits = _model_runtime_limits(st, model)
     if not api_key:
         raise HTTPException(500, "未配置 API Key，请在「设置」里填 base_url / key / 模型")
     turn_audio = None
@@ -5320,7 +5394,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
     system_for_budget = json.dumps(system_messages + summary_message, ensure_ascii=False)
     pre_compacted = False
     context_usage = {
-        **_agent_context_budget(),
+        **_agent_context_budget(runtime_limits["context_window_tokens"]),
         "estimated_input_tokens": _agent_request_token_estimate(
             system_for_budget, model_history, history_text
         ),
@@ -5330,6 +5404,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
             model_history, summary, pre_compacted, context_usage = _compact_agent_history(
                 model_history, summary, system_prompt=system_for_budget, prompt=history_text,
                 base_url=base_url, api_key=api_key, model=model,
+                context_window_tokens=runtime_limits["context_window_tokens"],
             )
             if pre_compacted:
                 stored_messages = list(model_history)
@@ -5413,6 +5488,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
             msgs, summary, post_compacted, context_usage = _compact_agent_history(
                 msgs, summary, system_prompt=system_for_budget, prompt="",
                 base_url=base_url, api_key=api_key, model=model,
+                context_window_tokens=runtime_limits["context_window_tokens"],
             )
             compacted = compacted or post_compacted
         except Exception:

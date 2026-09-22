@@ -66,6 +66,8 @@ PRODUCTION_SCOPE_TYPES = ("global", "chapter_range", "scene")
 PRODUCTION_PROPOSAL_TYPES = ("new_card", "card_update", "card_state", "scene")
 MAX_LLM_MODELS = 20
 MAX_LLM_MODEL_ID_LENGTH = 160
+DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS = max(1, int(config.AGENT_CONTEXT_WINDOW_TOKENS))
+DEFAULT_WORLD_STATE_CONTENT_CHARS = max(1, int(config.WORLD_STATE_CONTENT_CHARS))
 MAX_TAVILY_API_KEYS = 20
 MAX_TAVILY_API_KEY_LENGTH = 500
 
@@ -94,6 +96,56 @@ def _decode_llm_models(raw, active_model=""):
     except Exception:
         models = []
     return _normalize_llm_models(models, active_model)
+
+
+def _positive_model_limit(value, default):
+    if isinstance(value, bool):
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if value > 0 else default
+
+
+def _decode_model_runtime_options(raw):
+    try:
+        values = json.loads(raw or "{}")
+    except Exception:
+        values = {}
+    if not isinstance(values, dict):
+        return {}
+    result = {}
+    for raw_model, raw_options in values.items():
+        if not isinstance(raw_model, str) or not isinstance(raw_options, dict):
+            continue
+        model = raw_model.strip()[:MAX_LLM_MODEL_ID_LENGTH]
+        if not model:
+            continue
+        result[model] = {
+            "context_window_tokens": _positive_model_limit(
+                raw_options.get("context_window_tokens"), DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+            ),
+            "world_state_content_chars": _positive_model_limit(
+                raw_options.get("world_state_content_chars"), DEFAULT_WORLD_STATE_CONTENT_CHARS,
+            ),
+        }
+    return result
+
+
+def model_runtime_limits(options, model):
+    """Return effective limits for one model without guessing provider capabilities."""
+    options = options if isinstance(options, dict) else {}
+    configured = options.get((model or "").strip())
+    configured = configured if isinstance(configured, dict) else {}
+    return {
+        "context_window_tokens": _positive_model_limit(
+            configured.get("context_window_tokens"), DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+        ),
+        "world_state_content_chars": _positive_model_limit(
+            configured.get("world_state_content_chars"), DEFAULT_WORLD_STATE_CONTENT_CHARS,
+        ),
+    }
 
 
 def normalize_tavily_api_keys(values):
@@ -1026,6 +1078,11 @@ def _migration_world_state_analysis_inputs(conn):
     )
 
 
+def _migration_model_runtime_options(conn):
+    """Keep model-specific context settings separate from shared provider credentials."""
+    _add_col(conn, "user_settings", "llm_model_options_json", "TEXT DEFAULT '{}'")
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
@@ -1042,6 +1099,7 @@ _MIGRATIONS = (
     (13, "integrity_and_world_state_snapshots", _migration_integrity_and_world_state_snapshots),
     (14, "reference_document_fts", _migration_reference_document_fts),
     (15, "world_state_analysis_inputs", _migration_world_state_analysis_inputs),
+    (16, "model_runtime_options", _migration_model_runtime_options),
 )
 
 
@@ -1163,6 +1221,7 @@ def init_db():
                 llm_base_url TEXT,
                 llm_api_key TEXT,
                 llm_model TEXT,
+                llm_model_options_json TEXT DEFAULT '{}',
                 image_base_url TEXT DEFAULT '',
                 image_api_key TEXT DEFAULT '',
                 image_model TEXT DEFAULT '',
@@ -1970,7 +2029,7 @@ def get_settings(user_id):
     """返回该用户的 LLM 设置；没存过返回 None（调用方用 .env 兜底）。"""
     with get_conn() as conn:
         r = conn.execute(
-            "SELECT llm_base_url, llm_api_key, llm_model, llm_models_json, "
+            "SELECT llm_base_url, llm_api_key, llm_model, llm_models_json, llm_model_options_json, "
             "asr_base_url, asr_api_key, asr_model, tavily_api_keys_json, "
             "image_base_url, image_api_key, image_model, image_size "
             "FROM user_settings WHERE user_id=?",
@@ -1982,6 +2041,12 @@ def get_settings(user_id):
         settings["llm_models"] = _decode_llm_models(
             settings.pop("llm_models_json", "[]"), settings.get("llm_model") or "",
         )
+        settings["llm_model_options"] = _decode_model_runtime_options(
+            settings.pop("llm_model_options_json", "{}")
+        )
+        settings.update(model_runtime_limits(
+            settings["llm_model_options"], settings.get("llm_model") or "",
+        ))
         settings["tavily_api_keys"] = _decode_tavily_api_keys(
             settings.pop("tavily_api_keys_json", "[]")
         )
@@ -1991,12 +2056,13 @@ def get_settings(user_id):
 def save_settings(user_id, base_url, api_key, model, asr_model=None,
                   asr_base_url=None, asr_api_key=None, models=None,
                   tavily_api_keys=None, image_base_url=None,
-                  image_api_key=None, image_model=None, image_size=None):
+                  image_api_key=None, image_model=None, image_size=None,
+                  context_window_tokens=None, world_state_content_chars=None):
     """保存设置。api_key 为空或为掩码占位时保留旧值，避免清空已填的 key。"""
     now = time.time()
     with get_conn() as conn:
         old = conn.execute(
-            "SELECT llm_api_key, asr_api_key, llm_model, llm_models_json, "
+            "SELECT llm_api_key, asr_api_key, llm_model, llm_models_json, llm_model_options_json, "
             "tavily_api_keys_json, image_base_url, image_api_key, image_model, image_size "
             "FROM user_settings WHERE user_id=?", (user_id,)
         ).fetchone()
@@ -2020,28 +2086,43 @@ def save_settings(user_id, base_url, api_key, model, asr_model=None,
         model_list = _normalize_llm_models(old_models if models is None else models, model)
         if not model and model_list:
             model = model_list[0]
+        model_options = _decode_model_runtime_options(old["llm_model_options_json"]) if old else {}
+        current_limits = model_runtime_limits(model_options, model)
+        if model:
+            model_options[model] = {
+                "context_window_tokens": _positive_model_limit(
+                    context_window_tokens, current_limits["context_window_tokens"],
+                ),
+                "world_state_content_chars": _positive_model_limit(
+                    world_state_content_chars, current_limits["world_state_content_chars"],
+                ),
+            }
         if tavily_api_keys is None:
             tavily_keys = _decode_tavily_api_keys(old["tavily_api_keys_json"]) if old else []
         else:
             tavily_keys = normalize_tavily_api_keys(tavily_api_keys)
         conn.execute(
             "INSERT INTO user_settings(user_id, llm_base_url, llm_api_key, llm_model, "
-            "llm_models_json, asr_base_url, asr_api_key, asr_model, tavily_api_keys_json, "
+            "llm_models_json, llm_model_options_json, asr_base_url, asr_api_key, asr_model, tavily_api_keys_json, "
             "image_base_url, image_api_key, image_model, image_size, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "llm_base_url=excluded.llm_base_url, llm_api_key=excluded.llm_api_key, "
-            "llm_model=excluded.llm_model, llm_models_json=excluded.llm_models_json, asr_base_url=excluded.asr_base_url, "
+            "llm_model=excluded.llm_model, llm_models_json=excluded.llm_models_json, "
+            "llm_model_options_json=excluded.llm_model_options_json, asr_base_url=excluded.asr_base_url, "
             "asr_api_key=excluded.asr_api_key, asr_model=excluded.asr_model, "
             "tavily_api_keys_json=excluded.tavily_api_keys_json, image_base_url=excluded.image_base_url, "
             "image_api_key=excluded.image_api_key, image_model=excluded.image_model, "
             "image_size=excluded.image_size, updated_at=excluded.updated_at",
             (user_id, base_url, api_key, model, json.dumps(model_list, ensure_ascii=False),
+             json.dumps(model_options, ensure_ascii=False, sort_keys=True),
              asr_base_url or "", asr_api_key, asr_model,
              json.dumps(tavily_keys, ensure_ascii=False), image_base_url or "", image_api_key,
              (image_model or "").strip()[:MAX_LLM_MODEL_ID_LENGTH], image_size, now),
         )
-        return {"model": model, "models": model_list, "tavily_user_key_count": len(tavily_keys),
+        active_limits = model_runtime_limits(model_options, model)
+        return {"model": model, "models": model_list, **active_limits,
+                "tavily_user_key_count": len(tavily_keys),
                 "image_model": (image_model or "").strip()[:MAX_LLM_MODEL_ID_LENGTH],
                 "image_size": image_size}
 
@@ -2054,7 +2135,8 @@ def set_active_llm_model(user_id, model, fallback_models=None):
     now = time.time()
     with get_conn() as conn:
         old = conn.execute(
-            "SELECT llm_model, llm_models_json FROM user_settings WHERE user_id=?", (user_id,)
+            "SELECT llm_model, llm_models_json, llm_model_options_json "
+            "FROM user_settings WHERE user_id=?", (user_id,)
         ).fetchone()
         old_models = _decode_llm_models(old["llm_models_json"], old["llm_model"] or "") if old else []
         model_list = _normalize_llm_models(old_models + list(fallback_models or []))
@@ -2070,7 +2152,8 @@ def set_active_llm_model(user_id, model, fallback_models=None):
                 "INSERT INTO user_settings(user_id, llm_model, llm_models_json, updated_at) VALUES(?,?,?,?)",
                 (user_id, model, json.dumps(model_list, ensure_ascii=False), now),
             )
-        return {"model": model, "models": model_list}
+        model_options = _decode_model_runtime_options(old["llm_model_options_json"]) if old else {}
+        return {"model": model, "models": model_list, **model_runtime_limits(model_options, model)}
 
 
 # ---------- 归属校验 ----------

@@ -278,6 +278,7 @@ c.post(f"/api/chapters/{production_later_chapter}/purge", headers=H(tokA))
 c.post("/api/settings", json={
     "base_url": "https://a.test/v1", "api_key": "sk-alice-secret", "model": "m-a",
     "models": ["m-a", "m-polish", "m-fast"],
+    "context_window_tokens": 200000, "world_state_content_chars": 30000,
     "asr_base_url": "https://asr.test/v1", "asr_api_key": "sk-asr-secret", "asr_model": "whisper-test",
     "image_base_url": "https://image.test/v1", "image_api_key": "sk-image-secret",
     "image_model": "image-test", "image_size": "1024x1536",
@@ -287,6 +288,8 @@ s = c.get("/api/settings", headers=H(tokA)).json()
 ok(s["base_url"] == "https://a.test/v1" and s["model"] == "m-a" and s["asr_model"] == "whisper-test"
    and s["asr_base_url"] == "https://asr.test/v1", "设置读回文字/转写配置")
 ok(s["models"] == ["m-a", "m-polish", "m-fast"], "常用模型 ID 列表读回")
+ok(s["context_window_tokens"] == 200000 and s["world_state_content_chars"] == 30000,
+   "当前模型的上下文与 World State 输入上限可配置")
 ok(s["has_key"] is True and "secret" not in s["api_key_masked"] and s["api_key_masked"].startswith("****"), "key 掩码不泄露明文")
 ok(s["asr_has_key"] is True and "secret" not in s["asr_api_key_masked"], "转写 key 掩码不泄露明文")
 ok(s["image_base_url"] == "https://image.test/v1" and s["image_model"] == "image-test"
@@ -299,8 +302,29 @@ ok(s["tavily_user_key_count"] == 2 and s["tavily_key_source"] == "user"
 _model_switch = c.post("/api/settings/active-model", json={"model": "m-polish"}, headers=H(tokA)).json()
 ok(_model_switch["model"] == "m-polish" and c.get("/api/settings", headers=H(tokA)).json()["model"] == "m-polish",
    "可快速切换当前模型")
+ok(_model_switch["context_window_tokens"] == 200000
+   and _model_switch["world_state_content_chars"] == 30000,
+   "未单独设置的模型使用默认上下文配置")
+c.post("/api/settings", json={
+    "base_url": "https://a.test/v1", "api_key": "", "model": "m-polish",
+    "context_window_tokens": 1000000, "world_state_content_chars": 60000,
+}, headers=H(tokA))
+_model_a_limits = c.post(
+    "/api/settings/active-model", json={"model": "m-a"}, headers=H(tokA),
+).json()
+_model_polish_limits = c.post(
+    "/api/settings/active-model", json={"model": "m-polish"}, headers=H(tokA),
+).json()
+ok(_model_a_limits["context_window_tokens"] == 200000
+   and _model_a_limits["world_state_content_chars"] == 30000
+   and _model_polish_limits["context_window_tokens"] == 1000000
+   and _model_polish_limits["world_state_content_chars"] == 60000,
+   "不同模型分别保存上下文配置")
 ok(c.post("/api/settings/active-model", json={"model": "m-unknown"}, headers=H(tokA)).status_code == 400,
    "未配置模型不能直接切换")
+ok(c.post("/api/settings", json={
+    "base_url": "https://a.test/v1", "model": "m-polish", "context_window_tokens": 0,
+}, headers=H(tokA)).status_code == 400, "上下文设置只校验正整数，不猜测供应商上限")
 # 空 key 提交应保留旧 key
 c.post("/api/settings", json={"base_url": "https://a.test/v1", "api_key": "", "model": "m-a2"}, headers=H(tokA))
 _alice_settings = c.get("/api/settings", headers=H(tokA)).json()
@@ -988,6 +1012,9 @@ c.put(f"/api/chapters/{_long_world_cid}", json={"content": "甲" * 10000 + _long
 _long_calls = {"count": 0}
 def _long_world_state(messages, **kw):
     _long_calls["count"] += 1
+    prompt = json.loads(messages[-1]["content"])
+    _long_calls["visible_content"] = prompt["chapter"]["content"]
+    _long_calls["input_policy"] = prompt["input_policy"]
     return '{"plot":{},"memories":[],"scenes":[],"changes":[],"character_changes":[]}'
 llm.chat = _long_world_state
 _long_first = c.post(
@@ -1000,6 +1027,12 @@ _long_second = c.post(
 ok(_long_calls["count"] == 2 and not _long_second["cache_hit"]
    and _long_first["analysis_input_hash"] != _long_second["analysis_input_hash"],
    "full chapter hash prevents cache reuse when only the truncated prefix changes")
+ok(len(_long_calls["visible_content"]) == 30000
+   and _long_calls["visible_content"].startswith("乙")
+   and _long_calls["visible_content"].endswith("尾")
+   and "正文中段" in _long_calls["visible_content"]
+   and _long_calls["input_policy"]["truncation_strategy"] == "chapter_start_and_end",
+   "World State 按配置限制正文并同时保留章节开头和结尾")
 c.delete(f"/api/chapters/{_long_world_cid}", headers=H(tokA))
 c.post(f"/api/chapters/{_long_world_cid}/purge", headers=H(tokA))
 
@@ -1743,6 +1776,8 @@ ok(_budget["window_tokens"] == 200000 and _budget["trigger_tokens"] == 180000,
    "Agent 默认按 200K 窗口的 90% 计算压缩触发点")
 ok(_budget["input_budget_tokens"] == 180000 - config.AGENT_MAX_OUTPUT_TOKENS,
    "压缩预算会先为模型回答预留 token")
+ok(main._agent_context_budget(1000000)["trigger_tokens"] == 900000,
+   "Agent 压缩预算使用当前模型单独配置的上下文窗口")
 
 # 旧版每章单会话升级时必须完整保留消息、摘要和章节归属。
 _legacy = sqlite3.connect(":memory:")

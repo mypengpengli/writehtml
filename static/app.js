@@ -1339,6 +1339,7 @@ async function exportChap(fmt) {
 
 let activeModelId = "";
 let availableModelIds = [];
+let modelRuntimeOptions = {};
 
 function normalizeModelIds(models, active = "") {
   const result = [];
@@ -1370,6 +1371,9 @@ function toggleTavilyKeyVisibility() {
   if (button) button.title = revealed ? "隐藏输入内容" : "显示输入内容";
 }
 function renderModelSelectors(settings = {}) {
+  if (settings.model_runtime_options && typeof settings.model_runtime_options === "object") {
+    modelRuntimeOptions = settings.model_runtime_options;
+  }
   activeModelId = (settings.model || activeModelId || "").trim();
   availableModelIds = normalizeModelIds(settings.models, activeModelId);
   if (!activeModelId && availableModelIds.length) activeModelId = availableModelIds[0];
@@ -1385,6 +1389,16 @@ function renderModelSelectors(settings = {}) {
   const datalist = $("modelIdOptions");
   if (datalist) datalist.innerHTML = options;
 }
+function loadModelRuntimeFields(model, fallback = {}) {
+  model = (model || "").trim();
+  const limits = modelRuntimeOptions[model] || fallback || {};
+  if ($("setContextWindowTokens")) {
+    $("setContextWindowTokens").value = Number(limits.context_window_tokens || 200000);
+  }
+  if ($("setWorldStateContentChars")) {
+    $("setWorldStateContentChars").value = Number(limits.world_state_content_chars || 30000);
+  }
+}
 async function loadModelSelectors() {
   try {
     renderModelSelectors(await api("/api/settings", { method: "GET" }));
@@ -1399,10 +1413,15 @@ async function switchActiveModel(model) {
   ["modelQuickSwitch", "agentModelSwitch"].forEach(id => { if ($(id)) $(id).disabled = true; });
   try {
     const result = await api("/api/settings/active-model", { body: { model } });
+    modelRuntimeOptions[result.model || model] = {
+      context_window_tokens: result.context_window_tokens,
+      world_state_content_chars: result.world_state_content_chars,
+    };
     renderModelSelectors(result);
     if (!$("setOverlay").classList.contains("hidden")) {
       $("setModel").value = result.model || model;
       $("setModels").value = (result.models || []).join("\n");
+      loadModelRuntimeFields(result.model || model, result);
     }
     showToast(`已切换模型：${result.model || model}`, "ok");
   } catch (e) {
@@ -1418,6 +1437,7 @@ async function openSettings() {
     $("setModel").value = s.model || "";
     $("setModels").value = normalizeModelIds(s.models, s.model).join("\n");
     renderModelSelectors(s);
+    loadModelRuntimeFields(s.model, s);
     $("setAsrBaseUrl").value = s.asr_base_url || "";
     $("setAsrModel").value = s.asr_model || "whisper-1";
     $("setImageBaseUrl").value = s.image_base_url || "";
@@ -1457,6 +1477,8 @@ async function saveSettings() {
   const base_url = $("setBaseUrl").value.trim();
   const model = $("setModel").value.trim();
   const models = $("setModels").value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+  const context_window_tokens = Number($("setContextWindowTokens").value);
+  const world_state_content_chars = Number($("setWorldStateContentChars").value);
   const asr_base_url = $("setAsrBaseUrl").value.trim();
   const asr_model = $("setAsrModel").value.trim();
   let api_key = $("setApiKey").value.trim();
@@ -1475,7 +1497,8 @@ async function saveSettings() {
   setAgentMic(false);
   try {
     const body = {
-      base_url, api_key, model, models, asr_base_url, asr_api_key, asr_model,
+      base_url, api_key, model, models, context_window_tokens, world_state_content_chars,
+      asr_base_url, asr_api_key, asr_model,
       image_base_url: $("setImageBaseUrl").value.trim(), image_api_key,
       image_model: $("setImageModel").value.trim(), image_size: $("setImageSize").value,
     };
@@ -1483,6 +1506,7 @@ async function saveSettings() {
     else if ($("clearTavilyKeys").checked) body.tavily_api_keys = [];
     const result = await api("/api/settings", { body });
     renderModelSelectors(result);
+    loadModelRuntimeFields(result.model || model, result);
     renderTavilyKeyStatus(result);
     $("setModel").value = result.model || model;
     $("setModels").value = (result.models || models).join("\n");

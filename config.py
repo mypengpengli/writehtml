@@ -117,6 +117,7 @@ ADMIN_PASSWORD = os.getenv("WRITEHTML_ADMIN_PASSWORD", "")
 # request (system/story context + tools + chat + reserved answer) reaches 90% of the
 # configured model window. The default matches the project's current 200K-class models.
 AGENT_CONTEXT_WINDOW_TOKENS = int(os.getenv("AGENT_CONTEXT_WINDOW_TOKENS", "200000"))
+WORLD_STATE_CONTENT_CHARS = int(os.getenv("WORLD_STATE_CONTENT_CHARS", "30000"))
 AGENT_CONTEXT_TRIGGER_RATIO = float(os.getenv("AGENT_CONTEXT_TRIGGER_RATIO", "0.90"))
 AGENT_MAX_OUTPUT_TOKENS = int(os.getenv("AGENT_MAX_OUTPUT_TOKENS", "8192"))
 AGENT_PRESERVE_RECENT = int(os.getenv("AGENT_PRESERVE_RECENT", "24"))
