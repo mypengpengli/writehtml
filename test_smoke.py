@@ -115,6 +115,22 @@ ok(cas_saved.status_code == 200 and cas_conflict.status_code == 409
    and cas_conflict.json()["detail"]["server"]["content"] == "设备 A 的新稿"
    and c.get(f"/api/chapters/{cas_cid}", headers=H(tokA)).json()["content"] == "设备 A 的新稿",
    "多端陈旧保存返回冲突且不覆盖服务器正文")
+# The response must contain the revision written by this request, even if an
+# agent writes a newer revision before the route returns.
+_real_update_chapter = db.update_chapter
+def _save_then_agent_write(*args, **kwargs):
+    saved = _real_update_chapter(*args, **kwargs)
+    _real_update_chapter(args[0], args[1], None, "agent wrote after browser save", None)
+    return saved
+db.update_chapter = _save_then_agent_write
+_launder_check = c.put(f"/api/chapters/{cas_cid}", json={
+    "content": "browser second save", "expected_revision": 2,
+}, headers=H(tokA)).json()
+db.update_chapter = _real_update_chapter
+ok(_launder_check["analysis"]["content_revision"] == 3
+   and c.get(f"/api/chapters/{cas_cid}", headers=H(tokA)).json()["content_revision"] == 4,
+   "chapter save returns its own CAS revision instead of laundering a later agent revision")
+
 cas_branch = c.post(f"/api/chapters/{cas_cid}/conflict-branch", json={
     "title": "设备 B 分支", "content": "设备 B 的陈旧覆盖稿", "notes": "保留冲突稿",
 }, headers=H(tokA)).json()
@@ -227,6 +243,21 @@ ok("代价来自寿命" not in db.production_context_digest(wid, _uidA_early, ci
    "读者已知和保密边界按章节版本生效")
 
 # 作者编辑 AI 场景后，该场景升级为人工内容，后续分析替换不能覆盖。
+_old_scene_ids = db.replace_ai_production_scenes(
+    cid, _uidA_early, [{"title": "酒馆"}, {"title": "城门"}],
+)["scene_ids"]
+_inserted_scene_ids = db.replace_ai_production_scenes(
+    cid, _uidA_early, [{"title": "客栈"}, {"title": "酒馆"}, {"title": "城门"}],
+)["scene_ids"]
+ok(_inserted_scene_ids[1:] == _old_scene_ids and _inserted_scene_ids[0] not in _old_scene_ids,
+   "inserting a leading scene does not shift stable scene identities by ordinal")
+db.replace_ai_production_scenes(cid, _uidA_early, [{"title": "客栈"}])
+ok(all(item["id"] not in _old_scene_ids for item in db.list_production_scenes(cid, _uidA_early))
+   and all(any(old["id"] == scene_id and old["is_stale"]
+               for old in db.list_production_scenes(cid, _uidA_early, include_stale=True))
+           for scene_id in _old_scene_ids),
+   "stale AI scenes are hidden by default but remain available for diagnostics")
+
 ai_scene_id = db.replace_ai_production_scenes(cid, _uidA_early, [{"title": "AI 临时场景"}])["scene_ids"][0]
 reconciled_scene_id = db.replace_ai_production_scenes(
     cid, _uidA_early, [{"title": "AI 临时场景", "summary": "重分析后的摘要"}],
@@ -917,6 +948,33 @@ _after_analyze = c.get(f"/api/works/{wid}/entities?chapter_id={state_c2}", heade
 ok(_after_analyze["current_state"]["goal"] == "追查目击者" and _after_analyze["pending_count"] == 1,
    "待确认提议不改变后续 AI 上下文")
 # 模型分析期间正文若变化，整批 World State 结果必须作废，不能部分落库。
+_rejected_character_proposal_id = _analyzed["proposals"][0]["id"]
+ok(c.post(f"/api/character-state-proposals/{_rejected_character_proposal_id}/reject",
+          headers=H(tokA)).status_code == 200,
+   "World State proposal can be rejected before cache replay check")
+_replayed_analysis = c.post(
+    f"/api/chapters/{state_c2}/production/analyze", json={}, headers=H(tokA),
+).json()
+_proposals_after_replay = db.list_character_state_proposals(state_c2, uidA)["proposals"]
+ok(_replayed_analysis["cache_hit"] and _character_prompt["count"] == 1
+   and not any(item["status"] == "pending" for item in _proposals_after_replay),
+   "an applied cached analysis does not recreate a rejected proposal")
+
+# Non-prose inputs are part of the cache key. Editing a character card must
+# trigger a fresh model analysis even when chapter content is unchanged.
+c.put(f"/api/entities/{ent['id']}", json={"summary": "女主角，冷静，人物卡已更新"}, headers=H(tokA))
+_changed_context_analysis = c.post(
+    f"/api/chapters/{state_c2}/production/analyze", json={}, headers=H(tokA),
+).json()
+ok(not _changed_context_analysis["cache_hit"] and _character_prompt["count"] == 2,
+   "World State cache key includes character and story context inputs")
+_forced_analysis = c.post(
+    f"/api/chapters/{state_c2}/production/analyze", json={"force": True}, headers=H(tokA),
+).json()
+ok(not _forced_analysis["cache_hit"]
+   and _forced_analysis["analysis_generation"] == _changed_context_analysis["analysis_generation"] + 1,
+   "forced World State analysis creates a new generation")
+
 stale_world_cid = c.post(f"/api/works/{wid}/chapters", json={"title": "并发分析"}, headers=H(tokA)).json()["id"]
 c.put(f"/api/chapters/{stale_world_cid}", json={"content": "分析开始时的正文"}, headers=H(tokA))
 def _stale_world_state(messages, **kw):

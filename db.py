@@ -6,6 +6,7 @@ import json
 import secrets
 import hashlib
 import re
+from difflib import SequenceMatcher
 from datetime import datetime
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -996,6 +997,35 @@ def _migration_reference_document_fts(conn):
     )
 
 
+def _migration_world_state_analysis_inputs(conn):
+    # These rows are disposable model-output caches. Legacy rows cannot be
+    # trusted because their key omitted most of the analysis prompt inputs.
+    conn.executescript(
+        """
+        DROP TABLE IF EXISTS world_state_analyses;
+        CREATE TABLE world_state_analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chapter_id INTEGER NOT NULL,
+            input_hash TEXT NOT NULL,
+            source_content_hash TEXT NOT NULL,
+            analyzer_version TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            generation INTEGER NOT NULL DEFAULT 1,
+            result_json TEXT NOT NULL,
+            applied_at REAL,
+            created_at REAL NOT NULL,
+            UNIQUE(chapter_id, input_hash, analyzer_version, provider, model, generation),
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+        );
+        CREATE INDEX idx_world_state_analysis_chapter
+            ON world_state_analyses(chapter_id, created_at DESC);
+        CREATE INDEX idx_world_state_analysis_lookup
+            ON world_state_analyses(chapter_id, input_hash, analyzer_version, provider, model, generation DESC);
+        """
+    )
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
@@ -1011,6 +1041,7 @@ _MIGRATIONS = (
     (12, "production_canvas", _migration_production_canvas),
     (13, "integrity_and_world_state_snapshots", _migration_integrity_and_world_state_snapshots),
     (14, "reference_document_fts", _migration_reference_document_fts),
+    (15, "world_state_analysis_inputs", _migration_world_state_analysis_inputs),
 )
 
 
@@ -4495,15 +4526,16 @@ def _production_scene_payload(row):
     return item
 
 
-def list_production_scenes(chapter_id, user_id):
+def list_production_scenes(chapter_id, user_id, include_stale=False):
     with get_conn() as conn:
         if not _chapter_owned(conn, chapter_id, user_id):
             return None
+        stale_clause = "" if include_stale else " AND s.stale=0"
         rows = conn.execute(
             "SELECT s.*,c.content_hash AS chapter_content_hash,p.name AS location_name "
             "FROM production_scenes s JOIN chapters c ON c.id=s.chapter_id "
             "LEFT JOIN production_cards p ON p.id=s.location_card_id "
-            "WHERE s.chapter_id=? ORDER BY s.ord,s.id", (chapter_id,),
+            "WHERE s.chapter_id=?" + stale_clause + " ORDER BY s.ord,s.id", (chapter_id,),
         ).fetchall()
         return [_production_scene_payload(row) for row in rows]
 
@@ -4894,7 +4926,7 @@ def get_production_overview(wid, user_id):
         chapters = [dict(row) for row in conn.execute(
             "SELECT c.id,c.title,c.ord,c.workflow_status,c.analysis_status,c.production_analysis_status,"
             "c.production_analyzed_at,length(c.content) AS chars,"
-            "(SELECT COUNT(*) FROM production_scenes s WHERE s.chapter_id=c.id) AS scene_count,"
+            "(SELECT COUNT(*) FROM production_scenes s WHERE s.chapter_id=c.id AND s.stale=0) AS scene_count,"
             "(SELECT COUNT(*) FROM production_proposals p WHERE p.chapter_id=c.id AND p.status='pending') AS pending_count,"
             "(SELECT COUNT(*) FROM production_impact_flags f WHERE f.affected_chapter_id=c.id AND f.status='open') AS impact_count "
             "FROM chapters c WHERE c.work_id=? AND c.deleted_at IS NULL ORDER BY c.ord", (wid,),
@@ -5017,9 +5049,12 @@ def replace_ai_production_scenes(chapter_id, user_id, scenes):
             return None
         source_hash = chapter["content_hash"] or _content_fingerprint(chapter["content"] or "")
         previous = [dict(row) for row in conn.execute(
-            "SELECT * FROM production_scenes WHERE chapter_id=? AND source='ai' ORDER BY ord,id", (chapter_id,),
+            "SELECT * FROM production_scenes WHERE chapter_id=? AND source='ai' AND stale=0 ORDER BY ord,id",
+            (chapter_id,),
         ).fetchall()]
         unused = {row["id"]: row for row in previous}
+        normalized_titles = [re.sub(r"\s+", "", str(item.get("title") or "")).casefold()
+                             for item in scenes if isinstance(item, dict)]
         result = []
         for index, raw in enumerate(scenes[:40]):
             if not isinstance(raw, dict):
@@ -5035,15 +5070,43 @@ def replace_ai_production_scenes(chapter_id, user_id, scenes):
             evidence_start = raw.get("evidence_start") if isinstance(raw.get("evidence_start"), int) else None
             evidence_end = raw.get("evidence_end") if isinstance(raw.get("evidence_end"), int) else None
             matched = None
-            if evidence_start is not None and evidence_end is not None:
-                matched = next((row for row in unused.values()
-                                if row.get("evidence_start") == evidence_start and row.get("evidence_end") == evidence_end), None)
+            normalized_evidence = re.sub(r"\s+", "", str(raw.get("evidence") or "")).casefold()
+            if normalized_evidence:
+                evidence_matches = [row for row in unused.values()
+                                    if re.sub(r"\s+", "", row.get("evidence") or "").casefold()
+                                    == normalized_evidence]
+                if len(evidence_matches) == 1:
+                    matched = evidence_matches[0]
             if matched is None:
                 normalized_title = re.sub(r"\s+", "", title).casefold()
-                matched = next((row for row in unused.values()
-                                if re.sub(r"\s+", "", row.get("title") or "").casefold() == normalized_title), None)
+                title_matches = [row for row in unused.values()
+                                 if re.sub(r"\s+", "", row.get("title") or "").casefold()
+                                 == normalized_title]
+                if normalized_title and normalized_titles.count(normalized_title) == 1 and len(title_matches) == 1:
+                    matched = title_matches[0]
             if matched is None:
-                matched = next((row for row in unused.values() if row.get("ord") == index + 1), None)
+                def similarity(row):
+                    def ratio(left, right):
+                        left = re.sub(r"\s+", "", str(left or "")).casefold()
+                        right = re.sub(r"\s+", "", str(right or "")).casefold()
+                        return SequenceMatcher(None, left, right).ratio() if left and right else 0.0
+                    title_score = ratio(title, row.get("title"))
+                    evidence_score = ratio(raw.get("evidence"), row.get("evidence"))
+                    goal_score = ratio(raw.get("goal"), row.get("goal"))
+                    summary_score = ratio(raw.get("summary"), row.get("summary"))
+                    location_score = 1.0 if location_id is not None and location_id == row.get("location_card_id") else 0.0
+                    score = (title_score * 0.42 + evidence_score * 0.28 + goal_score * 0.15
+                             + summary_score * 0.10 + location_score * 0.05)
+                    return score, max(title_score, evidence_score)
+                candidates = sorted(
+                    ((similarity(row), row) for row in unused.values()),
+                    key=lambda item: item[0][0], reverse=True,
+                )
+                if candidates:
+                    (best_score, best_anchor), best_row = candidates[0]
+                    runner_up = candidates[1][0][0] if len(candidates) > 1 else 0.0
+                    if best_anchor >= 0.72 and best_score >= 0.68 and best_score - runner_up >= 0.08:
+                        matched = best_row
             payload = (
                 index + 1, title, str(raw.get("summary") or "")[:6000],
                 str(raw.get("time_label") or "")[:500], location_id,
@@ -5104,36 +5167,73 @@ def mark_production_analysis_current(chapter_id, user_id):
         return {"status": "current", "source_content_hash": source_hash, "analyzed_at": now}
 
 
-def get_world_state_analysis(chapter_id, user_id, content_hash, analyzer_version, model):
+def _world_state_analysis_payload(row):
+    if not row:
+        return None
+    try:
+        result = json.loads(row["result_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return {
+        "id": row["id"], "result": result, "input_hash": row["input_hash"],
+        "source_content_hash": row["source_content_hash"], "provider": row["provider"],
+        "model": row["model"], "generation": row["generation"],
+        "applied_at": row["applied_at"], "created_at": row["created_at"],
+    }
+
+
+def get_world_state_analysis(chapter_id, user_id, input_hash, analyzer_version, provider, model):
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT a.result_json,a.created_at FROM world_state_analyses a "
+            "SELECT a.* FROM world_state_analyses a "
             "JOIN chapters c ON c.id=a.chapter_id JOIN works w ON w.id=c.work_id "
-            "WHERE a.chapter_id=? AND w.user_id=? AND a.content_hash=? AND a.analyzer_version=? AND a.model=?",
-            (chapter_id, user_id, content_hash or "", analyzer_version, model or ""),
+            "WHERE a.chapter_id=? AND w.user_id=? AND a.input_hash=? AND a.analyzer_version=? "
+            "AND a.provider=? AND a.model=? ORDER BY a.generation DESC LIMIT 1",
+            (chapter_id, user_id, input_hash or "", analyzer_version, provider or "", model or ""),
         ).fetchone()
-        if not row:
-            return None
-        try:
-            result = json.loads(row["result_json"])
-        except (TypeError, json.JSONDecodeError):
-            return None
-        return {"result": result, "created_at": row["created_at"]}
+        return _world_state_analysis_payload(row)
 
 
-def save_world_state_analysis(chapter_id, user_id, content_hash, analyzer_version, model, result):
+def create_world_state_analysis(chapter_id, user_id, input_hash, source_content_hash,
+                                analyzer_version, provider, model, result, force=False):
+    """Create one immutable analysis generation, or reuse the current generation."""
     now = time.time()
     with get_conn() as conn:
         if not _chapter_owned(conn, chapter_id, user_id):
-            return False
-        conn.execute(
-            "INSERT INTO world_state_analyses(chapter_id,content_hash,analyzer_version,model,result_json,created_at) "
-            "VALUES(?,?,?,?,?,?) ON CONFLICT(chapter_id,content_hash,analyzer_version,model) DO UPDATE SET "
-            "result_json=excluded.result_json,created_at=excluded.created_at",
-            (chapter_id, content_hash or "", analyzer_version, model or "",
-             json.dumps(result, ensure_ascii=False), now),
+            return None
+        existing = conn.execute(
+            "SELECT * FROM world_state_analyses WHERE chapter_id=? AND input_hash=? AND analyzer_version=? "
+            "AND provider=? AND model=? ORDER BY generation DESC LIMIT 1",
+            (chapter_id, input_hash or "", analyzer_version, provider or "", model or ""),
+        ).fetchone()
+        if existing and not force:
+            payload = _world_state_analysis_payload(existing)
+            if payload:
+                payload["created"] = False
+            return payload
+        generation = int(existing["generation"] or 0) + 1 if existing else 1
+        cur = conn.execute(
+            "INSERT INTO world_state_analyses(chapter_id,input_hash,source_content_hash,analyzer_version,"
+            "provider,model,generation,result_json,applied_at,created_at) VALUES(?,?,?,?,?,?,?,?,NULL,?)",
+            (chapter_id, input_hash or "", source_content_hash or "", analyzer_version,
+             provider or "", model or "", generation, json.dumps(result, ensure_ascii=False), now),
         )
-        return True
+        row = conn.execute("SELECT * FROM world_state_analyses WHERE id=?", (cur.lastrowid,)).fetchone()
+        payload = _world_state_analysis_payload(row)
+        if payload:
+            payload["created"] = True
+        return payload
+
+
+def mark_world_state_analysis_applied(analysis_id, user_id):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE world_state_analyses SET applied_at=? WHERE id=? AND applied_at IS NULL "
+            "AND chapter_id IN (SELECT c.id FROM chapters c JOIN works w ON w.id=c.work_id WHERE w.user_id=?)",
+            (now, analysis_id, user_id),
+        )
+        return cur.rowcount == 1
 
 
 # ---------- AI Skills（用户可复用的 agent 指令模板）----------
@@ -5630,7 +5730,8 @@ def update_chapter(cid, user_id, title, content, notes, expected_revision=None):
         if not _chapter_owned(conn, cid, user_id):
             return None
         row = conn.execute(
-            "SELECT id,work_id,title,content,notes,content_hash,content_revision FROM chapters "
+            "SELECT id,work_id,title,content,notes,content_hash,content_revision,analysis_status,analysis_reason "
+            "FROM chapters "
             "WHERE id=? AND deleted_at IS NULL", (cid,),
         ).fetchone()
         if not row:
@@ -5656,7 +5757,10 @@ def update_chapter(cid, user_id, title, content, notes, expected_revision=None):
         content_changed = next_content != (row["content"] or "")
         document_changed = content_changed or next_title != (row["title"] or "") or next_notes != (row["notes"] or "")
         if not document_changed:
-            return {"ok": True, "content_revision": current_revision, "content_hash": row["content_hash"] or ""}
+            return {
+                "ok": True, "content_revision": current_revision, "content_hash": row["content_hash"] or "",
+                "analysis_status": row["analysis_status"], "analysis_reason": row["analysis_reason"] or "",
+            }
 
         next_revision = current_revision + 1
         next_hash = _content_fingerprint(next_content) if content_changed else (row["content_hash"] or _content_fingerprint(next_content))
@@ -5678,7 +5782,11 @@ def update_chapter(cid, user_id, title, content, notes, expected_revision=None):
         if content_changed:
             _invalidate_production_chapter(conn, cid, "正文已修改，需重新分析")
         conn.execute("UPDATE works SET updated_at=? WHERE id=?", (now, row["work_id"]))
-        return {"ok": True, "content_revision": next_revision, "content_hash": next_hash}
+        return {
+            "ok": True, "content_revision": next_revision, "content_hash": next_hash,
+            "analysis_status": "needs_review" if content_changed else row["analysis_status"],
+            "analysis_reason": "正文已修改，需重新分析" if content_changed else (row["analysis_reason"] or ""),
+        }
 
 
 def replace_text_in_chapter(cid, user_id, old, new):

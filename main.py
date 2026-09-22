@@ -1,5 +1,6 @@
 """FastAPI 后端：多用户鉴权 + 作品/章节 CRUD + AI 处理 + 拆分/排序/修订/导出。"""
 import json
+import hashlib
 import secrets
 import difflib
 import base64
@@ -1754,11 +1755,10 @@ async def save_chapter(cid: int, request: Request):
             "message": "服务器存在更新版本，当前草稿未覆盖服务器内容",
             "server": result.get("server") or {},
         })
-    chapter = db.get_chapter_meta(cid, uid) or {}
     return {"ok": True, "analysis": {
-        "content_revision": chapter.get("content_revision"),
-        "status": chapter.get("analysis_status"),
-        "reason": chapter.get("analysis_reason") or "",
+        "content_revision": result.get("content_revision"),
+        "status": result.get("analysis_status"),
+        "reason": result.get("analysis_reason") or "",
     }}
 
 
@@ -3157,7 +3157,32 @@ def _production_evidence_span(content, evidence):
     return (start, start + len(evidence)) if start >= 0 else (None, None)
 
 
-WORLD_STATE_ANALYZER_VERSION = "world-state-v2"
+WORLD_STATE_ANALYZER_VERSION = "world-state-v3"
+
+
+def _cached_world_state_result(uid, chapter, analysis, model, input_hash):
+    production = db.get_chapter_production(chapter["id"], uid) or {}
+    character_data = db.list_character_state_proposals(chapter["id"], uid) or {}
+    character_proposals = [
+        item for item in character_data.get("proposals", [])
+        if item.get("status") == "pending" and not item.get("is_stale")
+    ]
+    memory_data = db.get_story_memory_overview(chapter["work_id"], uid, chapter["id"]) or {}
+    production_proposals = [
+        item for item in production.get("proposals", [])
+        if item.get("status") == "pending" and not item.get("is_stale")
+    ]
+    return {
+        "ok": True, "model": model, "cache_hit": True,
+        "analysis_id": analysis["id"], "analysis_generation": analysis["generation"],
+        "analysis_input_hash": input_hash,
+        "scene_count": len(production.get("scenes") or []),
+        "changes": production_proposals, "character_changes": [],
+        "character_state_proposals": character_proposals,
+        "plot_state_proposal": None, "memory_proposals": memory_data.get("proposals") or [],
+        "source_content_hash": analysis.get("source_content_hash") or "",
+        "production": production,
+    }
 
 
 def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, model=None,
@@ -3256,21 +3281,31 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
         "confirmed_context": context_builder.render_context(
             base_context, {"work_bible", "plot_state", "relationships", "memory", "chapter_summary"}
         )[:16000],
-        "chapter": {"id": cid, "title": chapter["title"], "notes": chapter.get("notes") or "",
+        "chapter": {"id": cid, "ord": chapter.get("ord"), "title": chapter["title"],
+                    "notes": chapter.get("notes") or "",
                     "content": content[-30000:]},
     }
+    system_prompt = "你是长篇小说的 World State 连续性编辑。一次分析必须让剧情、人物、设定、记忆和场景彼此一致；输出严格 JSON。"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+    ]
+    provider = str(base_url or "").strip().rstrip("/")
+    analysis_input_hash = hashlib.sha256(json.dumps(
+        {"messages": messages, "provider": provider, "model": model or ""},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
     snapshot = None if force else db.get_world_state_analysis(
-        cid, uid, source_content_hash, WORLD_STATE_ANALYZER_VERSION, model,
+        cid, uid, analysis_input_hash, WORLD_STATE_ANALYZER_VERSION, provider, model,
     )
     cache_hit = bool(snapshot and isinstance(snapshot.get("result"), dict))
     if cache_hit:
         parsed = snapshot["result"]
     else:
         try:
-            parsed = _parse_json_from_model(llm.chat([
-                {"role": "system", "content": "你是长篇小说的 World State 连续性编辑。一次分析必须让剧情、人物、设定、记忆和场景彼此一致；输出严格 JSON。"},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-            ], base_url=base_url, api_key=api_key, model=model))
+            parsed = _parse_json_from_model(llm.chat(
+                messages, base_url=base_url, api_key=api_key, model=model,
+            ))
         except Exception as exc:
             if raise_on_error:
                 raise HTTPException(502, "生产画布分析失败：" + _provider_error(exc))
@@ -3281,6 +3316,17 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
         return None
     try:
         with db.world_state_transaction(cid, uid, source_content_hash):
+            analysis = db.create_world_state_analysis(
+                cid, uid, analysis_input_hash, source_content_hash,
+                WORLD_STATE_ANALYZER_VERSION, provider, model, parsed, force=force,
+            )
+            if not analysis:
+                raise RuntimeError("failed to persist World State analysis")
+            if not analysis.get("created"):
+                cache_hit = True
+                parsed = analysis["result"]
+            if analysis.get("applied_at") is not None:
+                return _cached_world_state_result(uid, chapter, analysis, model, analysis_input_hash)
             scenes = parsed.get("scenes") if isinstance(parsed.get("scenes"), list) else []
             clean_scenes = []
             for raw in scenes[:40]:
@@ -3367,11 +3413,12 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
             if saved_changes or character_results or plot_proposal or memory_proposals:
                 impact_summary = (plot_summary if plot_proposal else "") or "本章 World State 已发生实质变化"
                 db.propagate_world_state_impact(cid, uid, impact_summary)
-            db.save_world_state_analysis(
-                cid, uid, source_content_hash, WORLD_STATE_ANALYZER_VERSION, model, parsed,
-            )
+            if not db.mark_world_state_analysis_applied(analysis["id"], uid):
+                raise RuntimeError("World State analysis was already applied")
             result = {
                 "ok": True, "model": model, "cache_hit": cache_hit, "scene_count": len(clean_scenes),
+                "analysis_id": analysis["id"], "analysis_generation": analysis["generation"],
+                "analysis_input_hash": analysis_input_hash,
                 "changes": saved_changes, "character_changes": character_results,
                 "character_state_proposals": [item["item"] for item in character_results if item["kind"] == "proposal"],
                 "plot_state_proposal": plot_proposal, "memory_proposals": memory_proposals,
