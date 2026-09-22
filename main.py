@@ -9,6 +9,8 @@ import zipfile
 import time
 import threading
 import queue
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote
 
 import yaml
@@ -30,13 +32,52 @@ async def add_browser_permission_headers(request: Request, call_next):
     response.headers.setdefault("Permissions-Policy", "microphone=(self)")
     # HTML 引用了带版本号的前端资源；入口和未指纹化资源仍要求浏览器每次校验，
     # 避免发布瞬间出现新 HTML 配旧 CSS/JS 的混合版本。
-    if request.url.path in {"/", "/index.html", "/style.css", "/app.js"}:
+    if request.url.path in {"/", "/index.html"}:
         response.headers["Cache-Control"] = "no-cache"
+    elif request.url.path in {"/style.css", "/app.js"}:
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if request.query_params.get("v") else "no-cache"
+        )
     return response
 
 
 # 内存里的登录态：token -> user_id（单进程、重启即失效，需重登）
 _sessions = {}
+
+# Agent turns are resource-heavy (Pi launches a Node process). A bounded pool keeps
+# accidental double-clicks from spawning an unbounded number of threads/processes.
+_agent_executor = ThreadPoolExecutor(
+    max_workers=config.PI_AGENT_MAX_CONCURRENT_TURNS,
+    thread_name_prefix="agent-turn",
+)
+_agent_scope_locks = {}
+_agent_scope_locks_guard = threading.Lock()
+
+
+def _acquire_agent_scope_lock(uid, body):
+    if (body.get("conversation_mode") or "standard") == "temporary":
+        return None
+    cid = _optional_body_int(body, "chapter_id")
+    work_id = _optional_body_int(body, "work_id")
+    scope = db.resolve_agent_scope(uid, cid, work_id)
+    if not scope:
+        raise HTTPException(404, "作品或章节不存在")
+    key = (uid, scope["scope_key"])
+    with _agent_scope_locks_guard:
+        lock = _agent_scope_locks.setdefault(key, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "当前会话已有一轮正在执行，请等待完成后再发送")
+    return key, lock
+
+
+def _release_agent_scope_lock(handle):
+    if not handle:
+        return
+    key, lock = handle
+    lock.release()
+    with _agent_scope_locks_guard:
+        if not lock.locked() and _agent_scope_locks.get(key) is lock:
+            _agent_scope_locks.pop(key, None)
 
 
 def _auth(request: Request):
@@ -692,11 +733,13 @@ async def expand_sandbox_node(sid: int, request: Request):
         "author_instruction": instruction,
     }
     try:
-        parsed = _parse_json_from_model(llm.chat(
+        raw = await asyncio.to_thread(
+            llm.chat,
             [{"role": "system", "content": "你是小说策划编辑，候选分支要互有差异且不替作者强行定稿。"},
              {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
             base_url=base_url, api_key=api_key, model=model,
-        ))
+        )
+        parsed = _parse_json_from_model(raw)
     except Exception as exc:
         raise HTTPException(502, f"AI 展开失败：{_provider_error(exc)}") from exc
     if isinstance(parsed, dict):
@@ -895,7 +938,14 @@ async def resolve_production_impact(impact_id: int, request: Request):
 
 @app.post("/api/chapters/{cid}/production/analyze")
 async def analyze_chapter_production(cid: int, request: Request):
-    return _generate_production_analysis(_auth(request), cid, raise_on_error=True)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return await asyncio.to_thread(
+        _generate_production_analysis, _auth(request), cid,
+        raise_on_error=True, force=bool(body.get("force")),
+    )
 
 
 def _default_character_image_prompt(entity, state=None):
@@ -980,11 +1030,12 @@ async def polish_entity_image_prompt(eid: int, request: Request):
         "draft_prompt": draft,
     }
     try:
-        prompt = llm.chat(
+        prompt = (await asyncio.to_thread(
+            llm.chat,
             [{"role": "system", "content": "You are a senior character concept-art prompt editor."},
              {"role": "user", "content": json.dumps(instruction, ensure_ascii=False)}],
             **cfg,
-        ).strip()
+        )).strip()
     except Exception as exc:
         raise HTTPException(502, "AI 整理角色图提示词失败：" + _provider_error(exc, 300))
     prompt = re.sub(r"^```(?:text)?\s*|\s*```$", "", prompt, flags=re.I).strip()[:8000]
@@ -1172,7 +1223,14 @@ async def get_character_state_proposals(cid: int, request: Request):
 @app.post("/api/chapters/{cid}/character-state-proposals/analyze")
 async def analyze_character_state_proposals(cid: int, request: Request):
     uid = _auth(request)
-    analysis = _generate_production_analysis(uid, cid, raise_on_error=True)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    analysis = await asyncio.to_thread(
+        _generate_production_analysis, uid, cid,
+        raise_on_error=True, force=bool(body.get("force")),
+    )
     proposals = analysis.get("character_state_proposals") or []
     return {"proposals": proposals}
 
@@ -1245,7 +1303,14 @@ async def save_plot_state_version(wid: int, request: Request):
 
 @app.post("/api/chapters/{cid}/plot-state-proposals/analyze")
 async def analyze_plot_state_proposals(cid: int, request: Request):
-    analysis = _generate_production_analysis(_auth(request), cid, raise_on_error=True)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    analysis = await asyncio.to_thread(
+        _generate_production_analysis, _auth(request), cid,
+        raise_on_error=True, force=bool(body.get("force")),
+    )
     proposal = analysis.get("plot_state_proposal")
     return {"proposal": proposal}
 
@@ -1338,7 +1403,14 @@ async def search_story_memories_api(wid: int, request: Request):
 
 @app.post("/api/chapters/{cid}/story-memories/analyze")
 async def analyze_story_memories(cid: int, request: Request):
-    analysis = _generate_production_analysis(_auth(request), cid, raise_on_error=True)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    analysis = await asyncio.to_thread(
+        _generate_production_analysis, _auth(request), cid,
+        raise_on_error=True, force=bool(body.get("force")),
+    )
     proposals = analysis.get("memory_proposals") or []
     return {"proposals": proposals}
 
@@ -1648,9 +1720,12 @@ async def new_chapter(wid: int, request: Request):
 @app.post("/api/works/{wid}/reorder")
 async def reorder(wid: int, request: Request):
     body = await request.json()
-    if not db.reorder_chapters(wid, _auth(request), body.get("ids", [])):
+    result = db.reorder_chapters(wid, _auth(request), body.get("ids", []))
+    if result is None:
         raise HTTPException(404, "作品不存在")
-    return {"ok": True}
+    if result.get("invalid_order"):
+        raise HTTPException(400, "章节排序必须完整包含本作品的全部章节，且不能重复")
+    return result
 
 
 @app.get("/api/chapters/{cid}")
@@ -1665,8 +1740,20 @@ async def get_chapter(cid: int, request: Request):
 async def save_chapter(cid: int, request: Request):
     uid = _auth(request)
     body = await request.json()
-    if not db.update_chapter(cid, uid, body.get("title"), body.get("content"), body.get("notes")):
+    result = db.update_chapter(
+        cid, uid, body.get("title"), body.get("content"), body.get("notes"),
+        expected_revision=body.get("expected_revision") if "expected_revision" in body else None,
+    )
+    if result is None:
         raise HTTPException(404, "章节不存在")
+    if result.get("invalid_revision"):
+        raise HTTPException(400, "expected_revision 必须是整数")
+    if result.get("conflict"):
+        raise HTTPException(409, {
+            "code": "chapter_revision_conflict",
+            "message": "服务器存在更新版本，当前草稿未覆盖服务器内容",
+            "server": result.get("server") or {},
+        })
     chapter = db.get_chapter_meta(cid, uid) or {}
     return {"ok": True, "analysis": {
         "content_revision": chapter.get("content_revision"),
@@ -1710,13 +1797,13 @@ async def get_chapter_consistency_alerts(cid: int, request: Request):
 
 @app.post("/api/chapters/{cid}/review")
 async def review_chapter(cid: int, request: Request):
-    return _run_chapter_review(_auth(request), cid, raise_on_error=True)
+    return await asyncio.to_thread(_run_chapter_review, _auth(request), cid, raise_on_error=True)
 
 
 @app.post("/api/chapters/{cid}/reanalyze")
 async def reanalyze_chapter(cid: int, request: Request):
     """Explicit refresh for source-stale cards, alerts and story memory proposals."""
-    return _run_chapter_review(_auth(request), cid, raise_on_error=True)
+    return await asyncio.to_thread(_run_chapter_review, _auth(request), cid, raise_on_error=True)
 
 
 @app.post("/api/consistency-alerts/{alert_id}/dismiss")
@@ -1845,6 +1932,17 @@ async def branch_from_revision(cid: int, rid: int, request: Request):
         raise HTTPException(404, "章节不存在")
     if result is False:
         raise HTTPException(404, "历史版本不存在")
+    return result
+
+
+@app.post("/api/chapters/{cid}/conflict-branch")
+async def branch_from_editor_conflict(cid: int, request: Request):
+    body = await request.json()
+    result = db.create_chapter_conflict_branch(
+        cid, _auth(request), body.get("title", ""), body.get("content", ""), body.get("notes", ""),
+    )
+    if result is None:
+        raise HTTPException(404, "章节不存在")
     return result
 
 
@@ -1991,7 +2089,7 @@ async def apply_edit_proposal(cid: int, request: Request):
     if result.get("invalid"):
         raise HTTPException(400, "改稿预览已经失效")
     # 只有作者确认落稿后才生成状态建议，避免预览阶段产生幽灵剧情记录。
-    analysis = _generate_production_analysis(uid, cid)
+    analysis = await asyncio.to_thread(_generate_production_analysis, uid, cid)
     return {
         **result,
         "character_state_proposals": (analysis or {}).get("character_state_proposals") or [],
@@ -2061,8 +2159,10 @@ async def do_process(request: Request):
         bible = ""
         if cid:
             bible = _agent_bible(chap["work_id"], uid, cid)
-        result = llm.process(mode, text, context, notes, bible=bible,
-                             base_url=base_url, api_key=api_key, model=model, style=style)
+        result = await asyncio.to_thread(
+            llm.process, mode, text, context, notes, bible=bible,
+            base_url=base_url, api_key=api_key, model=model, style=style,
+        )
     else:
         raise HTTPException(400, "未知模式")
 
@@ -2082,8 +2182,9 @@ async def do_process(request: Request):
         seg = db.add_segment(cid, uid, seg_raw, result, mode)
     world_state = None
     if seg and mode in ("润色", "扩写", "续写", "找回"):
-        world_state = _generate_production_analysis(
-            uid, cid, base_url=base_url, api_key=api_key, model=model,
+        world_state = await asyncio.to_thread(
+            _generate_production_analysis, uid, cid,
+            base_url=base_url, api_key=api_key, model=model,
         )
     return {"result": result, "raw": seg_raw, "mode": mode, "content": seg["content"] if seg else None,
             "character_state_proposals": (world_state or {}).get("character_state_proposals") or [],
@@ -2124,7 +2225,9 @@ async def chat(request: Request):
             if tail:
                 sys_ctx.append({"role": "system", "content":
                     "当前正文末尾（供理解上下文，不要重复或改写）：\n" + tail})
-    reply = llm.chat(sys_ctx + msgs, base_url=base_url, api_key=api_key, model=model)
+    reply = await asyncio.to_thread(
+        llm.chat, sys_ctx + msgs, base_url=base_url, api_key=api_key, model=model,
+    )
     return {"reply": reply}
 
 
@@ -2508,7 +2611,9 @@ async def analyze_work_style(wid: int, request: Request):
     if used < 300:
         raise HTTPException(400, "正文太少，至少写几段后再提炼语言指纹")
     try:
-        result = _analyze_creative_materials(uid, "作者当前作品正文", "\n\n".join(samples))
+        result = await asyncio.to_thread(
+            _analyze_creative_materials, uid, "作者当前作品正文", "\n\n".join(samples),
+        )
         profile = materials.save_style_profile(
             uid, wid, result["style_profile"], source_kind="author_text", source_label="当前作品正文"
         )
@@ -2537,7 +2642,9 @@ async def extract_disassembly_materials(job_id: int, request: Request):
             "relations": result.get("relations") or [],
         }, ensure_ascii=False))
     try:
-        extracted = _analyze_creative_materials(uid, source["job"]["source_name"], "\n".join(blocks))
+        extracted = await asyncio.to_thread(
+            _analyze_creative_materials, uid, source["job"]["source_name"], "\n".join(blocks),
+        )
         wid = source["job"]["target_work_id"]
         profile = materials.save_style_profile(
             uid, wid, extracted["style_profile"], source_kind="disassembly",
@@ -2660,11 +2767,13 @@ async def run_disassembly_step(job_id: int, request: Request):
         f"已有设定：\n{existing or '暂无'}\n\n章节正文：\n{content}"
     )
     try:
-        parsed = _parse_json_from_model(llm.chat(
+        raw = await asyncio.to_thread(
+            llm.chat,
             [{"role": "system", "content": "你是长篇小说拆书编辑，必须以原文证据为准，不虚构未出现的设定。"},
              {"role": "user", "content": prompt}],
             base_url=base_url, api_key=api_key, model=model,
-        ))
+        )
+        parsed = _parse_json_from_model(raw)
         result = _normalize_disassembly_result(parsed)
         updated = db.complete_disassembly_chapter(job_id, uid, chapter["id"], result)
         return {"ok": True, "chapter_id": chapter["id"], "result": result, "job": updated}
@@ -2721,8 +2830,10 @@ async def transcribe_audio(request: Request):
     elif "wav" in mime:
         ext = "wav"
     try:
-        text = llm.transcribe(audio, filename=f"speech.{ext}", mime_type=mime,
-                              base_url=asr["base_url"], api_key=asr["api_key"], model=asr["model"])
+        text = await asyncio.to_thread(
+            llm.transcribe, audio, filename=f"speech.{ext}", mime_type=mime,
+            base_url=asr["base_url"], api_key=asr["api_key"], model=asr["model"],
+        )
     except Exception as e:
         raise HTTPException(502, "语音转写服务不可用。请检查中转站 Base URL、Key、转写模型 ID；"
                             "该中转站必须实际提供 /audio/transcriptions，普通聊天接口不能代替此路由。"
@@ -3046,8 +3157,11 @@ def _production_evidence_span(content, evidence):
     return (start, start + len(evidence)) if start >= 0 else (None, None)
 
 
+WORLD_STATE_ANALYZER_VERSION = "world-state-v2"
+
+
 def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, model=None,
-                                  raise_on_error=False):
+                                  raise_on_error=False, force=False):
     """Run the canonical World State pass and persist every derived chapter view once."""
     chapter = db.get_chapter_meta(cid, uid) if cid else None
     if not chapter:
@@ -3072,7 +3186,7 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
     evidence_enabled = work_settings.get("evidence_enabled", True)
     cards = db.list_production_cards(chapter["work_id"], uid, cid, include_pending=False) or []
     characters = db.list_character_cards(chapter["work_id"], uid, cid) or []
-    plot_overview = db.get_plot_state_overview(chapter["work_id"], uid, cid) or {}
+    plot_overview = db.get_plot_state_at(chapter["work_id"], uid, cid) or {}
     plot_before = _short_plot_state(plot_overview.get("current_state"))
     compact_cards = [{
         "id": item["id"], "category": item["category"], "name": item["name"],
@@ -3086,6 +3200,7 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
     } for item in characters[:80]]
     base_context = context_builder.build_context(
         uid, "analyze_world_state", chapter["work_id"], cid, token_budget=16000,
+        profile="world_state",
     ) or {"context_items": []}
     prompt = {
         "task": "对当前小说章节执行一次完整 World State 分析。一次性返回剧情、人物、故事记忆、设定卡变化和场景结构，所有结果必须来自同一份正文与同一时点。",
@@ -3125,6 +3240,7 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
             "场景按正文顺序排列；不要按自然段机械切分，地点、目标或冲突明显变化时才分场。",
             "只记录本章正文明确支持的变化，不预测后续，不把临时动作误写成长期设定。",
             "已存在卡片必须填写 target_id；正文首次出现且确有后续价值的规则、地点、技能、道具或组织才用 new_card。",
+            "作品 custom_fields 中定义的字段写入 after.attributes，并遵守 number、boolean、enum、level 的类型与选项。",
             "普通变化仅指位置、持有状态、熟练度、短期可逆状态；新卡、死亡、能力获得/失去、规则真相、归属永久变化均为 major。",
             "after 对 new_card 使用 name/summary/detail/attributes/truth/reader_state；对 card_state 使用 state 对象。",
             "设定卡随章节变化的读者已知、人物认知、保密边界、读者侧状态分别写入 state 的 _reader_known、_character_knowledge、_secrecy、_reader_state，不要用后期信息覆盖早期时点。",
@@ -3134,6 +3250,7 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
              else "evidence 返回空字符串，不需要生成证据。"),
         ],
         "known_cards": compact_cards,
+        "custom_fields": work_settings.get("custom_fields") or [],
         "known_characters": compact_characters,
         "confirmed_plot_state": plot_before,
         "confirmed_context": context_builder.render_context(
@@ -3142,117 +3259,132 @@ def _generate_production_analysis(uid, cid, *, base_url=None, api_key=None, mode
         "chapter": {"id": cid, "title": chapter["title"], "notes": chapter.get("notes") or "",
                     "content": content[-30000:]},
     }
-    try:
-        parsed = _parse_json_from_model(llm.chat([
-            {"role": "system", "content": "你是长篇小说的 World State 连续性编辑。一次分析必须让剧情、人物、设定、记忆和场景彼此一致；输出严格 JSON。"},
-            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-        ], base_url=base_url, api_key=api_key, model=model))
-    except Exception as exc:
-        if raise_on_error:
-            raise HTTPException(502, "生产画布分析失败：" + _provider_error(exc))
-        return None
+    snapshot = None if force else db.get_world_state_analysis(
+        cid, uid, source_content_hash, WORLD_STATE_ANALYZER_VERSION, model,
+    )
+    cache_hit = bool(snapshot and isinstance(snapshot.get("result"), dict))
+    if cache_hit:
+        parsed = snapshot["result"]
+    else:
+        try:
+            parsed = _parse_json_from_model(llm.chat([
+                {"role": "system", "content": "你是长篇小说的 World State 连续性编辑。一次分析必须让剧情、人物、设定、记忆和场景彼此一致；输出严格 JSON。"},
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ], base_url=base_url, api_key=api_key, model=model))
+        except Exception as exc:
+            if raise_on_error:
+                raise HTTPException(502, "生产画布分析失败：" + _provider_error(exc))
+            return None
     if not isinstance(parsed, dict):
         if raise_on_error:
             raise HTTPException(502, "生产画布分析没有返回有效 JSON")
         return None
-    current = db.get_chapter_meta(cid, uid)
-    if not current or (current.get("content_hash") or "") != source_content_hash:
+    try:
+        with db.world_state_transaction(cid, uid, source_content_hash):
+            scenes = parsed.get("scenes") if isinstance(parsed.get("scenes"), list) else []
+            clean_scenes = []
+            for raw in scenes[:40]:
+                if not isinstance(raw, dict):
+                    continue
+                evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
+                start, end = _production_evidence_span(content, evidence)
+                clean = dict(raw)
+                clean.update({"evidence": evidence, "evidence_start": start, "evidence_end": end})
+                clean_scenes.append(clean)
+            db.replace_ai_production_scenes(cid, uid, clean_scenes)
+            saved_changes = []
+            for raw in (parsed.get("changes") if isinstance(parsed.get("changes"), list) else [])[:60]:
+                if not isinstance(raw, dict):
+                    continue
+                evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
+                start, end = _production_evidence_span(content, evidence)
+                item = dict(raw)
+                item.update({"evidence": evidence, "evidence_start": start, "evidence_end": end})
+                saved = db.upsert_production_proposal(chapter["work_id"], uid, cid, item)
+                if not saved or saved.get("invalid") or saved.get("invalid_type") or saved.get("invalid_target"):
+                    continue
+                auto_applied = saved.get("severity") == "ordinary" and saved.get("proposal_type") == "card_state"
+                if auto_applied:
+                    applied = db.resolve_production_proposal(saved["id"], uid, True)
+                    saved["status"] = "accepted" if applied and applied.get("ok") else saved["status"]
+                    saved["auto_applied"] = bool(applied and applied.get("ok"))
+                saved_changes.append(saved)
+            character_results = []
+            known_character_ids = {item["id"] for item in characters}
+            for raw in (parsed.get("character_changes") if isinstance(parsed.get("character_changes"), list) else [])[:40]:
+                if not isinstance(raw, dict):
+                    continue
+                entity_id = raw.get("entity_id")
+                if isinstance(entity_id, str) and entity_id.isdigit():
+                    entity_id = int(entity_id)
+                if entity_id not in known_character_ids:
+                    continue
+                known_character = next(item for item in characters if item["id"] == entity_id)
+                before = _short_character_state(known_character.get("current_state"))
+                state = db.normalize_character_state(raw.get("state"), before)
+                summary = str(raw.get("change_summary") or "").strip()
+                if state == before or not db.character_state_has_content(state) or not summary:
+                    continue
+                evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
+                if raw.get("severity") == "ordinary":
+                    saved = db.create_character_state_version(
+                        entity_id, uid, cid, state, summary, evidence, source="ai",
+                    )
+                    kind = "version"
+                else:
+                    saved = db.upsert_character_state_proposal(
+                        entity_id, uid, cid, state, summary, evidence,
+                    )
+                    kind = "proposal"
+                if saved and not saved.get("empty_state"):
+                    character_results.append({"kind": kind, "item": saved})
+            plot_proposal = None
+            plot_raw = parsed.get("plot") if isinstance(parsed.get("plot"), dict) else parsed.get("plot_state")
+            if isinstance(plot_raw, dict):
+                raw_state = plot_raw.get("state") if isinstance(plot_raw.get("state"), dict) else {
+                    field: plot_raw.get(field, "") for field in db.PLOT_STATE_FIELDS
+                }
+                plot_state = db.normalize_plot_state(raw_state, plot_before)
+                plot_summary = str(plot_raw.get("change_summary") or "").strip()
+                if plot_summary and plot_state != plot_before and db.plot_state_has_content(plot_state):
+                    plot_proposal = db.upsert_plot_state_proposal(
+                        chapter["work_id"], uid, cid, plot_state, plot_summary,
+                        str(plot_raw.get("evidence") or "") if evidence_enabled else "",
+                    )
+                    if plot_proposal and plot_proposal.get("empty_state"):
+                        plot_proposal = None
+            memory_proposals = []
+            memory_items = parsed.get("memories") if isinstance(parsed.get("memories"), list) else parsed.get("memory_items")
+            for item in memory_items[:24] if isinstance(memory_items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                if not evidence_enabled:
+                    item = {**item, "evidence": ""}
+                saved = db.upsert_story_memory_proposal(chapter["work_id"], uid, cid, item)
+                if saved and not saved.get("invalid") and not saved.get("invalid_type"):
+                    memory_proposals.append(saved)
+            db.mark_production_analysis_current(cid, uid)
+            if saved_changes or character_results or plot_proposal or memory_proposals:
+                impact_summary = (plot_summary if plot_proposal else "") or "本章 World State 已发生实质变化"
+                db.propagate_world_state_impact(cid, uid, impact_summary)
+            db.save_world_state_analysis(
+                cid, uid, source_content_hash, WORLD_STATE_ANALYZER_VERSION, model, parsed,
+            )
+            result = {
+                "ok": True, "model": model, "cache_hit": cache_hit, "scene_count": len(clean_scenes),
+                "changes": saved_changes, "character_changes": character_results,
+                "character_state_proposals": [item["item"] for item in character_results if item["kind"] == "proposal"],
+                "plot_state_proposal": plot_proposal, "memory_proposals": memory_proposals,
+                "source_content_hash": source_content_hash,
+                "production": db.get_chapter_production(cid, uid),
+            }
+    except db.StaleWorldStateError:
         if raise_on_error:
             raise HTTPException(409, "分析期间正文已变化，本轮结果未保存，请重新分析")
         return {"ok": False, "stale": True, "chapter_id": cid, "scene_count": 0,
                 "changes": [], "character_changes": [], "memory_proposals": [],
                 "plot_state_proposal": None}
-    scenes = parsed.get("scenes") if isinstance(parsed.get("scenes"), list) else []
-    clean_scenes = []
-    for raw in scenes[:40]:
-        if not isinstance(raw, dict):
-            continue
-        evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
-        start, end = _production_evidence_span(content, evidence)
-        clean = dict(raw)
-        clean.update({"evidence": evidence, "evidence_start": start, "evidence_end": end})
-        clean_scenes.append(clean)
-    db.replace_ai_production_scenes(cid, uid, clean_scenes)
-    saved_changes = []
-    for raw in (parsed.get("changes") if isinstance(parsed.get("changes"), list) else [])[:60]:
-        if not isinstance(raw, dict):
-            continue
-        evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
-        start, end = _production_evidence_span(content, evidence)
-        item = dict(raw)
-        item.update({"evidence": evidence, "evidence_start": start, "evidence_end": end})
-        saved = db.upsert_production_proposal(chapter["work_id"], uid, cid, item)
-        if not saved or saved.get("invalid") or saved.get("invalid_type") or saved.get("invalid_target"):
-            continue
-        auto_applied = saved.get("severity") == "ordinary" and saved.get("proposal_type") == "card_state"
-        if auto_applied:
-            applied = db.resolve_production_proposal(saved["id"], uid, True)
-            saved["status"] = "accepted" if applied and applied.get("ok") else saved["status"]
-            saved["auto_applied"] = bool(applied and applied.get("ok"))
-        saved_changes.append(saved)
-    character_results = []
-    known_character_ids = {item["id"] for item in characters}
-    for raw in (parsed.get("character_changes") if isinstance(parsed.get("character_changes"), list) else [])[:40]:
-        if not isinstance(raw, dict):
-            continue
-        entity_id = raw.get("entity_id")
-        if isinstance(entity_id, str) and entity_id.isdigit():
-            entity_id = int(entity_id)
-        if entity_id not in known_character_ids:
-            continue
-        known_character = next(item for item in characters if item["id"] == entity_id)
-        before = _short_character_state(known_character.get("current_state"))
-        state = db.normalize_character_state(raw.get("state"), before)
-        summary = str(raw.get("change_summary") or "").strip()
-        if state == before or not db.character_state_has_content(state) or not summary:
-            continue
-        evidence = str(raw.get("evidence") or "") if evidence_enabled else ""
-        if raw.get("severity") == "ordinary":
-            saved = db.create_character_state_version(
-                entity_id, uid, cid, state, summary, evidence, source="ai",
-            )
-            kind = "version"
-        else:
-            saved = db.upsert_character_state_proposal(
-                entity_id, uid, cid, state, summary, evidence,
-            )
-            kind = "proposal"
-        if saved and not saved.get("empty_state"):
-            character_results.append({"kind": kind, "item": saved})
-    plot_proposal = None
-    plot_raw = parsed.get("plot") if isinstance(parsed.get("plot"), dict) else parsed.get("plot_state")
-    if isinstance(plot_raw, dict):
-        raw_state = plot_raw.get("state") if isinstance(plot_raw.get("state"), dict) else {
-            field: plot_raw.get(field, "") for field in db.PLOT_STATE_FIELDS
-        }
-        plot_state = db.normalize_plot_state(raw_state, plot_before)
-        plot_summary = str(plot_raw.get("change_summary") or "").strip()
-        if plot_summary and plot_state != plot_before and db.plot_state_has_content(plot_state):
-            plot_proposal = db.upsert_plot_state_proposal(
-                chapter["work_id"], uid, cid, plot_state, plot_summary,
-                str(plot_raw.get("evidence") or "") if evidence_enabled else "",
-            )
-            if plot_proposal and plot_proposal.get("empty_state"):
-                plot_proposal = None
-    memory_proposals = []
-    memory_items = parsed.get("memories") if isinstance(parsed.get("memories"), list) else parsed.get("memory_items")
-    for item in memory_items[:24] if isinstance(memory_items, list) else []:
-        if not isinstance(item, dict):
-            continue
-        if not evidence_enabled:
-            item = {**item, "evidence": ""}
-        saved = db.upsert_story_memory_proposal(chapter["work_id"], uid, cid, item)
-        if saved and not saved.get("invalid") and not saved.get("invalid_type"):
-            memory_proposals.append(saved)
-    db.mark_production_analysis_current(cid, uid)
-    return {
-        "ok": True, "model": model, "scene_count": len(clean_scenes),
-        "changes": saved_changes, "character_changes": character_results,
-        "character_state_proposals": [item["item"] for item in character_results if item["kind"] == "proposal"],
-        "plot_state_proposal": plot_proposal, "memory_proposals": memory_proposals,
-        "source_content_hash": source_content_hash,
-        "production": db.get_chapter_production(cid, uid),
-    }
+    return result
 
 
 def _parse_json_from_model(raw):
@@ -3281,283 +3413,6 @@ def _short_character_state(state):
 
 def _short_plot_state(state):
     return {field: (state or {}).get(field, "") for field in db.PLOT_STATE_FIELDS}
-
-
-def _generate_character_state_proposals(uid, cid, *, base_url=None, api_key=None, model=None,
-                                        raise_on_error=False):
-    """根据当前章正文提取人物变化。失败不阻断主写作，且永远只生成待确认提议。"""
-    chapter = db.get_chapter_meta(cid, uid) if cid else None
-    if not chapter:
-        if raise_on_error:
-            raise HTTPException(404, "章节不存在")
-        return []
-    # 同一章已经被作者确认过的状态也算当前事实；连续多次写作不能退回到章前状态。
-    characters = db.list_character_cards(chapter["work_id"], uid, cid) or []
-    if not characters or not (chapter.get("content") or "").strip():
-        return []
-
-    settings = db.get_settings(uid) or {}
-    base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
-    api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
-    model = model or settings.get("llm_model") or config.LLM_MODEL
-    if not api_key:
-        if raise_on_error:
-            raise HTTPException(500, "未配置 API Key，无法提取人物状态")
-        return []
-
-    cards = []
-    known = {}
-    for character in characters:
-        known[character["id"]] = character
-        cards.append({
-            "entity_id": character["id"],
-            "name": character["name"],
-            "summary": (character.get("summary") or "")[:900],
-            "detail": (character.get("detail") or "")[:1800],
-            "confirmed_state_at_this_point": _short_character_state(character.get("current_state")),
-        })
-    context = context_builder.build_context(
-        uid, "extract_character_state", chapter["work_id"], cid, token_budget=14000,
-    ) or {"context_items": []}
-    prompt = {
-        "task": "阅读当前章节，只提取文本明确支持的人物动态变化；不要编造，也不要重写人物基础设定。",
-        "output": {
-            "updates": [{
-                "entity_id": 1,
-                "state": {
-                    "location": "", "goal": "", "emotion": "", "physical": "",
-                    "information": "", "relationships": "", "assets": "", "secrets": "", "notes": "",
-                },
-                "change_summary": "一句话说明本章发生的变化",
-                "evidence": "来自本章的简短事实依据，不要长引文",
-            }],
-        },
-        "rules": [
-            "只返回 JSON 对象，不要 Markdown、不要解释。",
-            "没有明确、重要变化时，返回 {\"updates\": []}。",
-            "state 必须是截至本章结束的完整当前状态：保留当前已确认状态中仍然成立的信息；未知字段用空字符串。",
-            "只能使用给定 entity_id，且只给本章实际涉及、状态发生实质变化的人物生成 update。",
-        ],
-        "characters": cards,
-        "story_context": context_builder.render_context(
-            context, {"work_bible", "plot_state", "relationships", "memory", "chapter_summary"}
-        )[:22000],
-        "chapter": {
-            "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
-            "content": (chapter.get("content") or "")[-14000:],
-        },
-    }
-    messages = [
-        {"role": "system", "content": "你是小说人物连续性记录员。输出必须可被 JSON 解析，不能添加任何额外文字。"},
-        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-    ]
-    try:
-        parsed = _parse_json_from_model(llm.chat(messages, base_url=base_url, api_key=api_key, model=model))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        if raise_on_error:
-            raise HTTPException(502, "人物状态提取失败：" + _provider_error(exc))
-        return []
-
-    updates = parsed.get("updates") if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
-    if not isinstance(updates, list):
-        if raise_on_error:
-            raise HTTPException(502, "人物状态提取没有返回有效 JSON")
-        return []
-    proposals = []
-    seen = set()
-    for update in updates:
-        if not isinstance(update, dict):
-            continue
-        entity_id = update.get("entity_id")
-        if isinstance(entity_id, str) and entity_id.isdigit():
-            entity_id = int(entity_id)
-        if not isinstance(entity_id, int) or isinstance(entity_id, bool) or entity_id not in known or entity_id in seen:
-            continue
-        raw_state = update.get("state")
-        if not isinstance(raw_state, dict):
-            raw_state = {field: update.get(field, "") for field in db.CHARACTER_STATE_FIELDS}
-        before = _short_character_state(known[entity_id].get("current_state"))
-        state = db.normalize_character_state(raw_state, before)
-        if state == before or not db.character_state_has_content(state):
-            continue
-        summary = update.get("change_summary") if isinstance(update.get("change_summary"), str) else ""
-        evidence = update.get("evidence") if isinstance(update.get("evidence"), str) else ""
-        if not summary.strip():
-            continue
-        saved = db.upsert_character_state_proposal(entity_id, uid, cid, state, summary, evidence)
-        if saved and not saved.get("not_character") and not saved.get("empty_state"):
-            saved["entity_name"] = known[entity_id]["name"]
-            proposals.append(saved)
-            seen.add(entity_id)
-    return proposals
-
-
-def _generate_plot_state_proposal(uid, cid, *, base_url=None, api_key=None, model=None,
-                                  raise_on_error=False):
-    """从本章提取整体剧情推进，只形成作者可确认的待处理提议。"""
-    chapter = db.get_chapter_meta(cid, uid) if cid else None
-    if not chapter:
-        if raise_on_error:
-            raise HTTPException(404, "章节不存在")
-        return None
-    content = (chapter.get("content") or "").strip()
-    if not content:
-        return None
-    overview = db.get_plot_state_overview(chapter["work_id"], uid, cid)
-    if not overview or overview.get("invalid_chapter"):
-        if raise_on_error:
-            raise HTTPException(404, "剧情状态不存在")
-        return None
-    before = _short_plot_state(overview.get("current_state"))
-    settings = db.get_settings(uid) or {}
-    base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
-    api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
-    model = model or settings.get("llm_model") or config.LLM_MODEL
-    if not api_key:
-        if raise_on_error:
-            raise HTTPException(500, "未配置 API Key，无法提取剧情状态")
-        return None
-    context = context_builder.build_context(
-        uid, "extract_plot_state", chapter["work_id"], cid, token_budget=14000,
-    ) or {"context_items": []}
-    prompt = {
-        "task": "阅读当前章节，更新截至本章结束时的故事状态。只记录文本明确支持的推进，不编造后续剧情。",
-        "output": {
-            "state": {field: "" for field in db.PLOT_STATE_FIELDS},
-            "change_summary": "一句话概括本章的故事推进",
-            "evidence": "来自本章的简短事实依据，不要长引文",
-        },
-        "rules": [
-            "只返回 JSON 对象，不要 Markdown、不要解释。",
-            "state 必须是截至本章结束的完整当前状态：保留仍成立的既有事实；未知字段用空字符串。",
-            "如果没有实质剧情推进，返回 {\"state\": {}, \"change_summary\": \"\", \"evidence\": \"\"}。",
-            "未回收伏笔要保留仍未解决的项；下一章目标只能是文本和既有大纲支持的合理目标。",
-        ],
-        "confirmed_state_at_this_point": before,
-        "story_context": context_builder.render_context(
-            context, {"work_bible", "production_bible", "character_state", "relationships", "memory", "chapter_summary"}
-        )[:22000],
-        "chapter": {
-            "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
-            "content": content[-16000:],
-        },
-    }
-    messages = [
-        {"role": "system", "content": "你是小说剧情连续性记录员。输出必须是可解析 JSON，不能添加额外文字。"},
-        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-    ]
-    try:
-        parsed = _parse_json_from_model(llm.chat(messages, base_url=base_url, api_key=api_key, model=model))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        if raise_on_error:
-            raise HTTPException(502, "剧情状态提取失败：" + _provider_error(exc))
-        return None
-    if isinstance(parsed, dict) and isinstance(parsed.get("update"), dict):
-        parsed = parsed["update"]
-    if not isinstance(parsed, dict):
-        if raise_on_error:
-            raise HTTPException(502, "剧情状态提取没有返回有效 JSON")
-        return None
-    raw_state = parsed.get("state") if isinstance(parsed.get("state"), dict) else {
-        field: parsed.get(field, "") for field in db.PLOT_STATE_FIELDS
-    }
-    state = db.normalize_plot_state(raw_state, before)
-    summary = parsed.get("change_summary") if isinstance(parsed.get("change_summary"), str) else ""
-    evidence = parsed.get("evidence") if isinstance(parsed.get("evidence"), str) else ""
-    if state == before or not db.plot_state_has_content(state) or not summary.strip():
-        return None
-    saved = db.upsert_plot_state_proposal(chapter["work_id"], uid, cid, state, summary, evidence)
-    if saved and not saved.get("empty_state"):
-        return saved
-    return None
-
-
-def _generate_story_memory_proposals(uid, cid, *, base_url=None, api_key=None, model=None,
-                                     raise_on_error=False):
-    """Extract only source-backed story facts; all results remain author proposals."""
-    chapter = db.get_chapter_meta(cid, uid) if cid else None
-    if not chapter:
-        if raise_on_error:
-            raise HTTPException(404, "章节不存在")
-        return []
-    content = (chapter.get("content") or "").strip()
-    if not content:
-        if raise_on_error:
-            raise HTTPException(400, "本章为空，无法提取故事记忆")
-        return []
-    settings = db.get_settings(uid) or {}
-    base_url = base_url or settings.get("llm_base_url") or config.LLM_BASE_URL
-    api_key = api_key or settings.get("llm_api_key") or config.LLM_API_KEY
-    model = model or settings.get("llm_model") or config.LLM_MODEL
-    if not api_key:
-        if raise_on_error:
-            raise HTTPException(500, "未配置 API Key，无法提取故事记忆")
-        return []
-    entities = db.list_entities(chapter["work_id"], uid, cid) or []
-    known_entities = [
-        {"entity_id": item["id"], "name": item["name"], "kind": item.get("kind") or ""}
-        for item in entities[:100]
-    ]
-    context = context_builder.build_context(
-        uid, "extract_memory", chapter["work_id"], cid, token_budget=15000,
-    ) or {"context_items": []}
-    prompt = {
-        "task": "从当前章节提取会影响后续写作的明确故事记忆。只提取重要事件、事实变化、"
-                "人物知情或关系变化、物品/地点/能力变化、世界规则、承诺和秘密。",
-        "output": {
-            "items": [{
-                "memory_type": "event|fact|knowledge|relationship_change|item_change|location_change|ability_change|world_rule|promise|secret",
-                "entity_ids": [1],
-                "entity_names": ["可选的实体名"],
-                "title": "短标题",
-                "content": "截至本章结束仍成立的简洁事实",
-                "evidence": "本章中的短证据，不要长引文",
-                "importance": 1,
-            }],
-        },
-        "rules": [
-            "只返回 JSON 对象，不要 Markdown、不要解释。",
-            "宁可少提取，也不要把普通动作、模糊情绪或推测当成长期事实。",
-            "每条内容必须能从当前章节得到支持，不要编造后续发展。",
-            "同一事实不要拆成重复项目；没有重要变化时返回 {\"items\": []}。",
-            "entity_ids 只能使用给定实体；没有匹配实体时可不填。",
-            "importance 为 1 到 5，4-5 只用于重要转折、关键秘密或主线事实。",
-        ],
-        "known_entities": known_entities,
-        "confirmed_context": context_builder.render_context(
-            context, {"work_bible", "production_bible", "character_state", "plot_state", "relationships", "memory", "chapter_summary"}
-        )[:22000],
-        "chapter": {
-            "id": chapter["id"], "title": chapter["title"], "notes": chapter.get("notes") or "",
-            "content": content[-20000:],
-        },
-    }
-    try:
-        parsed = _parse_json_from_model(llm.chat([
-            {"role": "system", "content": "你是长篇小说故事记忆整理员。输出必须是可解析 JSON。"},
-            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-        ], base_url=base_url, api_key=api_key, model=model))
-    except Exception as exc:
-        if raise_on_error:
-            raise HTTPException(502, "故事记忆提取失败：" + _provider_error(exc))
-        return []
-    items = parsed.get("items") if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
-    if not isinstance(items, list):
-        if raise_on_error:
-            raise HTTPException(502, "故事记忆提取没有返回有效 JSON")
-        return []
-    proposals = []
-    for item in items[:24]:
-        if not isinstance(item, dict):
-            continue
-        saved = db.upsert_story_memory_proposal(chapter["work_id"], uid, cid, item)
-        if saved and not saved.get("invalid") and not saved.get("invalid_type"):
-            proposals.append(saved)
-    return proposals
 
 
 def _run_chapter_review(uid, cid, *, base_url=None, api_key=None, model=None, raise_on_error=False):
@@ -3620,7 +3475,7 @@ def _run_chapter_review(uid, cid, *, base_url=None, api_key=None, model=None, ra
     alerts = db.replace_chapter_consistency_alerts(cid, uid, parsed.get("alerts") or [])
     workflow = db.update_chapter_workflow(cid, uid, status="review", summary=summary, checked=True)
     production_analysis = _generate_production_analysis(
-        uid, cid, base_url=base_url, api_key=api_key, model=model,
+        uid, cid, base_url=base_url, api_key=api_key, model=model, force=True,
     )
     character_state_proposals = (production_analysis or {}).get("character_state_proposals") or []
     plot_state_proposal = (production_analysis or {}).get("plot_state_proposal")
@@ -5744,13 +5599,21 @@ async def agent(request: Request):
     text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "没有对话内容")
-    turn = _prepare_agent_turn(uid, body, text)
-    return _run_agent_turn(
-        uid, turn["chapter_id"], text, body.get("selection"), body.get("skill_ids"),
-        session_id=turn["session_id"], work_id=turn["work_id"],
-        use_history=turn["use_history"], retain_history=turn["retain_history"],
-        documents=body.get("documents"), input_persisted=turn["input_persisted"],
-    )
+    scope_lock = _acquire_agent_scope_lock(uid, body)
+    try:
+        turn = _prepare_agent_turn(uid, body, text)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _agent_executor,
+            lambda: _run_agent_turn(
+                uid, turn["chapter_id"], text, body.get("selection"), body.get("skill_ids"),
+                session_id=turn["session_id"], work_id=turn["work_id"],
+                use_history=turn["use_history"], retain_history=turn["retain_history"],
+                documents=body.get("documents"), input_persisted=turn["input_persisted"],
+            ),
+        )
+    finally:
+        _release_agent_scope_lock(scope_lock)
 
 
 def _agent_stream_error(exc):
@@ -5768,7 +5631,7 @@ def _agent_stream_error(exc):
     return payload
 
 
-def _agent_streaming_response(thread_name, task):
+def _agent_streaming_response(thread_name, task, scope_lock=None):
     events = queue.Queue()
 
     def publish(event):
@@ -5781,9 +5644,14 @@ def _agent_streaming_response(thread_name, task):
         except Exception as exc:
             publish(_agent_stream_error(exc))
         finally:
+            _release_agent_scope_lock(scope_lock)
             events.put(None)
 
-    threading.Thread(target=worker, name=thread_name, daemon=True).start()
+    try:
+        _agent_executor.submit(worker)
+    except Exception:
+        _release_agent_scope_lock(scope_lock)
+        raise
 
     def event_lines():
         while True:
@@ -5815,17 +5683,23 @@ async def agent_stream(request: Request):
     text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "没有对话内容")
-    turn = _prepare_agent_turn(uid, body, text)
-    return _agent_streaming_response(
-        f"agent-stream-{uid}-{turn['session_id'] or 'temp'}",
-        lambda publish: _run_agent_turn(
-            uid, turn["chapter_id"], text, body.get("selection"), body.get("skill_ids"),
-            session_id=turn["session_id"], work_id=turn["work_id"],
-            use_history=turn["use_history"], retain_history=turn["retain_history"],
-            on_event=publish, documents=body.get("documents"),
-            input_persisted=turn["input_persisted"],
-        ),
-    )
+    scope_lock = _acquire_agent_scope_lock(uid, body)
+    try:
+        turn = _prepare_agent_turn(uid, body, text)
+        return _agent_streaming_response(
+            f"agent-stream-{uid}-{turn['session_id'] or 'temp'}",
+            lambda publish: _run_agent_turn(
+                uid, turn["chapter_id"], text, body.get("selection"), body.get("skill_ids"),
+                session_id=turn["session_id"], work_id=turn["work_id"],
+                use_history=turn["use_history"], retain_history=turn["retain_history"],
+                on_event=publish, documents=body.get("documents"),
+                input_persisted=turn["input_persisted"],
+            ),
+            scope_lock=scope_lock,
+        )
+    except Exception:
+        _release_agent_scope_lock(scope_lock)
+        raise
 
 
 @app.post("/api/agent/context")
@@ -5880,16 +5754,21 @@ async def agent_audio(request: Request):
     uid = _auth(request)
     body = await request.json()
     audio_format, model_turn = _direct_audio_model_turn(body)
+    scope_lock = _acquire_agent_scope_lock(uid, body)
     try:
         turn = _prepare_agent_turn(
             uid, body, "语音会话", history_text="[voice] 语音指令",
         )
-        result = _run_agent_turn(
-            uid, turn["chapter_id"], "[voice] 语音指令",
-            body.get("selection"), body.get("skill_ids"), model_turn=model_turn,
-            session_id=turn["session_id"], work_id=turn["work_id"],
-            use_history=turn["use_history"], retain_history=turn["retain_history"],
-            documents=body.get("documents"), input_persisted=turn["input_persisted"],
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            _agent_executor,
+            lambda: _run_agent_turn(
+                uid, turn["chapter_id"], "[voice] 语音指令",
+                body.get("selection"), body.get("skill_ids"), model_turn=model_turn,
+                session_id=turn["session_id"], work_id=turn["work_id"],
+                use_history=turn["use_history"], retain_history=turn["retain_history"],
+                documents=body.get("documents"), input_persisted=turn["input_persisted"],
+            ),
         )
         settings = db.get_settings(uid) or {}
         result["voice"] = {
@@ -5903,6 +5782,8 @@ async def agent_audio(request: Request):
         raise HTTPException(502, "语音已直接发送给模型，但当前模型或网关不支持音频输入/工具调用。"
                             "可关闭「直接发送语音给 AI」后改用转写模式。"
                             f" 详情：{_provider_error(e)}")
+    finally:
+        _release_agent_scope_lock(scope_lock)
 
 
 @app.post("/api/agent/audio/stream")
@@ -5911,9 +5792,14 @@ async def agent_audio_stream(request: Request):
     uid = _auth(request)
     body = await request.json()
     audio_format, model_turn = _direct_audio_model_turn(body)
-    turn = _prepare_agent_turn(
-        uid, body, "语音会话", history_text="[voice] 语音指令",
-    )
+    scope_lock = _acquire_agent_scope_lock(uid, body)
+    try:
+        turn = _prepare_agent_turn(
+            uid, body, "语音会话", history_text="[voice] 语音指令",
+        )
+    except Exception:
+        _release_agent_scope_lock(scope_lock)
+        raise
 
     def run(publish):
         result = _run_agent_turn(
@@ -5932,7 +5818,7 @@ async def agent_audio_stream(request: Request):
         return result
 
     return _agent_streaming_response(
-        f"agent-audio-stream-{uid}-{turn['session_id'] or 'temp'}", run,
+        f"agent-audio-stream-{uid}-{turn['session_id'] or 'temp'}", run, scope_lock=scope_lock,
     )
 
 
@@ -5941,7 +5827,7 @@ async def recover_agent_runtime(turn_id: str, request: Request):
     """重放一个未确认的本机 launcher 回合，不重新调用模型。"""
     uid = _auth(request)
     try:
-        answer, runtime_state = skill_runtime.recover_turn(turn_id, uid)
+        answer, runtime_state = await asyncio.to_thread(skill_runtime.recover_turn, turn_id, uid)
     except skill_runtime.SkillRuntimeError as e:
         raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
     if not isinstance(answer, dict):

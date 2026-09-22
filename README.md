@@ -66,6 +66,7 @@ REPO=https://github.com/mypengpengli/writehtml.git
 mkdir -p "$DIR" && cd "$DIR"
 rm -rf /tmp/writehtml-update && git clone --depth 1 "$REPO" /tmp/writehtml-update
 cp -rf /tmp/writehtml-update/. "$DIR"/ && rm -rf /tmp/writehtml-update
+if [ ! -f .env ]; then SIGNUP_CODE="$(openssl rand -hex 16)"; umask 077; printf 'SIGNUP_CODE=%s\n' "$SIGNUP_CODE" > .env; echo "首次注册注册码：$SIGNUP_CODE"; fi
 docker compose down 2>/dev/null || true
 docker compose up -d --build --force-recreate
 docker compose ps
@@ -74,7 +75,7 @@ docker compose ps
 
 > 这段就是仓库里的 `deploy.sh`，也可以 `curl -fsSL …/deploy.sh | bash` 或手动 `bash deploy.sh`。
 
-**不需要 `.env`**：当前 `docker-compose.yml` 使用注册码 `lipeng%@0` 开放注册，已有账号不受影响。这个码会随公开仓库一起可见，正式公网使用时应直接修改 `SIGNUP_CODE` 后重建容器。每位用户登录后在「模型与联网设置」里填自己的模型配置和 Tavily Key 池。
+首次部署会自动生成私有注册码并写入权限为 `600` 的 `.env`，同时在终端显示一次；后续更新不会覆盖它。`SIGNUP_CODE` 为空时注册入口关闭，已有账号不受影响。不要把真实注册码、模型 Key 或 Tavily Key 提交到仓库。每位用户登录后可在「模型与联网设置」里填写自己的模型配置和 Tavily Key 池。
 
 ### 联网搜索配置
 
@@ -110,7 +111,7 @@ POST /api/agent/audio/stream
 
 旧接口 `POST /api/agent` 和 `POST /api/agent/audio` 仍然保留，供旧客户端或接口调用一次性取得完整 JSON。普通润色、扩写、摘要等原子编辑接口仍先生成完整结果再应用，避免半段正文进入编辑器。
 
-Pi 供应商请求和兼容 Agent 请求都会显式开启 `stream=true`。流式 HTTP 任务在独立线程运行，不阻塞 FastAPI 处理其他请求；浏览器最多每个动画帧刷新一次消息 DOM。Pi 进程仍按回合隔离，不复用带状态的全局 Agent 进程，避免并发会话、工具状态和工作目录互相污染。
+Pi 供应商请求和兼容 Agent 请求都会显式开启 `stream=true`。模型回合在大小受控的工作线程池中运行，不阻塞 FastAPI 处理其他请求；同一持久会话会串行执行，避免双击发送造成历史互相覆盖，不同会话仍可并发。线程池大小由 `PI_AGENT_MAX_CONCURRENT_TURNS` 控制，默认 `4`。这只限制同时运行的回合数，不限制单回合工具次数、Skills 或任务时长。浏览器最多每个动画帧刷新一次消息 DOM。Pi 进程仍按回合隔离，不复用带状态的全局 Agent 进程，避免并发会话、工具状态和工作目录互相污染。
 
 启用“本机 meta-memory launcher”后是一个有意的例外：浏览器会实时看到“正在生成 / 正在确认 / 正在保存”等状态，但不会提前收到 `assistant_delta`。完整回答必须先写入独立回答文件，并经 `after` 或 `recovery replay` 确认后，才通过最终 `result` 返回。只使用 Pi 原生 Skills、没有配置 launcher 时，文字仍正常实时流出。
 

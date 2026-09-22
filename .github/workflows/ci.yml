@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: pi_runtime/package-lock.json
+      - run: pip install -r requirements.txt
+      - run: npm ci --prefix pi_runtime --ignore-scripts
+      - name: Syntax checks
+        run: |
+          python -m py_compile main.py db.py materials.py context_builder.py config.py
+          node --check static/app.js
+          node --check pi_runtime/bridge.mjs
+          bash -n deploy.sh
+      - name: Application tests
+        env:
+          WRITEHTML_ADMIN_PASSWORD: ci-admin-password
+        run: |
+          python test_web_search.py
+          python test_smoke.py
+          python test_pi_runtime.py

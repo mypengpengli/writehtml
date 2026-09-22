@@ -104,7 +104,7 @@ def render_context(context, types=None):
 
 
 def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", selection=None,
-                  skill_ids=None, token_budget=None):
+                  skill_ids=None, token_budget=None, profile="writing"):
     """Return prompt messages plus every source item and its recall reason.
 
     The returned structure is intentionally useful to both a model and the context
@@ -127,6 +127,10 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
     chapter_tail = _clip(chapter_content[-7000:], 7000)
     mentions_text = "\n".join((instruction, selected_text, chapter_tail[-1800:]))
     items = []
+    include_production = profile in {"writing", "sandbox"}
+    include_characters = profile in {"writing", "sandbox"}
+    include_materials = profile in {"writing", "sandbox"}
+    include_skills = profile in {"writing", "sandbox"}
 
     if instruction:
         items.append(_item("instruction", "作者本轮指令", instruction, "本轮明确请求", 0))
@@ -146,14 +150,15 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
     if work_notes:
         items.append(_item("work_bible", "作品设定", _clip(work_notes, 9000), "全局创作约束", 1))
 
-    production_digest = db.production_context_digest(work_id, user_id, chapter_id)
+    production_digest = db.production_context_digest(work_id, user_id, chapter_id) if include_production else ""
     if production_digest:
         items.append(_item(
             "production_bible", "生产画布设定", _clip(production_digest, 14000),
             "当前章节时点生效的规则、地点、技能、道具与保密边界", 1,
         ))
 
-    entities = db.list_character_cards(work_id, user_id, chapter_id) or []
+    entities = db.list_character_cards(work_id, user_id, chapter_id) if include_characters else []
+    entities = entities or []
     active_entities = _mentioned_entities(entities, mentions_text)
     entity_ids = [entity["id"] for entity in active_entities]
     for entity in active_entities:
@@ -172,7 +177,7 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
                 1 if entity.get("name") in mentions_text else 2,
             ))
 
-    plot = db.get_plot_state_overview(work_id, user_id, chapter_id) if chapter_id else None
+    plot = db.get_plot_state_at(work_id, user_id, chapter_id) if chapter_id else None
     if plot and not plot.get("invalid_chapter"):
         state = _state_lines(db.PLOT_STATE_LABELS, plot.get("current_state") or {})
         if state:
@@ -205,7 +210,7 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
     # Reference projects, style fingerprints, reusable documents and inspirations
     # are optional aids. Canonical work notes and confirmed story facts above keep
     # higher priority and are never overwritten by these sources.
-    for material in materials.context_items(user_id, work_id, recall_query):
+    for material in (materials.context_items(user_id, work_id, recall_query) if include_materials else []):
         items.append(_item(
             material.get("type") or "reference",
             material.get("title") or "创作参考资料",
@@ -214,7 +219,7 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
             int(material.get("priority", 3)),
         ))
 
-    skills = db.get_agent_skills_for_turn(user_id, work_id, skill_ids or []) if skill_ids else []
+    skills = db.get_agent_skills_for_turn(user_id, work_id, skill_ids or []) if skill_ids and include_skills else []
     if skills:
         skill_lines = [f"{skill['name']}：{_clip(skill.get('description') or skill.get('instruction') or '', 800)}"
                        for skill in skills]

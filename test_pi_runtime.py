@@ -318,6 +318,7 @@ try:
         main.config.AGENT_SKILL_CWD = old_runtime["cwd"]
         main.config.AGENT_SKILL_RUNTIME_DIR = old_runtime["runtime_dir"]
         main.config.AGENT_SKILL_TOUCH_SECONDS = old_runtime["touch"]
+    ok(not main._agent_scope_locks, "completed Agent turns release and recycle their session locks")
 finally:
     server.shutdown()
     server.server_close()

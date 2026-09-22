@@ -17,8 +17,13 @@ let voiceDirectToModel = localStorage.getItem("voiceDirectToModel") !== "0"; // 
 let voiceAsrAutoSend = localStorage.getItem("voiceAsrAutoSend") === "1";
 let aiTts = localStorage.getItem("aiTts") !== "0"; // 默认开
 
-// 自动保存
+// 正文保存协调器：单通道写服务器，editVersion 防止旧响应清掉新输入。
 let saveTimer = null, dirty = false;
+let editorEditVersion = 0;
+let editorContentRevision = null;
+let editorSavePromise = null;
+let editorConflictResolver = null;
+let editorConflictData = null;
 // 查找
 let findPos = [], findIdx = -1;
 // 拖拽
@@ -81,9 +86,24 @@ let productionCards = [];
 let productionResourceCategory = "all";
 let productionSelected = null;
 let productionLayoutTimer = null;
+let productionLayoutPending = null;
 let productionInspectorSaveTimer = null;
 let productionInspectorSaving = false;
 let productionZoom = 1;
+
+class SerialSaveQueue {
+  constructor() { this.tail = Promise.resolve(); this.pending = 0; }
+  run(task) {
+    this.pending += 1;
+    const next = this.tail.then(task, task);
+    this.tail = next.catch(() => {}).finally(() => { this.pending = Math.max(0, this.pending - 1); });
+    return next;
+  }
+  async wait() { await this.tail; }
+}
+const productionSaveQueue = new SerialSaveQueue();
+const plotStateSaveQueue = new SerialSaveQueue();
+const productionLayoutSaveQueue = new SerialSaveQueue();
 
 /* ---------- 图标（内联 SVG，Lucide 风格 24×24 描边） ---------- */
 const _W = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
@@ -215,7 +235,13 @@ async function api(path, opts = {}) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   if (res.status === 401) { showLogin(); throw new Error("未登录"); }
-  if (!res.ok) throw new Error(await responseError(res));
+  if (!res.ok) {
+    const info = await responseErrorData(res);
+    const error = new Error(info.message);
+    error.status = res.status;
+    error.detail = info.detail;
+    throw error;
+  }
   return res.json();
 }
 
@@ -262,11 +288,13 @@ async function streamAgent(body, onEvent, path = "/api/agent/stream") {
   return result;
 }
 
-async function responseError(res) {
+async function responseErrorData(res) {
   const raw = (await res.text()).trim();
   let msg = raw || res.statusText || "请求失败";
+  let detail = null;
   try {
     const data = JSON.parse(raw);
+    detail = data.detail ?? data;
     if (data.detail && typeof data.detail === "object") {
       msg = data.detail.message || msg;
       if (data.detail.turn_id) msg += `（恢复编号：${data.detail.turn_id}）`;
@@ -275,7 +303,10 @@ async function responseError(res) {
     }
   } catch (e) {}
   msg = String(msg).replace(/\s+/g, " ");
-  return msg.length > 260 ? msg.slice(0, 260) + "…" : msg;
+  return { message: msg.length > 260 ? msg.slice(0, 260) + "…" : msg, detail };
+}
+async function responseError(res) {
+  return (await responseErrorData(res)).message;
 }
 
 const tail = (s, n) => (!s ? "" : s.length > n ? s.slice(-n) : s);
@@ -330,6 +361,7 @@ async function doRegister() {
 }
 
 async function doLogout() {
+  if (!await flushEditorSave()) return;
   try { await api("/api/logout"); } catch (e) {}
   clearEntityImageCache();
   token = ""; localStorage.removeItem("token");
@@ -358,7 +390,9 @@ async function init() {
 
 async function loadWorks() {
   works = await api("/api/works", { method: "GET" });
-  currentWorkId = works.length ? works[0].id : null;
+  if (!works.some(work => work.id === currentWorkId)) {
+    currentWorkId = works.length ? works[0].id : null;
+  }
   currentChapterId = null;
   await loadChapters();
 }
@@ -397,7 +431,7 @@ function renderTree() {
 }
 
 async function selectWork(wid) {
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   currentWorkId = wid;
   currentChapterId = null;
   entitiesCache = []; entitiesCacheWorkId = null; entitiesCacheChapterId = null;
@@ -425,7 +459,8 @@ async function loadChapters() {
 }
 
 async function selectChapter(cid) {
-  if (dirty) await saveNow();
+  if (cid === currentChapterId) return;
+  if (!await flushEditorSave()) return;
   currentChapterId = cid;
   plotStateChapterId = cid;
   storyMemoryChapterId = cid;
@@ -444,9 +479,13 @@ async function loadChapter() {
   const c = await api(`/api/chapters/${currentChapterId}`, { method: "GET" });
   $("chapTitle").value = c.title || "";
   $("content").value = c.content || "";
-  renderSemanticEditor();
   $("notes").value = c.notes || "";
-  dirty = false; updateSaveStat("");
+  editorContentRevision = Math.max(1, +(c.content_revision || 1));
+  editorEditVersion = 0;
+  dirty = false;
+  const restored = restoreEditorDraft(c);
+  renderSemanticEditor();
+  updateSaveStat(restored ? "已恢复本机草稿" : "");
   updateWC();
   const cur = chapters.find(x => x.id === currentChapterId);
   if (cur) cur.chars = charCount(c.content || "");
@@ -462,6 +501,7 @@ async function loadChapter() {
 async function newWork() {
   const title = await askCard({ title: "新建作品", input: "作品名", def: "新作品", okText: "新建" });
   if (!title) return;
+  if (!await flushEditorSave()) return;
   const r = await api("/api/works", { body: { title } });
   currentWorkId = r.id; currentChapterId = null;
   await loadWorks();
@@ -470,6 +510,7 @@ async function newWork() {
 async function newChapter(wid) {
   const title = await askCard({ title: "新建章节", input: "章节名", def: "新章节", okText: "新建" });
   if (!title) return;
+  if (!await flushEditorSave()) return;
   const r = await api(`/api/works/${wid}/chapters`, { body: { title } });
   currentWorkId = wid; currentChapterId = r.id;
   await loadChapters();
@@ -477,7 +518,7 @@ async function newChapter(wid) {
 
 async function delChapter(cid) {
   if (!await askCard({ title: "移到回收站？", msg: "可找回。在回收站点「彻底删除」才会真正删除。", okText: "移到回收站", danger: true })) return;
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   await api(`/api/chapters/${cid}`, { method: "DELETE" });
   currentChapterId = null;
   await loadChapters();
@@ -485,6 +526,7 @@ async function delChapter(cid) {
 
 async function delWork(wid) {
   if (!await askCard({ title: "删除整个作品？", msg: "作品及其所有章节将被删除，不可恢复。", okText: "删除", danger: true })) return;
+  if (!await flushEditorSave()) return;
   await api(`/api/works/${wid}`, { method: "DELETE" });
   currentWorkId = null; currentChapterId = null;
   await loadWorks();
@@ -535,39 +577,180 @@ async function dragDrop(ev, targetCid) {
 
 /* ---------- 自动保存 + 字数 ---------- */
 
-function onContentInput() {
-  dirty = true; updateSaveStat("未保存"); updateWC();
+function editorDraftKey(chapterId = currentChapterId, workId = currentWorkId) {
+  if (!chapterId || !workId) return "";
+  return `writehtml:editor-draft:${currentUsername || "anonymous"}:${workId}:${chapterId}`;
+}
+function editorSnapshot() {
+  return {
+    chapter_id: currentChapterId,
+    work_id: currentWorkId,
+    title: $("chapTitle").value,
+    content: $("content").value,
+    notes: $("notes").value,
+    base_revision: editorContentRevision,
+    edit_version: editorEditVersion,
+    saved_at: Date.now(),
+  };
+}
+function stashEditorDraft(snapshot = editorSnapshot()) {
+  const key = editorDraftKey(snapshot.chapter_id, snapshot.work_id);
+  if (!key) return;
+  try { localStorage.setItem(key, JSON.stringify(snapshot)); } catch (e) {}
+}
+function clearEditorDraft(chapterId = currentChapterId, workId = currentWorkId) {
+  const key = editorDraftKey(chapterId, workId);
+  if (!key) return;
+  try { localStorage.removeItem(key); } catch (e) {}
+}
+function restoreEditorDraft(serverChapter) {
+  const key = editorDraftKey(serverChapter.id, serverChapter.work_id);
+  if (!key) return false;
+  let draft = null;
+  try { draft = JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { draft = null; }
+  if (!draft || draft.chapter_id !== serverChapter.id) return false;
+  const differs = draft.title !== (serverChapter.title || "") || draft.content !== (serverChapter.content || "") ||
+    draft.notes !== (serverChapter.notes || "");
+  if (!differs) { clearEditorDraft(serverChapter.id, serverChapter.work_id); return false; }
+  $("chapTitle").value = draft.title || "";
+  $("content").value = draft.content || "";
+  $("notes").value = draft.notes || "";
+  editorContentRevision = Math.max(1, +(draft.base_revision || serverChapter.content_revision || 1));
+  editorEditVersion = Math.max(1, +(draft.edit_version || 1));
+  dirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 500);
+  return true;
+}
+function markEditorDirty() {
+  editorEditVersion += 1;
+  dirty = true;
+  stashEditorDraft();
+  updateSaveStat("已本机暂存");
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveNow, 1500);
+}
+function onContentInput() {
+  markEditorDirty(); updateWC();
   typewriterCenter();
   updateSelectionTools();
-  renderSemanticEditor();
+  queueSemanticEditorRender();
 }
-function onNotesInput() { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); }
+function onNotesInput() { markEditorDirty(); }
 
-async function saveNow() {
-  if (!currentChapterId || !dirty) return;
-  clearTimeout(saveTimer);
-  updateSaveStat("保存中…");
-  try {
-    const saved = await api(`/api/chapters/${currentChapterId}`, {
-      method: "PUT",
-      body: { title: $("chapTitle").value, content: $("content").value, notes: $("notes").value },
-    });
-    dirty = false; updateSaveStat("已保存");
-    const cur = chapters.find(x => x.id === currentChapterId);
-    if (cur) {
-      cur.chars = charCount($("content").value);
-      if (saved.analysis) {
-        cur.content_revision = saved.analysis.content_revision;
-        cur.analysis_status = saved.analysis.status;
-        cur.analysis_reason = saved.analysis.reason;
-      }
-    }
-    renderTree();
-  } catch (e) { updateSaveStat("保存失败"); }
+function waitForEditorConflict(local, server) {
+  editorConflictData = { local, server };
+  $("editorConflictLocal").value = local.content || "";
+  $("editorConflictServer").value = server.content || "";
+  $("editorConflictOverlay").classList.remove("hidden");
+  return new Promise(resolve => { editorConflictResolver = resolve; });
 }
-function saveTitle() { dirty = true; saveNow(); }
+function resolveEditorConflict(action) {
+  $("editorConflictOverlay").classList.add("hidden");
+  const resolve = editorConflictResolver;
+  editorConflictResolver = null;
+  if (resolve) resolve(action);
+}
+async function handleEditorConflict(snapshot, server) {
+  updateSaveStat("存在多端冲突");
+  stashEditorDraft(snapshot);
+  const action = await waitForEditorConflict(snapshot, server || {});
+  if (action === "server") {
+    $("chapTitle").value = server.title || "";
+    $("content").value = server.content || "";
+    $("notes").value = server.notes || "";
+    editorContentRevision = Math.max(1, +(server.content_revision || editorContentRevision || 1));
+    editorEditVersion += 1;
+    dirty = false;
+    clearEditorDraft(snapshot.chapter_id, snapshot.work_id);
+    renderSemanticEditor(); updateWC(); updateSaveStat("已采用服务器版本");
+    return true;
+  }
+  if (action === "branch") {
+    const branch = await api(`/api/chapters/${snapshot.chapter_id}/conflict-branch`, { body: {
+      title: `${snapshot.title || "章节"} · 冲突分支`, content: snapshot.content, notes: snapshot.notes,
+    }});
+    clearEditorDraft(snapshot.chapter_id, snapshot.work_id);
+    dirty = false;
+    currentWorkId = branch.work_id;
+    currentChapterId = branch.id;
+    await loadChapters();
+    showToast("本机稿已另存为分支", "ok");
+    return true;
+  }
+  if (action === "local") {
+    editorContentRevision = Math.max(1, +(server.content_revision || editorContentRevision || 1));
+    dirty = true;
+    stashEditorDraft({ ...snapshot, base_revision: editorContentRevision, edit_version: editorEditVersion });
+    return "retry";
+  }
+  dirty = true;
+  updateSaveStat("冲突未处理，草稿仍在本机");
+  return false;
+}
+
+async function runEditorSaveLoop() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  while (currentChapterId && dirty) {
+    const snapshot = editorSnapshot();
+    const saveVersion = editorEditVersion;
+    updateSaveStat("保存中…");
+    try {
+      const saved = await api(`/api/chapters/${snapshot.chapter_id}`, {
+        method: "PUT",
+        body: { title: snapshot.title, content: snapshot.content, notes: snapshot.notes,
+          expected_revision: snapshot.base_revision },
+      });
+      if (currentChapterId !== snapshot.chapter_id) return false;
+      editorContentRevision = Math.max(1, +(saved.analysis?.content_revision || editorContentRevision || 1));
+      const cur = chapters.find(x => x.id === snapshot.chapter_id);
+      if (cur) {
+        cur.chars = charCount(snapshot.content);
+        cur.content_revision = editorContentRevision;
+        cur.analysis_status = saved.analysis?.status;
+        cur.analysis_reason = saved.analysis?.reason;
+      }
+      if (editorEditVersion === saveVersion) {
+        dirty = false;
+        clearEditorDraft(snapshot.chapter_id, snapshot.work_id);
+        updateSaveStat("已保存");
+      } else {
+        dirty = true;
+        stashEditorDraft();
+        updateSaveStat("有新内容，继续保存…");
+      }
+      renderTree();
+    } catch (e) {
+      if (e.status === 409 && e.detail?.code === "chapter_revision_conflict") {
+        const handled = await handleEditorConflict(snapshot, e.detail.server || {});
+        if (handled === "retry") continue;
+        return handled;
+      }
+      dirty = true;
+      stashEditorDraft();
+      updateSaveStat("保存失败，草稿在本机");
+      return false;
+    }
+  }
+  return true;
+}
+async function saveNow() {
+  if (!currentChapterId) return true;
+  if (editorSavePromise) return editorSavePromise;
+  if (!dirty) return true;
+  editorSavePromise = runEditorSaveLoop();
+  try { return await editorSavePromise; }
+  finally { editorSavePromise = null; }
+}
+async function flushEditorSave() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  const saved = await saveNow();
+  if (!saved) showToast("正文尚未同步，已停止切换；本机草稿仍然保留", "err");
+  return !!saved;
+}
+function saveTitle() { markEditorDirty(); saveNow(); }
 function updateSaveStat(s) { $("saveStat").textContent = s; }
 function updateWC() {
   const live = charCount($("content").value);
@@ -870,7 +1053,7 @@ async function processAndAppend(text) {
       await notifyStoryUpdates(r);
       return;
     }
-    if (dirty) await saveNow();
+    if (!await flushEditorSave()) return;
     const baseContent = el.value;
     const r = await api("/api/process", {
       body: { mode, text, context: tail(baseContent, 1500), chapter_id: currentChapterId,
@@ -891,7 +1074,7 @@ async function processSelection(m, style) {
   const selected = el.value.slice(s, e);
   setMicStatus("处理中…");
   try {
-    if (dirty) await saveNow();
+    if (!await flushEditorSave()) return;
     const baseContent = el.value;
     const r = await api("/api/process", {
       body: { mode: m, text: selected, context: tail(baseContent, 1500), chapter_id: currentChapterId, style,
@@ -913,7 +1096,7 @@ async function generate() {
 
 async function undo() {
   if (!currentChapterId) return;
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   const c = await api(`/api/chapters/${currentChapterId}/undo`, { method: "POST" });
   $("content").value = c.content || "";
   onContentInput();
@@ -982,14 +1165,14 @@ async function splitChapter() {
 
 async function saveRevision() {
   if (!currentChapterId) return;
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   await api(`/api/chapters/${currentChapterId}/revisions`, { method: "POST" });
   flash("已存为版本");
 }
 
 async function saveNamedRevision() {
   if (!currentChapterId) return;
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   const label = await askCard({ title: "保存命名章节版本", input: "版本名称（可选）", def: "", okText: "保存" });
   if (label === false) return;
   await api(`/api/chapters/${currentChapterId}/revisions`, { body: { label: label || "" } });
@@ -999,7 +1182,7 @@ async function saveNamedRevision() {
 
 async function saveNamedWorkRevision() {
   if (!currentWorkId) return;
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   const label = await askCard({ title: "保存整本版本", input: "版本名称（可选）", def: "", okText: "保存" });
   if (label === false) return;
   await api(`/api/works/${currentWorkId}/revisions`, { body: { label: label || "" } });
@@ -1040,6 +1223,7 @@ async function renameRevision(rid, existing) {
 async function createBranchFromRevision(rid) {
   const title = await askCard({ title: "创建分支稿", msg: "会在本作品中新增一章，可独立编辑，不会覆盖当前主线。", input: "分支章节标题", def: `${$("chapTitle").value || "章节"} · 分支`, okText: "创建" });
   if (!title) return;
+  if (!await flushEditorSave()) return;
   const result = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/branch`, { body: { title } });
   currentChapterId = result.id;
   closeRevisions();
@@ -1110,7 +1294,7 @@ async function applyPendingRestore() {
 }
 async function recoverFromRevision(rid) {
   if (!currentChapterId) return;
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   setMicStatus("AI 找回中…");
   try {
     const r = await api("/api/process", {
@@ -1351,7 +1535,7 @@ function sandboxData() {
 }
 async function openOutlineSandbox() {
   if (!currentWorkId) { showToast("先选一个作品", "err"); return; }
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   $("outlineOverlay").classList.remove("hidden");
   try {
     sandboxList = await api(`/api/works/${currentWorkId}/sandboxes`, { method: "GET" });
@@ -2056,7 +2240,7 @@ async function aiCheck() {
   $("aiResult").textContent = "校验中…";
   busy($("aiCheckBtn"), true);
   try {
-    if (dirty) await saveNow();
+    if (!await flushEditorSave()) return;
     const r = await api(`/api/chapters/${currentChapterId}/review`, { body: {} });
     consistencyAlerts = r.alerts || [];
     syncChapterWorkflow(r.workflow);
@@ -2622,7 +2806,7 @@ async function sendAgent() {
   const baseMessages = agentMsgs.slice();
   el.value = "";
   // 先把正文框里未保存的手动编辑落库，避免 AI 基于旧正文操作、回显时覆盖手打内容
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   agentMsgs.push({ role: "user", content: text, temporary: conversationMode === "temporary" });
   agentBusy = true;
   agentReplyDraft = "";
@@ -2950,7 +3134,7 @@ async function sendAgentAudio(blob) {
   const btn = $("agentMicBtn"), el = $("agentInput"), selection = agentSelection;
   const conversationMode = agentConversationMode;
   const baseMessages = agentMsgs.slice();
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   agentMsgs.push({ role: "user", content: "[voice] 语音指令", temporary: conversationMode === "temporary" });
   agentBusy = true;
   agentReplyDraft = "";
@@ -3117,6 +3301,8 @@ let characterDetailTab = "profile";
 let entityImagePromptMode = "latest";
 let entityImageSettingsLoaded = false;
 let semanticPopTimer = null;
+let semanticRenderTimer = null;
+let semanticMatcherCache = { signature: "", regex: null, byName: new Map(), entities: [] };
 const entityImageObjectUrls = new Map();
 const imageAssetObjectUrls = new Map();
 let entityImageHistory = [];
@@ -3139,25 +3325,42 @@ function semanticKindClass(kind) {
   return ({ 人物: "person", 地点: "place", 物品: "item", 组织: "org", 概念: "concept" })[kind] || "concept";
 }
 function regexEscape(value) { return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function renderSemanticEditor() {
-  const editor = $("content"), textHost = $("semanticText"), layer = $("semanticLayer");
-  if (!editor || !textHost || !layer) return;
-  const text = editor.value || "";
+function queueSemanticEditorRender() {
+  clearTimeout(semanticRenderTimer);
+  semanticRenderTimer = setTimeout(() => {
+    semanticRenderTimer = null;
+    renderSemanticEditor();
+  }, 110);
+}
+function semanticMatcher() {
   const seen = new Set();
   const entities = entitiesCache
     .filter(entity => entity && entity.name && !seen.has(entity.name.toLocaleLowerCase()) && seen.add(entity.name.toLocaleLowerCase()))
     .sort((a, b) => b.name.length - a.name.length);
+  const signature = entities.map(entity => `${entity.id}:${entity.name}`).join("|");
+  if (semanticMatcherCache.signature === signature) return semanticMatcherCache;
+  const byName = new Map(entities.map(entity => [entity.name.toLocaleLowerCase(), entity]));
+  let regex = null;
+  if (entities.length) {
+    try { regex = new RegExp(entities.map(entity => regexEscape(entity.name)).join("|"), "giu"); }
+    catch (e) { regex = null; }
+  }
+  semanticMatcherCache = { signature, regex, byName, entities };
+  return semanticMatcherCache;
+}
+function renderSemanticEditor() {
+  const editor = $("content"), textHost = $("semanticText"), layer = $("semanticLayer");
+  if (!editor || !textHost || !layer) return;
+  const text = editor.value || "";
+  const { entities, byName, regex } = semanticMatcher();
   if (!text || !entities.length) {
     textHost.textContent = "";
     layer.classList.add("hidden");
     editor.classList.remove("semantic-active");
     return;
   }
-  const byName = new Map(entities.map(entity => [entity.name.toLocaleLowerCase(), entity]));
-  const pattern = entities.map(entity => regexEscape(entity.name)).join("|");
-  let regex;
-  try { regex = new RegExp(pattern, "giu"); }
-  catch (e) { textHost.textContent = text; return; }
+  if (!regex) { textHost.textContent = text; return; }
+  regex.lastIndex = 0;
   let html = "", last = 0, match;
   while ((match = regex.exec(text))) {
     const value = match[0];
@@ -4152,33 +4355,36 @@ async function savePlotState(automatic = false) {
     evidence: $("plotStateEvidence").value.trim() };
   const draftKey = plotStateDraftKey();
   const signature = plotStateDraftSignature(body);
+  const proposalId = plotStateProposalId;
   if (automatic && !plotStateHasContent(body)) return;
-  try {
-    let response;
-    if (plotStateProposalId) response = await api(`/api/plot-state-proposals/${plotStateProposalId}/accept`, { body });
-    else response = await api(`/api/works/${workId}/plot-state-versions`, { body: { ...body, chapter_id: chapterId, autosave: automatic } });
-    const storedDraft = readPlotStateDraft(draftKey);
-    if (storedDraft && plotStateDraftSignature(storedDraft) === signature) clearPlotStateDraft(draftKey);
-    plotStateProposalId = null;
-    if (automatic) {
-      if (currentWorkId === workId && plotStateChapterId === chapterId) {
-        if (plotStateData) {
-          plotStateData.current_state = body.state;
-          plotStateData.state_version = response.version || plotStateData.state_version;
+  return plotStateSaveQueue.run(async () => {
+    try {
+      let response;
+      if (proposalId) response = await api(`/api/plot-state-proposals/${proposalId}/accept`, { body });
+      else response = await api(`/api/works/${workId}/plot-state-versions`, { body: { ...body, chapter_id: chapterId, autosave: automatic } });
+      const storedDraft = readPlotStateDraft(draftKey);
+      if (storedDraft && plotStateDraftSignature(storedDraft) === signature) clearPlotStateDraft(draftKey);
+      if (plotStateProposalId === proposalId) plotStateProposalId = null;
+      if (automatic) {
+        if (currentWorkId === workId && plotStateChapterId === chapterId) {
+          if (plotStateData) {
+            plotStateData.current_state = body.state;
+            plotStateData.state_version = response.version || plotStateData.state_version;
+          }
+          const version = response.version;
+          if (version) $("plotStateSource").textContent = `${plotStateSourceLabels[version.source] || "已记录"} · 生效于第${version.chapter_ord}章`;
+          setPlotStateSaveMessage("已自动保存到服务器。", "ok");
         }
-        const version = response.version;
-        if (version) $("plotStateSource").textContent = `${plotStateSourceLabels[version.source] || "已记录"} · 生效于第${version.chapter_ord}章`;
-        setPlotStateSaveMessage("已自动保存到服务器。", "ok");
+        return;
       }
-      return;
+      await loadPlotState();
+      showToast("剧情状态已保存", "ok");
+    } catch (e) {
+      setPlotStateSaveMessage(automatic ? "服务器暂不可用，草稿已保存在本机。" : e.message, automatic ? "warn" : "");
+    } finally {
+      if (!automatic) busy(button, false, "保存为本章剧情状态");
     }
-    await loadPlotState();
-    showToast("剧情状态已保存", "ok");
-  } catch (e) {
-    setPlotStateSaveMessage(automatic ? "服务器暂不可用，草稿已保存在本机。" : e.message, automatic ? "warn" : "");
-  } finally {
-    if (!automatic) busy(button, false, "保存为本章剧情状态");
-  }
+  });
 }
 
 function syncChapterWorkflow(workflow) {
@@ -4229,7 +4435,7 @@ async function setWorkflowStatus(status) {
 }
 async function runChapterReview() {
   if (!currentChapterId) return;
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   const button = $("workflowReviewBtn");
   busy(button, true, "复核中");
   try {
@@ -4420,7 +4626,7 @@ async function saveStoryMemory(memoryId) {
 }
 async function analyzeStoryMemories() {
   if (!storyMemoryChapterId) return;
-  if (storyMemoryChapterId === currentChapterId && dirty) await saveNow();
+  if (storyMemoryChapterId === currentChapterId && !await flushEditorSave()) return;
   const button = $("storyMemoryAnalyzeBtn");
   busy(button, true, "分析中");
   try {
@@ -4672,15 +4878,15 @@ function renderReader() {
 }
 async function readerPrev() {
   const i = chapters.findIndex(c => c.id === currentChapterId);
-  if (i > 0) { if (dirty) await saveNow(); currentChapterId = chapters[i - 1].id; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
+  if (i > 0 && await flushEditorSave()) { currentChapterId = chapters[i - 1].id; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
 }
 async function readerNext() {
   const i = chapters.findIndex(c => c.id === currentChapterId);
-  if (i >= 0 && i < chapters.length - 1) { if (dirty) await saveNow(); currentChapterId = chapters[i + 1].id; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
+  if (i >= 0 && i < chapters.length - 1 && await flushEditorSave()) { currentChapterId = chapters[i + 1].id; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
 }
 async function readerJumpTo() {
   const cid = +$("readerJump").value;
-  if (cid && cid !== currentChapterId) { if (dirty) await saveNow(); currentChapterId = cid; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
+  if (cid && cid !== currentChapterId && await flushEditorSave()) { currentChapterId = cid; await Promise.all([loadChapter(), loadAgentSessions()]); renderReader(); renderTree(); }
 }
 function readerFont(d) { readerFontPx = Math.min(32, Math.max(14, readerFontPx + d)); localStorage.setItem("rFont", readerFontPx); $("readView").style.fontSize = readerFontPx + "px"; }
 function readerLine() { readerLH = readerLH >= 2.6 ? 1.6 : +(readerLH + 0.3).toFixed(1); localStorage.setItem("rLH", readerLH); $("readView").style.lineHeight = readerLH; }
@@ -4728,7 +4934,7 @@ function syncProductionHeader() {
 
 async function openProductionCanvas() {
   if (!currentWorkId) { showToast("请先新建或选择一个作品", "err"); return; }
-  if (dirty) await saveNow();
+  if (!await flushEditorSave()) return;
   closeStoryDrawer();
   $("app").classList.remove("side-open");
   $("app").classList.add("production-open");
@@ -4754,6 +4960,7 @@ async function maybePromptProductionAnalysis() {
 }
 
 async function closeProductionCanvas() {
+  await flushProductionLayoutSave();
   await closeProductionInspector();
   await maybePromptProductionAnalysis();
   $("app").classList.remove("production-open");
@@ -4763,6 +4970,7 @@ async function closeProductionCanvas() {
 
 async function showProductionOverview() {
   if (productionMode === "chapter") await maybePromptProductionAnalysis();
+  await flushProductionLayoutSave();
   productionMode = "overview";
   await closeProductionInspector();
   syncProductionHeader();
@@ -4781,6 +4989,7 @@ async function changeProductionChapter(value) {
   const next = +value;
   if (!next || next === productionChapterId) return;
   await maybePromptProductionAnalysis();
+  await flushProductionLayoutSave();
   await closeProductionInspector();
   productionChapterId = next;
   if (currentChapterId !== next) await selectChapter(next);
@@ -5164,16 +5373,32 @@ function queueProductionLayoutSave() {
   const key = `productionLayoutDraft:${currentUsername || "user"}:${workId}:${chapterId}`;
   localStorage.setItem(key, JSON.stringify({ layout, saved_at: Date.now() }));
   $("productionSaveStatus").textContent = "布局已本机暂存";
-  productionLayoutTimer = setTimeout(async () => {
-    try {
-      const saved = await api(`/api/works/${workId}/production/layout`, { method: "PUT", body: {
-        chapter_id: chapterId, layout,
-      }});
-      if (productionChapterData && productionChapterId === chapterId) productionChapterData.layout = saved;
-      localStorage.removeItem(key);
-      $("productionSaveStatus").textContent = "布局已同步";
-    } catch (e) { $("productionSaveStatus").textContent = "布局同步失败，草稿仍在本机"; }
-  }, 500);
+  const draftSnapshot = localStorage.getItem(key);
+  productionLayoutPending = { workId, chapterId, layout, key, draftSnapshot };
+  productionLayoutTimer = setTimeout(flushProductionLayoutSave, 500);
+}
+
+async function flushProductionLayoutSave() {
+  clearTimeout(productionLayoutTimer);
+  productionLayoutTimer = null;
+  const pending = productionLayoutPending;
+  productionLayoutPending = null;
+  if (pending) {
+    const { workId, chapterId, layout, key, draftSnapshot } = pending;
+    await productionLayoutSaveQueue.run(async () => {
+      try {
+        const saved = await api(`/api/works/${workId}/production/layout`, { method: "PUT", body: {
+          chapter_id: chapterId, layout,
+        }});
+        if (productionChapterData && productionChapterId === chapterId) productionChapterData.layout = saved;
+        if (localStorage.getItem(key) === draftSnapshot) localStorage.removeItem(key);
+        if (productionChapterId === chapterId) $("productionSaveStatus").textContent = "布局已同步";
+      } catch (e) {
+        if (productionChapterId === chapterId) $("productionSaveStatus").textContent = "布局同步失败，草稿仍在本机";
+      }
+    });
+  }
+  await productionLayoutSaveQueue.wait();
 }
 
 function setProductionZoom(delta) {
@@ -5191,6 +5416,42 @@ function productionPairsText(value) {
   if (!value || typeof value !== "object") return "";
   return Object.entries(value).filter(([, item]) => item != null && String(item).trim())
     .map(([key, item]) => `${key}：${typeof item === "object" ? JSON.stringify(item) : item}`).join("\n");
+}
+
+function productionCustomFields() {
+  const settings = productionChapterData?.settings || productionOverviewData?.settings || {};
+  return Array.isArray(settings.custom_fields) ? settings.custom_fields : [];
+}
+function productionCustomFieldsForm(attributes = {}) {
+  const fields = productionCustomFields().filter(field => field.type !== "hidden");
+  if (!fields.length) return "";
+  return `<div class="production-inspector-section"><h3>作品自定义字段</h3><div class="production-form-grid">${fields.map(field => {
+    const id = `productionCustom_${String(field.id || field.name).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    const value = attributes?.[field.name];
+    const data = `data-production-custom="${esc(field.name)}" data-custom-type="${esc(field.type)}"`;
+    if (field.type === "boolean") return `<label>${esc(field.name)}<input id="${id}" ${data} type="checkbox" ${value ? "checked" : ""}></label>`;
+    if (field.type === "enum" || field.type === "level") {
+      const options = (field.options || []).map(option => `<option value="${esc(option)}" ${String(value ?? "") === String(option) ? "selected" : ""}>${esc(option)}</option>`).join("");
+      return `<label>${esc(field.name)}<select id="${id}" ${data}><option value="">未设置</option>${options}</select></label>`;
+    }
+    return `<label>${esc(field.name)}<input id="${id}" ${data} type="${field.type === "number" ? "number" : "text"}" value="${esc(value == null ? "" : String(value))}"></label>`;
+  }).join("")}</div></div>`;
+}
+function productionOtherAttributes(attributes = {}) {
+  const configured = new Set(productionCustomFields().map(field => field.name));
+  return Object.fromEntries(Object.entries(attributes || {}).filter(([key]) => !configured.has(key)));
+}
+function readProductionCustomAttributes(base = {}) {
+  const attributes = { ...base };
+  document.querySelectorAll("[data-production-custom]").forEach(input => {
+    const name = input.dataset.productionCustom;
+    const type = input.dataset.customType;
+    let value = type === "boolean" ? input.checked : input.value;
+    if (type === "number" && value !== "") value = Number(value);
+    if (value === "" || value == null || (type === "number" && !Number.isFinite(value))) delete attributes[name];
+    else attributes[name] = value;
+  });
+  return attributes;
 }
 
 function parseProductionPairs(value) {
@@ -5237,45 +5498,59 @@ function openProductionAI() {
   $("agentInput").focus();
 }
 
-function productionDraftKey(selection = productionSelected) {
+const productionStateFieldIds = new Set([
+  "productionCardState", "productionStateReaderKnown", "productionStateCharacterKnowledge",
+  "productionStateSecrecy", "productionStateReaderState", "productionCardStateSummary",
+]);
+function productionDraftKey(selection = productionSelected, kind = "base") {
   if (!selection || !currentWorkId) return "";
   const item = selection.item || {};
   const identity = item.id || `new-${item.category || "item"}`;
-  return `productionDraft:${currentUsername || "user"}:${currentWorkId}:${productionChapterId || 0}:${selection.type}:${selection.point || "after"}:${identity}`;
+  return `productionDraft:${currentUsername || "user"}:${currentWorkId}:${productionChapterId || 0}:${selection.type}:${selection.point || "after"}:${identity}:${kind}`;
 }
 
-function stashProductionInspectorDraft() {
-  const key = productionDraftKey();
+function stashProductionInspectorDraft(kind = "all") {
   const form = $("productionInspectorBody")?.querySelector(".production-inspector-form");
-  if (!key || !form || !["card", "scene"].includes(productionSelected?.type)) return;
-  const values = {};
-  form.querySelectorAll("input[id],textarea[id],select[id]").forEach(input => {
-    values[input.id] = input.type === "checkbox" ? input.checked : input.value;
+  if (!form || !["card", "scene"].includes(productionSelected?.type)) return;
+  const kinds = kind === "all" ? ["base", "state"] : [kind];
+  kinds.forEach(draftKind => {
+    const key = productionDraftKey(productionSelected, draftKind);
+    if (!key) return;
+    const values = {};
+    form.querySelectorAll("input[id],textarea[id],select[id]").forEach(input => {
+      const isState = productionStateFieldIds.has(input.id);
+      if ((draftKind === "state") !== isState) return;
+      values[input.id] = input.type === "checkbox" ? input.checked : input.value;
+    });
+    if (Object.keys(values).length) localStorage.setItem(key, JSON.stringify({ values, saved_at: Date.now() }));
   });
-  localStorage.setItem(key, JSON.stringify({ values, saved_at: Date.now() }));
 }
 
 function restoreProductionInspectorDraft() {
-  const key = productionDraftKey();
-  if (!key) return;
-  let draft = null;
-  try { draft = JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { draft = null; }
-  if (!draft?.values) return;
-  Object.entries(draft.values).forEach(([id, value]) => {
-    const input = $(id);
-    if (!input) return;
-    if (input.type === "checkbox") input.checked = !!value;
-    else input.value = value == null ? "" : value;
+  let restored = false;
+  ["base", "state"].forEach(kind => {
+    const key = productionDraftKey(productionSelected, kind);
+    if (!key) return;
+    let draft = null;
+    try { draft = JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { draft = null; }
+    if (!draft?.values) return;
+    Object.entries(draft.values).forEach(([id, value]) => {
+      const input = $(id);
+      if (!input) return;
+      if (input.type === "checkbox") input.checked = !!value;
+      else input.value = value == null ? "" : value;
+    });
+    restored = true;
   });
-  $("productionSaveStatus").textContent = "已恢复本机草稿";
+  if (restored) $("productionSaveStatus").textContent = "已恢复本机草稿";
 }
 
-function clearProductionInspectorDraft(key = productionDraftKey()) {
+function clearProductionInspectorDraft(key = productionDraftKey(productionSelected, "base")) {
   if (key) localStorage.removeItem(key);
 }
 
 function markProductionInspectorDraft() {
-  stashProductionInspectorDraft();
+  stashProductionInspectorDraft("state");
   if ($("productionSaveStatus")) $("productionSaveStatus").textContent = "已本机暂存";
 }
 
@@ -5288,15 +5563,18 @@ async function closeProductionInspector(options = {}) {
   const { flush = true, discard = false } = options;
   const selection = productionSelected;
   const shouldFlush = !!productionInspectorSaveTimer && !!productionSelected?.item?.id;
-  if (!discard) stashProductionInspectorDraft();
+  if (!discard) stashProductionInspectorDraft("all");
   clearTimeout(productionInspectorSaveTimer);
   productionInspectorSaveTimer = null;
-  while (productionInspectorSaving) await new Promise(resolve => setTimeout(resolve, 30));
+  await productionSaveQueue.wait();
   if (flush && shouldFlush && productionSelected === selection) {
     if (productionSelected?.type === "card") await saveProductionCardFromInspector(true);
     else if (productionSelected?.type === "scene") await saveProductionSceneFromInspector(true);
   }
-  if (discard) clearProductionInspectorDraft(productionDraftKey(selection));
+  if (discard) {
+    clearProductionInspectorDraft(productionDraftKey(selection, "base"));
+    clearProductionInspectorDraft(productionDraftKey(selection, "state"));
+  }
   $("productionWorkspace")?.classList.remove("inspector-open");
   productionSelected = null;
   renderProductionResources();
@@ -5362,7 +5640,8 @@ function inspectProductionCard(cardId, point = "after") {
       <label>名称<input id="productionCardName" value="${esc(item.name)}"></label>
       <label>一句话设定<textarea id="productionCardSummary" rows="3">${esc(item.summary || "")}</textarea></label>
       <label>详细说明<textarea id="productionCardDetail" rows="5">${esc(item.detail || "")}</textarea></label>
-      <label>自定义属性 <span>每行“字段：值”</span><textarea id="productionCardAttributes">${esc(productionPairsText(item.attributes))}</textarea></label>
+      ${productionCustomFieldsForm(item.attributes)}
+      <label>其他属性 <span>每行“字段：值”</span><textarea id="productionCardAttributes">${esc(productionPairsText(productionOtherAttributes(item.attributes)))}</textarea></label>
       <div class="production-form-grid">
         <label>起始章节<select id="productionCardScopeStart">${productionChapterSelectOptions(item.scope_start_chapter_id)}</select></label>
         <label>结束章节<select id="productionCardScopeEnd">${productionChapterSelectOptions(item.scope_end_chapter_id)}</select></label>
@@ -5394,7 +5673,8 @@ function newProductionCard(category = "rule") {
       <label>名称<input id="productionCardName" placeholder="例如：灵力等级"></label>
       <label>一句话设定<textarea id="productionCardSummary" rows="3"></textarea></label>
       <label>详细说明<textarea id="productionCardDetail" rows="5"></textarea></label>
-      <label>自定义属性 <span>每行“字段：值”</span><textarea id="productionCardAttributes"></textarea></label>
+      ${productionCustomFieldsForm({})}
+      <label>其他属性 <span>每行“字段：值”</span><textarea id="productionCardAttributes"></textarea></label>
       <div class="production-form-grid"><label>起始章节<select id="productionCardScopeStart">${productionChapterSelectOptions()}</select></label><label>结束章节<select id="productionCardScopeEnd">${productionChapterSelectOptions()}</select></label></div>
       <label>限定场景<select id="productionCardScopeScene">${productionSceneSelectOptions()}</select></label>
       <div class="production-inspector-section"><h3>真相与信息边界</h3>
@@ -5411,7 +5691,7 @@ function readProductionCardForm() {
   const body = {
     category: $("productionCardCategory").value, name: $("productionCardName").value.trim(),
     summary: $("productionCardSummary").value, detail: $("productionCardDetail").value,
-    attributes: parseProductionPairs($("productionCardAttributes").value),
+    attributes: readProductionCustomAttributes(parseProductionPairs($("productionCardAttributes").value)),
     truth: { objective: $("productionTruthObjective").value, reader_known: $("productionTruthReader").value,
       character_knowledge: $("productionTruthCharacters").value, secrecy: $("productionTruthSecrecy").value },
     reader_state: $("productionCardReaderState").value, scope_type: $("productionCardScope").value,
@@ -5425,7 +5705,7 @@ function readProductionCardForm() {
 
 function queueProductionInspectorSave() {
   if (!["card", "scene"].includes(productionSelected?.type)) return;
-  stashProductionInspectorDraft();
+  stashProductionInspectorDraft("base");
   clearTimeout(productionInspectorSaveTimer);
   $("productionSaveStatus").textContent = "已本机暂存";
   if (!productionSelected?.item?.id) return;
@@ -5439,31 +5719,42 @@ function queueProductionInspectorSave() {
 
 async function saveProductionCardFromInspector(quiet = false) {
   if (productionSelected?.type !== "card") return;
-  const cardId = productionSelected.item.id;
-  const draftKey = productionDraftKey();
+  const selection = productionSelected;
+  const cardId = selection.item.id;
+  const workId = currentWorkId;
+  const draftKey = productionDraftKey(selection, "base");
+  const draftSnapshot = localStorage.getItem(draftKey);
   const body = readProductionCardForm();
   if (!body.name) { if (!quiet) showToast("请填写设定卡名称", "err"); return; }
-  try {
-    productionInspectorSaving = true;
-    const saved = await api(cardId ? `/api/production/cards/${cardId}` : `/api/works/${currentWorkId}/production/cards`, {
-      method: cardId ? "PUT" : "POST", body,
-    });
-    clearProductionInspectorDraft(draftKey);
-    $("productionSaveStatus").textContent = "已同步";
-    productionSelected.item = saved;
-    const index = productionCards.findIndex(item => item.id === saved.id);
-    if (index >= 0) productionCards[index] = { ...productionCards[index], ...saved };
-    else productionCards.push(saved);
-    if (productionChapterData?.after?.cards) {
-      const at = productionChapterData.after.cards.findIndex(item => item.id === saved.id);
-      if (at >= 0) productionChapterData.after.cards[at] = { ...productionChapterData.after.cards[at], ...saved };
-      else productionChapterData.after.cards.push(saved);
-    }
-    renderProductionResources();
-    if (productionMode === "chapter") renderProductionCanvas();
-    if (!quiet) { showToast(cardId ? "设定卡已保存" : "设定卡已创建", "ok"); inspectProductionCard(saved.id); }
-  } catch (e) { $("productionSaveStatus").textContent = "同步失败，草稿仍在本机"; if (!quiet) showToast(e.message, "err"); }
-  finally { productionInspectorSaving = false; }
+  return productionSaveQueue.run(async () => {
+    try {
+      productionInspectorSaving = true;
+      const saved = await api(cardId ? `/api/production/cards/${cardId}` : `/api/works/${workId}/production/cards`, {
+        method: cardId ? "PUT" : "POST", body,
+      });
+      if (localStorage.getItem(draftKey) === draftSnapshot) clearProductionInspectorDraft(draftKey);
+      if (productionSelected === selection) {
+        $("productionSaveStatus").textContent = "已同步";
+        productionSelected.item = saved;
+      }
+      const index = productionCards.findIndex(item => item.id === saved.id);
+      if (index >= 0) productionCards[index] = { ...productionCards[index], ...saved };
+      else productionCards.push(saved);
+      if (productionChapterData?.after?.cards) {
+        const at = productionChapterData.after.cards.findIndex(item => item.id === saved.id);
+        if (at >= 0) productionChapterData.after.cards[at] = { ...productionChapterData.after.cards[at], ...saved };
+        else productionChapterData.after.cards.push(saved);
+      }
+      renderProductionResources();
+      if (productionMode === "chapter") renderProductionCanvas();
+      if (!quiet && productionSelected === selection) { showToast(cardId ? "设定卡已保存" : "设定卡已创建", "ok"); inspectProductionCard(saved.id); }
+      return saved;
+    } catch (e) {
+      if ($("productionSaveStatus")) $("productionSaveStatus").textContent = "同步失败，草稿仍在本机";
+      if (!quiet) showToast(e.message, "err");
+      return null;
+    } finally { productionInspectorSaving = false; }
+  });
 }
 
 async function saveProductionCardStateFromInspector() {
@@ -5476,12 +5767,13 @@ async function saveProductionCardStateFromInspector() {
   state._reader_state = $("productionStateReaderState").value;
   Object.keys(state).forEach(key => { if (!String(state[key] ?? "").trim()) delete state[key]; });
   if (!Object.keys(state).length) { showToast("请至少填写一项状态", "err"); return; }
-  const draftKey = productionDraftKey();
+  const draftKey = productionDraftKey(productionSelected, "state");
+  const draftSnapshot = localStorage.getItem(draftKey);
   try {
-    await api(`/api/production/cards/${item.id}/versions`, { body: {
+    await productionSaveQueue.run(() => api(`/api/production/cards/${item.id}/versions`, { body: {
       chapter_id: productionChapterId, state, change_summary: $("productionCardStateSummary").value,
-    }});
-    clearProductionInspectorDraft(draftKey);
+    }}));
+    if (localStorage.getItem(draftKey) === draftSnapshot) clearProductionInspectorDraft(draftKey);
     showToast("本章状态已保存", "ok");
     await loadProductionChapter();
     inspectProductionCard(item.id);
@@ -5491,11 +5783,12 @@ async function saveProductionCardStateFromInspector() {
 async function archiveProductionCard(cardId) {
   const ok = await askCard({ title: "归档设定卡", msg: "归档后不会再进入后续写作上下文，历史状态仍保留。", okText: "归档", danger: true });
   if (!ok) return;
-  const draftKey = productionDraftKey();
+  const selection = productionSelected;
+  const draftKeys = [productionDraftKey(selection, "base"), productionDraftKey(selection, "state")];
   try {
     await closeProductionInspector({ flush: false });
     await api(`/api/production/cards/${cardId}`, { method: "DELETE" });
-    clearProductionInspectorDraft(draftKey);
+    draftKeys.forEach(clearProductionInspectorDraft);
     await (productionMode === "chapter" ? loadProductionChapter() : loadProductionOverview());
     showToast("设定卡已归档", "ok");
   } catch (e) { showToast(e.message, "err"); }
@@ -5580,36 +5873,48 @@ function readProductionSceneForm() {
 
 async function saveProductionSceneFromInspector(quiet = false) {
   if (productionSelected?.type !== "scene") return;
-  const sceneId = productionSelected.item.id;
-  const draftKey = productionDraftKey();
+  const selection = productionSelected;
+  const sceneId = selection.item.id;
+  const chapterId = productionChapterId;
+  const draftKey = productionDraftKey(selection, "base");
+  const draftSnapshot = localStorage.getItem(draftKey);
   const body = readProductionSceneForm();
   if (!body.title) { if (!quiet) showToast("请填写场景标题", "err"); return; }
-  try {
-    productionInspectorSaving = true;
-    const saved = await api(sceneId ? `/api/production/scenes/${sceneId}` : `/api/chapters/${productionChapterId}/production/scenes`, {
-      method: sceneId ? "PUT" : "POST", body,
-    });
-    clearProductionInspectorDraft(draftKey);
-    $("productionSaveStatus").textContent = "已同步";
-    productionSelected.item = saved;
-    if (productionChapterData?.scenes) {
-      const index = productionChapterData.scenes.findIndex(item => item.id === saved.id);
-      if (index >= 0) productionChapterData.scenes[index] = saved; else productionChapterData.scenes.push(saved);
-    }
-    renderProductionCanvas();
-    if (!quiet) { showToast(sceneId ? "场景已保存" : "场景已创建", "ok"); inspectProductionScene(saved.id); }
-  } catch (e) { $("productionSaveStatus").textContent = "同步失败，草稿仍在本机"; if (!quiet) showToast(e.message, "err"); }
-  finally { productionInspectorSaving = false; }
+  return productionSaveQueue.run(async () => {
+    try {
+      productionInspectorSaving = true;
+      const saved = await api(sceneId ? `/api/production/scenes/${sceneId}` : `/api/chapters/${chapterId}/production/scenes`, {
+        method: sceneId ? "PUT" : "POST", body,
+      });
+      if (localStorage.getItem(draftKey) === draftSnapshot) clearProductionInspectorDraft(draftKey);
+      if (productionSelected === selection) {
+        $("productionSaveStatus").textContent = "已同步";
+        productionSelected.item = saved;
+      }
+      if (productionChapterData?.scenes) {
+        const index = productionChapterData.scenes.findIndex(item => item.id === saved.id);
+        if (index >= 0) productionChapterData.scenes[index] = saved; else productionChapterData.scenes.push(saved);
+      }
+      renderProductionCanvas();
+      if (!quiet && productionSelected === selection) { showToast(sceneId ? "场景已保存" : "场景已创建", "ok"); inspectProductionScene(saved.id); }
+      return saved;
+    } catch (e) {
+      if ($("productionSaveStatus")) $("productionSaveStatus").textContent = "同步失败，草稿仍在本机";
+      if (!quiet) showToast(e.message, "err");
+      return null;
+    } finally { productionInspectorSaving = false; }
+  });
 }
 
 async function deleteProductionScene(sceneId) {
   const ok = await askCard({ title: "删除场景", msg: "只删除画布场景节点，不会删除正文。", okText: "删除", danger: true });
   if (!ok) return;
-  const draftKey = productionDraftKey();
+  const selection = productionSelected;
+  const draftKeys = [productionDraftKey(selection, "base"), productionDraftKey(selection, "state")];
   try {
     await closeProductionInspector({ flush: false });
     await api(`/api/production/scenes/${sceneId}`, { method: "DELETE" });
-    clearProductionInspectorDraft(draftKey);
+    draftKeys.forEach(clearProductionInspectorDraft);
     await loadProductionChapter();
   }
   catch (e) { showToast(e.message, "err"); }
@@ -5632,7 +5937,7 @@ async function resolveProductionImpact(impactId) {
 
 async function analyzeProductionChapter() {
   if (!productionChapterId) return;
-  if (dirty && currentChapterId === productionChapterId) await saveNow();
+  if (currentChapterId === productionChapterId && !await flushEditorSave()) return;
   const button = $("productionAnalyzeBtn");
   busy(button, true, "分析中");
   try {
@@ -6337,7 +6642,11 @@ $("semanticPop").addEventListener("pointerenter", () => clearTimeout(semanticPop
 $("semanticPop").addEventListener("pointerleave", () => hideSemanticPop(100));
 window.addEventListener("resize", syncSemanticEditor, { passive: true });
 $("notes").addEventListener("input", onNotesInput);
-$("chapTitle").addEventListener("input", () => { dirty = true; updateSaveStat("未保存"); clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 1500); });
+$("chapTitle").addEventListener("input", markEditorDirty);
+window.addEventListener("pagehide", () => { if (dirty) stashEditorDraft(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && dirty) stashEditorDraft();
+});
 plotStateFields.map(([, , id]) => id).concat(["plotStateSummary", "plotStateEvidence"])
   .forEach(id => $(id).addEventListener("input", queuePlotStateAutosave));
 document.addEventListener("click", (e) => {

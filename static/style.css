@@ -917,6 +917,19 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 
 /* 通用询问卡 / 危险按钮 / 空状态 CTA（阶段三：替代 prompt·confirm） */
 .ask-card { max-width: 380px; }
+.editor-conflict-card { max-width: 920px; }
+.editor-conflict-body { padding: 16px; overflow: auto; }
+.editor-conflict-compare { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.editor-conflict-compare label { display: grid; gap: 7px; min-width: 0; color: var(--muted); font-size: 13px; }
+.editor-conflict-compare textarea { min-height: 320px; resize: vertical; color: var(--text); background: var(--surface); }
+.editor-conflict-actions { flex-wrap: wrap; }
+.editor-conflict-actions button { min-width: 150px; }
+@media (max-width: 700px) {
+  .editor-conflict-card { max-height: 94vh; }
+  .editor-conflict-compare { grid-template-columns: 1fr; }
+  .editor-conflict-compare textarea { min-height: 180px; }
+  .editor-conflict-actions button { min-width: calc(50% - 4px); }
+}
 .ask-input { margin: 6px 0 4px; }
 .danger-btn { background: var(--danger); color: #fff; border-color: var(--danger); }
 .danger-btn:hover { border-color: var(--danger); filter: brightness(1.06); }

@@ -103,6 +103,28 @@ ok(c.get("/api/me").status_code == 401, "未登录 401")
 wid = c.post("/api/works", json={"title": "A作"}, headers=H(tokA)).json()["id"]
 cid = c.post(f"/api/works/{wid}/chapters", json={"title": "第一章"}, headers=H(tokA)).json()["id"]
 
+# 编辑器使用内容版本做乐观并发控制；陈旧页面不得静默覆盖服务器新稿。
+cas_cid = c.post(f"/api/works/{wid}/chapters", json={"title": "并发保存检查"}, headers=H(tokA)).json()["id"]
+cas_saved = c.put(f"/api/chapters/{cas_cid}", json={
+    "content": "设备 A 的新稿", "expected_revision": 1,
+}, headers=H(tokA))
+cas_conflict = c.put(f"/api/chapters/{cas_cid}", json={
+    "content": "设备 B 的陈旧覆盖稿", "expected_revision": 1,
+}, headers=H(tokA))
+ok(cas_saved.status_code == 200 and cas_conflict.status_code == 409
+   and cas_conflict.json()["detail"]["server"]["content"] == "设备 A 的新稿"
+   and c.get(f"/api/chapters/{cas_cid}", headers=H(tokA)).json()["content"] == "设备 A 的新稿",
+   "多端陈旧保存返回冲突且不覆盖服务器正文")
+cas_branch = c.post(f"/api/chapters/{cas_cid}/conflict-branch", json={
+    "title": "设备 B 分支", "content": "设备 B 的陈旧覆盖稿", "notes": "保留冲突稿",
+}, headers=H(tokA)).json()
+ok(cas_branch["branch_of_chapter_id"] == cas_cid
+   and c.get(f"/api/chapters/{cas_branch['id']}", headers=H(tokA)).json()["content"] == "设备 B 的陈旧覆盖稿",
+   "冲突草稿可另存为章节分支")
+for temporary_cid in (cas_branch["id"], cas_cid):
+    c.delete(f"/api/chapters/{temporary_cid}", headers=H(tokA))
+    c.post(f"/api/chapters/{temporary_cid}/purge", headers=H(tokA))
+
 # 隔离：bob 看不到 alice 的作品/章节
 ok(c.get("/api/works", headers=H(tokB)).json() == [], "bob 看不到 alice 作品")
 ok(c.get(f"/api/chapters/{cid}", headers=H(tokB)).status_code == 404, "bob 访问 alice 章节 404")
@@ -206,6 +228,10 @@ ok("代价来自寿命" not in db.production_context_digest(wid, _uidA_early, ci
 
 # 作者编辑 AI 场景后，该场景升级为人工内容，后续分析替换不能覆盖。
 ai_scene_id = db.replace_ai_production_scenes(cid, _uidA_early, [{"title": "AI 临时场景"}])["scene_ids"][0]
+reconciled_scene_id = db.replace_ai_production_scenes(
+    cid, _uidA_early, [{"title": "AI 临时场景", "summary": "重分析后的摘要"}],
+)["scene_ids"][0]
+ok(reconciled_scene_id == ai_scene_id, "AI 重分析按场景身份更新并保持稳定 ID")
 edited_ai_scene = c.put(f"/api/production/scenes/{ai_scene_id}", json={
     "chapter_id": cid, "title": "作者保留场景", "summary": "人工修订后的结构",
 }, headers=H(tokA)).json()
@@ -391,6 +417,8 @@ ok(c.get(f"/api/chapters/{cid}", headers=H(tokA)).json()["content"] == "你好",
 ok(c.get(f"/api/chapters/{cid2}", headers=H(tokA)).json()["content"] == "世界", "右半进新章")
 
 # 排序：把新章挪到前面
+ok(c.post(f"/api/works/{wid}/reorder", json={"ids": [cid2, cid2]}, headers=H(tokA)).status_code == 400,
+   "章节排序拒绝重复或不完整 ID")
 ok(c.post(f"/api/works/{wid}/reorder", json={"ids": [cid2, cid]}, headers=H(tokA)).status_code == 200, "排序")
 order = [c["id"] for c in c.get(f"/api/works/{wid}/chapters", headers=H(tokA)).json()]
 ok(order == [cid2, cid], "排序生效")
@@ -636,6 +664,10 @@ ok(_long_doc_preview.status_code == 200 and "蓝鲸协议" in _long_doc_preview.
    "作者可预览长期资料全文且他人不可读取")
 ok(c.put(f"/api/works/{wid}/materials/documents/{_long_doc['id']}", json={"pinned": False}, headers=H(tokB)).status_code == 404,
    "他人不能修改长期参考资料")
+ok(not materials.delete_document(uidA + 9999, wid, _long_doc["id"])
+   and any(item["id"] == _long_doc["id"] for item in materials.search_reference_documents(
+       uidA, wid, "钟声", 3,
+   )), "长期资料全文索引可召回双字中文短词且越权删除不会破坏索引")
 _reference_work_id = c.post("/api/works", json={"title": "只读参考工程"}, headers=H(tokA)).json()["id"]
 materials.save_style_profile(uidA, _reference_work_id, {
     "narrative_voice": "克制的近距离叙述", "point_of_view": "第三人称限知", "pacing": "短场景递进",
@@ -865,6 +897,7 @@ c.put(f"/api/chapters/{state_c2}", json={"content": "林晚在旧码头得知失
 _orig_character_chat = llm.chat
 _character_prompt = {}
 def _character_extract(messages, **kw):
+    _character_prompt["count"] = _character_prompt.get("count", 0) + 1
     _character_prompt["messages"] = messages
     return json.dumps({"plot": {}, "memories": [], "scenes": [], "changes": [], "character_changes": [{
         "entity_id": ent["id"],
@@ -876,6 +909,10 @@ llm.chat = _character_extract
 _analyzed = c.post(f"/api/chapters/{state_c2}/character-state-proposals/analyze", json={}, headers=H(tokA)).json()
 ok(len(_analyzed["proposals"]) == 1 and _analyzed["proposals"][0]["status"] == "pending", "AI 提取人物状态为待确认提议")
 ok("known_characters" in _character_prompt["messages"][-1]["content"], "统一分析收到当前已确认人物状态")
+ok("custom_fields" in _character_prompt["messages"][-1]["content"], "生产画布自定义字段进入统一 World State 分析")
+_cached_analysis = c.post(f"/api/chapters/{state_c2}/production/analyze", json={}, headers=H(tokA)).json()
+ok(_cached_analysis["cache_hit"] and _character_prompt["count"] == 1,
+   "同正文同模型的 World State 分析复用持久化快照")
 _after_analyze = c.get(f"/api/works/{wid}/entities?chapter_id={state_c2}", headers=H(tokA)).json()[0]
 ok(_after_analyze["current_state"]["goal"] == "追查目击者" and _after_analyze["pending_count"] == 1,
    "待确认提议不改变后续 AI 上下文")
@@ -1819,11 +1856,12 @@ ok(_nsandbox == 0 and _nbookjobs == 0, "删作品级联清空情节沙盘与拆�
 with db.get_conn() as conn:
     _nmaterial_settings = conn.execute("SELECT COUNT(*) FROM work_material_settings WHERE work_id=?", (wid,)).fetchone()[0]
     _nmaterial_docs = conn.execute("SELECT COUNT(*) FROM work_reference_documents WHERE work_id=?", (wid,)).fetchone()[0]
+    _nmaterial_fts = conn.execute("SELECT COUNT(*) FROM reference_document_fts WHERE work_id=?", (wid,)).fetchone()[0]
     _nmaterial_mounts = conn.execute("SELECT COUNT(*) FROM work_reference_mounts WHERE work_id=?", (wid,)).fetchone()[0]
     _nmaterial_profiles = conn.execute("SELECT COUNT(*) FROM work_style_profiles WHERE work_id=?", (wid,)).fetchone()[0]
     _nentity_images = conn.execute("SELECT COUNT(*) FROM entity_images WHERE work_id=?", (wid,)).fetchone()[0]
-ok(not any((_nmaterial_settings, _nmaterial_docs, _nmaterial_mounts, _nmaterial_profiles, _nentity_images)),
-   "删作品级联清空资料中心配置、长期资料、挂载、语言指纹与角色图库")
+ok(not any((_nmaterial_settings, _nmaterial_docs, _nmaterial_fts, _nmaterial_mounts, _nmaterial_profiles, _nentity_images)),
+   "删作品级联清空资料中心配置、长期资料及索引、挂载、语言指纹与角色图库")
 # 同样应级联清掉该作品各章节的 agent 对话（cid 上留有一条压缩后的对话）
 ok(db.get_conversation(uidA, cid) is None, "删作品级联清空对话")
 _archived_inspiration = c.get(
@@ -1845,6 +1883,8 @@ ok(_home.status_code == 200 and _assets.get("style.css") and _assets.get("style.
    "首页可访问且前端资源带版本号")
 ok(c.get("/style.css").headers.get("cache-control") == "no-cache" and c.get("/app.js").headers.get("cache-control") == "no-cache",
    "前端入口资源要求重新校验缓存")
+ok("immutable" in c.get(f"/app.js?v={_assets['app.js']}").headers.get("cache-control", ""),
+   "带内容版本的前端资源可长期缓存")
 
 llm.chat = _orig_character_chat
 print("\nAll smoke checks passed.")

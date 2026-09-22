@@ -8,9 +8,9 @@ services:
     environment:
       # 数据库放在挂载卷里，容器重建不丢稿
       - DB_PATH=/data/writehtml.db
-      # 凭注册码开放注册；已存在账号不受影响。公网部署后建议定期更换。
+      # 凭注册码开放注册；必须在服务器 .env 中设置，不能提交到仓库。
       - ALLOW_SIGNUP=false
-      - SIGNUP_CODE=lipeng%@0
+      - SIGNUP_CODE=${SIGNUP_CODE:-}
       # 想给所有用户兜底一个默认 key（用户没填自己的时用这个），取消下面注释：
       # - LLM_BASE_URL=https://api.deepseek.com/v1
       # - LLM_API_KEY=sk-xxx

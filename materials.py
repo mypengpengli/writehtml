@@ -235,6 +235,89 @@ def get_document(user_id, work_id, document_id):
     return item
 
 
+def _sync_reference_document_fts(conn, document_id):
+    row = conn.execute(
+        "SELECT id,user_id,work_id,name,tags,content FROM work_reference_documents WHERE id=?",
+        (document_id,),
+    ).fetchone()
+    conn.execute("DELETE FROM reference_document_fts WHERE rowid=?", (document_id,))
+    if row:
+        conn.execute(
+            "INSERT INTO reference_document_fts(rowid,name,tags,content,user_id,work_id) VALUES(?,?,?,?,?,?)",
+            (row["id"], row["name"], row["tags"] or "", row["content"], row["user_id"], row["work_id"]),
+        )
+
+
+def search_reference_documents(user_id, work_id, query, limit=3):
+    """Return only the few document bodies needed by this turn."""
+    limit = max(1, min(int(limit or 3), 10))
+    with db.get_conn() as conn:
+        if not _owned(conn, work_id, user_id):
+            return None
+        selected = []
+        seen = set()
+        pinned = conn.execute(
+            "SELECT * FROM work_reference_documents WHERE work_id=? AND user_id=? "
+            "AND enabled=1 AND pinned=1 ORDER BY updated_at DESC,id DESC LIMIT ?",
+            (work_id, user_id, limit),
+        ).fetchall()
+        for row in pinned:
+            selected.append(dict(row))
+            seen.add(row["id"])
+        remaining = limit - len(selected)
+        terms = sorted(_terms(query), key=len, reverse=True)[:16]
+        if remaining > 0 and terms:
+            expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
+            try:
+                rows = conn.execute(
+                    "SELECT d.*,bm25(reference_document_fts,2.0,1.5,1.0) AS rank "
+                    "FROM reference_document_fts JOIN work_reference_documents d "
+                    "ON d.id=reference_document_fts.rowid "
+                    "WHERE reference_document_fts MATCH ? AND d.work_id=? AND d.user_id=? AND d.enabled=1 "
+                    "ORDER BY rank,d.updated_at DESC LIMIT ?",
+                    (expression, work_id, user_id, limit + len(seen)),
+                ).fetchall()
+            except Exception:
+                rows = []
+            for row in rows:
+                if row["id"] in seen:
+                    continue
+                selected.append(dict(row))
+                seen.add(row["id"])
+                if len(selected) >= limit:
+                    break
+            # FTS5 trigram does not match every two-character Chinese query.
+            # Fall back inside SQLite without loading every document body into Python.
+            if len(selected) < limit:
+                fallback_terms = sorted(terms, key=len, reverse=True)[:6]
+                haystack = "lower(name || char(10) || tags || char(10) || content)"
+                clauses = " OR ".join(f"instr({haystack}, ?) > 0" for _ in fallback_terms)
+                rows = conn.execute(
+                    "SELECT * FROM work_reference_documents WHERE work_id=? AND user_id=? AND enabled=1 AND ("
+                    + clauses + ") ORDER BY updated_at DESC,id DESC LIMIT ?",
+                    (work_id, user_id, *fallback_terms, limit + len(seen)),
+                ).fetchall()
+                for row in rows:
+                    if row["id"] in seen:
+                        continue
+                    selected.append(dict(row))
+                    seen.add(row["id"])
+                    if len(selected) >= limit:
+                        break
+        if remaining > 0 and not terms:
+            rows = conn.execute(
+                "SELECT * FROM work_reference_documents WHERE work_id=? AND user_id=? AND enabled=1 "
+                "ORDER BY pinned DESC,updated_at DESC,id DESC LIMIT ?", (work_id, user_id, limit),
+            ).fetchall()
+            for row in rows:
+                if row["id"] not in seen:
+                    selected.append(dict(row))
+                    seen.add(row["id"])
+                if len(selected) >= limit:
+                    break
+    return [{**item, "enabled": bool(item["enabled"]), "pinned": bool(item["pinned"])} for item in selected]
+
+
 def save_document(user_id, work_id, payload):
     payload = payload if isinstance(payload, dict) else {}
     name = " ".join(str(payload.get("name") or "长期参考资料").replace("\\", "/").rsplit("/", 1)[-1].split())[:240]
@@ -259,6 +342,7 @@ def save_document(user_id, work_id, payload):
             "SELECT id,user_id,work_id,name,tags,enabled,pinned,length(content) AS chars,created_at,updated_at "
             "FROM work_reference_documents WHERE work_id=? AND content_hash=?", (work_id, digest)
         ).fetchone()
+        _sync_reference_document_fts(conn, row["id"])
     item = dict(row)
     item["enabled"], item["pinned"] = bool(item["enabled"]), bool(item["pinned"])
     return item
@@ -284,6 +368,7 @@ def update_document(user_id, work_id, document_id, payload):
         )
         if not cur.rowcount:
             return None
+        _sync_reference_document_fts(conn, document_id)
     return next((item for item in list_documents(user_id, work_id) if item["id"] == document_id), None)
 
 
@@ -293,6 +378,8 @@ def delete_document(user_id, work_id, document_id):
             "DELETE FROM work_reference_documents WHERE id=? AND work_id=? AND user_id=?",
             (document_id, work_id, user_id),
         )
+        if cur.rowcount:
+            conn.execute("DELETE FROM reference_document_fts WHERE rowid=?", (document_id,))
         return cur.rowcount > 0
 
 
@@ -435,19 +522,8 @@ def context_items(user_id, work_id, query, *, include_memory=True):
                                   "reason": "作者挂载的借鉴源；只借结构和技法，不作为本书事实", "priority": 3})
 
     if settings["use_reference_documents"]:
-        docs = list_documents(user_id, work_id, include_content=True) or []
-        query_terms = _terms(query)
-        ranked = []
+        docs = search_reference_documents(user_id, work_id, query, limit=3) or []
         for document in docs:
-            if not document["enabled"]:
-                continue
-            haystack = f"{document['name']} {document.get('tags') or ''} {document.get('content') or ''}".lower()
-            score = sum(1 for term in query_terms if term in haystack)
-            if document["pinned"]:
-                score += 100
-            if score or not query_terms:
-                ranked.append((score, document))
-        for _, document in sorted(ranked, key=lambda pair: (pair[0], pair[1]["updated_at"]), reverse=True)[:3]:
             items.append({"type": "reference_document", "title": f"长期参考：{document['name']}",
                           "content": document["content"][:6500],
                           "reason": "置顶资料" if document["pinned"] else "与本轮指令匹配的长期资料", "priority": 2})
