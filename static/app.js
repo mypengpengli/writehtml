@@ -79,6 +79,7 @@ let inspirationPreviewUrl = null;
 let inspirationPendingPolls = 0;
 // 创作生产画布
 let productionMode = "overview";
+let productionSection = localStorage.getItem("productionSection") || "canon";
 let productionChapterId = null;
 let productionOverviewData = null;
 let productionChapterData = null;
@@ -90,6 +91,11 @@ let productionLayoutPending = null;
 let productionInspectorSaveTimer = null;
 let productionInspectorSaving = false;
 let productionZoom = 1;
+let storyPlanNodes = [];
+let storyPlanFilter = "all";
+let storyPlanNotesRecord = null;
+let storyPlanSaveTimer = null;
+let storyPlanSaving = false;
 
 class SerialSaveQueue {
   constructor() { this.tail = Promise.resolve(); this.pending = 0; }
@@ -1692,7 +1698,7 @@ function renderOutlineSandbox() {
       <div class="sandbox-node-dir">${esc(node.direction || sandboxKindLabel(node.kind))}</div>
       <div class="sandbox-node-title">${esc(node.title)}</div>
       <div class="sandbox-node-summary">${esc(node.summary || "点击填写这个情节点会发生什么")}</div>
-      <div class="sandbox-node-meta">${node.chapter_id ? "已关联正文章节" : "沙盘草案"}${node.characters ? ` · ${esc(node.characters)}` : ""}</div>
+      <div class="sandbox-node-meta">${node.chapter_id ? "已关联正文章节" : node.plan_node_id ? "已采纳为规划" : "候选未来"}${node.characters ? ` · ${esc(node.characters)}` : ""}</div>
       ${parents.has(node.id) ? `<button class="sandbox-node-collapse" data-collapse-node="${esc(node.id)}" title="${node.collapsed ? "展开子节点" : "收起子节点"}">${node.collapsed ? "+" : "−"}</button>` : ""}
     </article>`).join("");
   nodesHost.querySelectorAll(".sandbox-node").forEach(element => {
@@ -1738,7 +1744,9 @@ function renderSandboxInspector() {
   $("sandboxNodeKind").value = node.kind || "plot"; $("sandboxNodeDirection").value = node.direction || "";
   $("sandboxNodeCharacters").value = node.characters || "";
   $("sandboxOpenChapterBtn").classList.toggle("hidden", !node.chapter_id);
-  $("sandboxAdoptBtn").classList.toggle("hidden", !!node.chapter_id); renderSandboxCandidates();
+  $("sandboxOpenPlanBtn").classList.toggle("hidden", !node.plan_node_id);
+  $("sandboxAdoptMode").value = node.plan_node_id ? "update_plan" : "plan";
+  $("sandboxAdoptBtn").classList.toggle("hidden", !!node.chapter_id && !!node.plan_node_id); renderSandboxCandidates();
 }
 function updateSelectedSandboxNode() {
   const node = selectedSandboxNode(); if (!node) return;
@@ -1754,7 +1762,7 @@ function updateSelectedSandboxNode() {
     el.querySelector(".sandbox-node-dir").textContent = node.direction || sandboxKindLabel(node.kind);
     el.querySelector(".sandbox-node-title").textContent = node.title || "未命名情节点";
     el.querySelector(".sandbox-node-summary").textContent = node.summary || "点击填写这个情节点会发生什么";
-    el.querySelector(".sandbox-node-meta").textContent = `${node.chapter_id ? "已关联正文章节" : "沙盘草案"}${node.characters ? ` · ${node.characters}` : ""}`;
+    el.querySelector(".sandbox-node-meta").textContent = `${node.chapter_id ? "已关联正文章节" : node.plan_node_id ? "已采纳为规划" : "候选未来"}${node.characters ? ` · ${node.characters}` : ""}`;
   }
   renderSandboxEdges();
   scheduleSandboxSave();
@@ -1795,7 +1803,7 @@ function syncSandboxChapters(feedback = true) {
   mains.forEach((chapter, index) => {
     let node = byChapter.get(chapter.id);
     if (!node) {
-      node = { id: `chapter-${chapter.id}`, title: chapter.title || `第${chapter.ord}章`, summary: chapter.workflow_summary || chapter.workflow_goal || "",
+      node = { id: `chapter-${chapter.id}`, title: chapter.title || `第${chapter.ord}章`, summary: chapter.outcome_summary || chapter.workflow_goal || "",
         kind: "chapter", direction: "推进", characters: "", chapter_id: chapter.id, x: 70 + index * 280, y: 90, collapsed: false };
       data.nodes.push(node); byChapter.set(chapter.id, node); added++;
     } else node.title = chapter.title || node.title;
@@ -1807,7 +1815,7 @@ function syncSandboxChapters(feedback = true) {
   chapters.filter(chapter => chapter.branch_of_chapter_id).forEach((chapter, index) => {
     if (byChapter.has(chapter.id)) return;
     const parent = byChapter.get(chapter.branch_of_chapter_id);
-    const node = { id: `chapter-${chapter.id}`, title: chapter.title || "章节分支", summary: chapter.workflow_summary || "",
+    const node = { id: `chapter-${chapter.id}`, title: chapter.title || "章节分支", summary: chapter.outcome_summary || "",
       kind: "chapter", direction: "发散", characters: "", chapter_id: chapter.id,
       x: (parent?.x || 70) + 280, y: (parent?.y || 90) + 150 + index * 120, collapsed: false };
     data.nodes.push(node); byChapter.set(chapter.id, node); added++;
@@ -1907,20 +1915,25 @@ async function exportSandboxTree(rootId = null) {
   showToast(rootId ? "此分支已导出，并复制为 Markdown" : "整棵沙盘已导出，并复制为 Markdown", "ok");
 }
 async function adoptSandboxNode() {
-  const node = selectedSandboxNode(); if (!node || node.chapter_id) return;
+  const node = selectedSandboxNode(); if (!node) return;
   try {
-    const chapter = await api(`/api/works/${currentWorkId}/chapters`, { body: { title: node.title || "沙盘章节" } });
-    const path = sandboxExportMarkdown(node.id);
-    const notes = [node.summary, node.characters ? `涉及人物：${node.characters}` : "", path]
-      .filter(Boolean).join("\n\n");
-    await api(`/api/chapters/${chapter.id}`, { method: "PUT", body: { notes } });
-    await api(`/api/chapters/${chapter.id}/workflow`, { method: "PUT", body: {
-      status: "planning", goal: node.summary || node.title || "完善本章计划", summary: node.summary || "",
+    const mode = $("sandboxAdoptMode").value;
+    const result = await api(`/api/sandboxes/${currentSandbox.id}/nodes/${encodeURIComponent(node.id)}/adopt`, { body: {
+      mode, target_plan_id: node.plan_node_id || null,
     }});
-    node.chapter_id = chapter.id; node.kind = "chapter";
-    await saveOutlineSandbox(false); await loadChapters(); renderOutlineSandbox(); renderSandboxInspector();
-    showToast("已采纳为正文章节，节点摘要和分支计划已带入", "ok");
+    node.plan_node_id = result.plan?.id || node.plan_node_id;
+    if (result.chapter?.id) { node.chapter_id = result.chapter.id; node.kind = "chapter"; await loadChapters(); }
+    await saveOutlineSandbox(false); renderOutlineSandbox(); renderSandboxInspector();
+    showToast(result.chapter ? "已采纳为正式规划并创建章节" : "已采纳为正式剧情规划", "ok");
   } catch (e) { showToast(e.message, "err"); }
+}
+async function openSandboxPlan() {
+  const node = selectedSandboxNode(); if (!node?.plan_node_id) return;
+  const planId = node.plan_node_id;
+  await closeOutlineSandbox();
+  if (!$("app").classList.contains("production-open")) await openProductionCanvas();
+  await setProductionSection("plan");
+  inspectStoryPlan(planId);
 }
 async function openSandboxChapter() {
   const node = selectedSandboxNode(); if (!node?.chapter_id) return;
@@ -4797,13 +4810,15 @@ function renderAgentContext(data) {
   $("contextMeta").textContent = `${data.engine} · ${chapter} · ${data.model || "未设置模型"}${estimate}`;
   $("contextSelection").innerHTML = contextTextBlock("选区", data.selection?.present ? data.selection.text : "本回合没有选区");
   const recalled = data.context_items || [];
+  const excluded = data.context_exclusions || [];
   const conversation = data.conversation || {};
   $("contextRecall").innerHTML = `<div><b>会话上下文</b>
     <p>${conversation.use_history ? `${esc(conversation.title || "当前会话")} · ${conversation.message_count || 0} 条消息` : "本轮不读取旧聊天"}</p>
     ${conversation.has_summary ? `<details><summary>已压缩的早期对话摘要</summary><pre>${esc(conversation.summary || "")}</pre></details>` : ""}
     </div><div><b>本轮参考资料</b>${recalled.length ? recalled.map((item, index) =>
-    `<details ${index < 3 ? "open" : ""}><summary>${esc(item.title || item.type || "上下文")} · ${esc(item.reason || "系统上下文")}</summary><pre>${esc(item.content || "")}</pre></details>`
-    ).join("") : '<p>暂无可用的已确认故事资料</p>'}</div>`;
+    `<details ${index < 3 ? "open" : ""}><summary>${esc(item.title || item.type || "上下文")} · ${esc(item.reason || "系统上下文")}${item.source_version ? ` · v${item.source_version}` : ""}</summary>${item.time_scope ? `<p>${esc(item.time_scope)}</p>` : ""}<pre>${esc(item.content || "")}</pre></details>`
+    ).join("") : '<p>暂无可用的已确认故事资料</p>'}
+    ${excluded.length ? `<details><summary>本轮未发送的剧情规划 · ${excluded.length} 项</summary><div class="context-exclusion-list">${excluded.map(item => `<p><b>${esc(item.title)}</b><span>${esc(item.reason)}</span></p>`).join("")}</div></details>` : ""}</div>`;
   const skills = data.skills || [];
   $("contextSkills").innerHTML = `<div><b>本回合 Skills</b>${skills.length ? skills.map(item =>
     `<details><summary>${esc(item.name)}${item.description ? ` · ${esc(item.description)}` : ""}</summary><pre>${esc(item.instruction)}</pre></details>`
@@ -4947,13 +4962,17 @@ function syncProductionHeader() {
     select.innerHTML = productionChapterOptions();
     select.disabled = !chapters.length;
   }
-  $("productionOverviewBtn")?.classList.toggle("active", productionMode === "overview");
-  $("productionChapterBtn")?.classList.toggle("active", productionMode === "chapter");
+  $("productionCanonBtn")?.classList.toggle("active", productionSection === "canon");
+  $("productionPlanBtn")?.classList.toggle("active", productionSection === "plan");
+  $("productionStateBtn")?.classList.toggle("active", productionSection === "state");
   const chapter = chapters.find(item => item.id === productionChapterId);
-  $("productionSubtitle").textContent = productionMode === "overview"
-    ? `${chapters.length} 章 · 全书脉络`
+  $("productionSubtitle").textContent = productionSection === "canon" ? "人物与世界事实"
+    : productionSection === "plan" ? "已选择的未来与候选推演"
     : (chapter ? `第${chapter.ord}章《${chapter.title || "未命名"}》` : "请选择章节");
-  $("productionAnalyzeBtn").disabled = productionMode !== "chapter" || !productionChapterId;
+  $("productionChapterSelect")?.classList.toggle("hidden", productionSection === "canon");
+  $("productionAnalyzeBtn")?.classList.toggle("hidden", productionSection !== "state");
+  $("productionAnalyzeBtn").disabled = productionSection !== "state" || !productionChapterId;
+  $("productionSettingsBar")?.classList.add("hidden");
 }
 
 async function openProductionCanvas() {
@@ -4965,14 +4984,13 @@ async function openProductionCanvas() {
   const workspace = $("productionWorkspace");
   workspace.classList.toggle("resources-closed", window.innerWidth < 1100);
   productionChapterId = currentChapterId || chapters[chapters.length - 1]?.id || null;
-  productionMode = productionChapterId ? "chapter" : "overview";
+  if (!['canon', 'plan', 'state'].includes(productionSection)) productionSection = "canon";
   syncProductionHeader();
-  if (productionMode === "chapter") await loadProductionChapter();
-  else await loadProductionOverview();
+  await setProductionSection(productionSection, true);
 }
 
 async function maybePromptProductionAnalysis() {
-  if (!productionChapterId || !productionChapterData?.settings?.auto_analyze_on_leave) return true;
+  if (productionSection !== "state" || !productionChapterId || !productionChapterData?.settings?.auto_analyze_on_leave) return true;
   const status = productionChapterData.chapter?.production_analysis_status;
   if (status === "current" || !(productionChapterData.chapter?.content || "").trim()) return true;
   const analyze = await askCard({
@@ -4993,20 +5011,39 @@ async function closeProductionCanvas() {
 }
 
 async function showProductionOverview() {
-  if (productionMode === "chapter") await maybePromptProductionAnalysis();
-  await flushProductionLayoutSave();
-  productionMode = "overview";
-  await closeProductionInspector();
-  syncProductionHeader();
-  await loadProductionOverview();
+  await setProductionSection("canon");
 }
 
 async function showProductionChapter() {
-  if (!productionChapterId) productionChapterId = currentChapterId || chapters[chapters.length - 1]?.id || null;
-  if (!productionChapterId) { showToast("当前作品还没有章节", "err"); return; }
-  productionMode = "chapter";
+  await setProductionSection("state");
+}
+
+async function setProductionSection(section, opening = false) {
+  if (!['canon', 'plan', 'state'].includes(section)) section = 'canon';
+  if (!opening && productionSection === 'state' && section !== 'state') await maybePromptProductionAnalysis();
+  await flushProductionLayoutSave();
+  await closeProductionInspector();
+  productionSection = section;
+  localStorage.setItem("productionSection", section);
+  const planMode = section === "plan";
+  $("productionResources")?.classList.toggle("hidden", planMode);
+  $("storyPlanTreePane")?.classList.toggle("hidden", !planMode);
+  $("storyPlanWorkspace")?.classList.toggle("hidden", !planMode);
+  $("productionOverview")?.classList.add("hidden");
+  $("productionCanvasViewport")?.classList.add("hidden");
   syncProductionHeader();
-  await loadProductionChapter();
+  if (planMode) {
+    productionMode = "plan";
+    await loadStoryPlan();
+  } else if (section === "state") {
+    if (!productionChapterId) productionChapterId = currentChapterId || chapters[chapters.length - 1]?.id || null;
+    if (!productionChapterId) { showToast("当前作品还没有章节", "err"); productionSection = "canon"; return setProductionSection("canon", true); }
+    productionMode = "chapter";
+    await loadProductionChapter();
+  } else {
+    productionMode = "overview";
+    await loadProductionOverview();
+  }
 }
 
 async function changeProductionChapter(value) {
@@ -5017,7 +5054,15 @@ async function changeProductionChapter(value) {
   await closeProductionInspector();
   productionChapterId = next;
   if (currentChapterId !== next) await selectChapter(next);
+  if (productionSection === "plan") {
+    syncProductionHeader();
+    renderStoryPlan();
+    return;
+  }
+  productionSection = "state";
   productionMode = "chapter";
+  productionSection = "state";
+  localStorage.setItem("productionSection", "state");
   syncProductionHeader();
   await loadProductionChapter();
 }
@@ -5094,7 +5139,7 @@ function renderProductionOverview() {
     ["道具", counts.item || 0], ["组织", counts.organization || 0],
   ];
   const cards = (data.chapters || []).map(chapter => {
-    const summary = chapter.workflow_summary || (chapter.chars ? `${chapter.chars} 字正文` : "尚未开始正文");
+    const summary = chapter.outcome_summary || (chapter.chars ? `${chapter.chars} 字正文` : "尚未开始正文");
     const warnings = (chapter.pending_count || 0) + (chapter.impact_count || 0);
     return `<button class="production-chapter-card ${chapter.id === productionChapterId ? "active" : ""}" onclick="openProductionChapterFromOverview(${chapter.id})">
       <span class="production-chapter-number">第 ${chapter.ord} 章</span>
@@ -5117,6 +5162,8 @@ async function openProductionChapterFromOverview(chapterId) {
   productionChapterId = chapterId;
   if (currentChapterId !== chapterId) await selectChapter(chapterId);
   productionMode = "chapter";
+  productionSection = "state";
+  localStorage.setItem("productionSection", "state");
   syncProductionHeader();
   await loadProductionChapter();
 }
@@ -5162,6 +5209,267 @@ function renderProductionResources() {
       <small>${esc(productionCategoryLabels[item.category] || item.category)}</small>
     </button>`;
   }).join("") : `<div class="production-empty">${svg("search")}<span>没有匹配的资源</span></div>`;
+}
+
+const storyPlanTypeLabels = {
+  book: "总纲", volume: "卷纲", arc: "阶段", chapter: "章节", scene: "场景", subplot: "支线", foreshadow: "伏笔",
+};
+const storyPlanStatusLabels = { planned: "计划中", committed: "已锁定", realized: "已写入", abandoned: "废弃" };
+const storyPlanPolicyLabels = { auto: "自动", planning_only: "仅规划", writing_range: "写作范围", never: "不发送 AI" };
+
+async function loadStoryPlan() {
+  if (!currentWorkId) return;
+  setProductionLoading(true);
+  try {
+    const [plans, notes] = await Promise.all([
+      api(`/api/works/${currentWorkId}/story-plan?include_abandoned=1`, { method: "GET" }),
+      api(`/api/works/${currentWorkId}/notes`, { method: "GET" }),
+      loadProductionResources(productionChapterId),
+    ]);
+    storyPlanNodes = Array.isArray(plans) ? plans : [];
+    storyPlanNotesRecord = notes || null;
+    renderStoryPlan();
+  } catch (e) {
+    $("storyPlanBoard").innerHTML = `<div class="production-empty">${svg("alert")}<b>剧情规划读取失败</b><span>${esc(e.message)}</span></div>`;
+  } finally { setProductionLoading(false); applyIcons(); }
+}
+
+function storyPlanChildren(parentId) {
+  return storyPlanNodes.filter(item => (item.parent_id || null) === (parentId || null))
+    .sort((a, b) => (a.ord || 0) - (b.ord || 0) || a.id - b.id);
+}
+
+function storyPlanTreeRows(parentId = null, depth = 0, visited = new Set()) {
+  return storyPlanChildren(parentId).map(item => {
+    if (visited.has(item.id)) return "";
+    const nextVisited = new Set(visited); nextVisited.add(item.id);
+    const selected = productionSelected?.type === "story_plan" && productionSelected.item?.id === item.id;
+    return `<div class="story-plan-tree-group">
+      <button class="story-plan-tree-row ${selected ? "active" : ""} ${item.status === "abandoned" ? "muted" : ""}"
+              style="--plan-depth:${Math.min(depth, 6)}" onclick="inspectStoryPlan(${item.id})">
+        <span class="story-plan-type">${esc(storyPlanTypeLabels[item.node_type] || item.node_type)}</span>
+        <span><b>${esc(item.title)}</b><small>${esc(storyPlanStatusLabels[item.status] || item.status)}</small></span>
+      </button>${storyPlanTreeRows(item.id, depth + 1, nextVisited)}
+    </div>`;
+  }).join("");
+}
+
+function storyPlanMatchesFilter(item) {
+  if (storyPlanFilter === "all") return true;
+  if (storyPlanFilter === "volume") return ["volume", "arc"].includes(item.node_type);
+  if (storyPlanFilter === "thread") return ["subplot", "foreshadow"].includes(item.node_type);
+  return item.node_type === storyPlanFilter;
+}
+
+function renderLegacyNotesBanner() {
+  const host = $("legacyNotesBanner");
+  if (!host) return;
+  const pending = storyPlanNotesRecord?.notes_role === "mixed" && storyPlanNotesRecord?.notes?.trim();
+  host.classList.toggle("hidden", !pending);
+  host.innerHTML = pending ? `<div><b>旧版作品备注待整理</b><span>${esc(storyPlanNotesRecord.notes.slice(0, 180))}${storyPlanNotesRecord.notes.length > 180 ? "…" : ""}</span></div>
+    <span><button onclick="classifyLegacyNotes('plan')">导入为规划</button><button onclick="classifyLegacyNotes('canon')">保留为设定</button><button onclick="classifyLegacyNotes('reference')">仅作参考</button></span>` : "";
+}
+
+function renderStoryPlan() {
+  renderLegacyNotesBanner();
+  $("storyPlanCount").textContent = `${storyPlanNodes.filter(item => item.status !== "abandoned").length} 项`;
+  $("storyPlanTree").innerHTML = storyPlanTreeRows() || `<div class="production-empty compact"><span>尚无正式规划</span></div>`;
+  document.querySelectorAll("[data-plan-filter]").forEach(button =>
+    button.classList.toggle("active", button.dataset.planFilter === storyPlanFilter));
+  const items = storyPlanNodes.filter(storyPlanMatchesFilter);
+  const currentChapter = productionChapterId;
+  $("storyPlanBoard").innerHTML = items.length ? `<div class="story-plan-grid">${items.map(item => {
+    const body = item.context_summary || item.summary || item.goal || item.detail || "尚未填写内容";
+    const realized = (item.realizations || []).find(row => row.source_current);
+    return `<button class="story-plan-card type-${item.node_type} ${item.status === "abandoned" ? "abandoned" : ""} ${item.chapter_id === currentChapter ? "current" : ""}" onclick="inspectStoryPlan(${item.id})">
+      <span class="story-plan-card-head"><span>${esc(storyPlanTypeLabels[item.node_type] || item.node_type)}</span><small>${esc(storyPlanStatusLabels[item.status] || item.status)}</small></span>
+      <b>${esc(item.title)}</b><p>${esc(body)}</p>
+      <span class="story-plan-card-meta">${item.chapter_title ? `第${item.chapter_ord || "?"}章` : "未关联章节"}<i>${esc(storyPlanPolicyLabels[item.context_policy] || item.context_policy)}</i>${realized ? `<i>${esc({pending:"待核对",partial:"部分实现",realized:"已实现",deviated:"已偏离"}[realized.status] || realized.status)}</i>` : ""}</span>
+    </button>`;
+  }).join("")}</div>` : `<div class="production-empty">${svg("nodes")}<b>这个分类还没有规划</b><button onclick="newStoryPlanNode()">新建计划</button></div>`;
+  applyIcons();
+}
+
+function setStoryPlanFilter(filter) {
+  storyPlanFilter = filter;
+  renderStoryPlan();
+}
+
+async function classifyLegacyNotes(mode) {
+  try {
+    await api(`/api/works/${currentWorkId}/notes/classify`, { body: { mode } });
+    showToast(mode === "plan" ? "旧备注已完整导入剧情规划" : "旧备注分类已保存", "ok");
+    await loadStoryPlan();
+  } catch (e) { showToast(e.message, "err"); }
+}
+
+function storyPlanParentOptions(value, selfId = null) {
+  return `<option value="">顶层</option>` + storyPlanNodes.filter(item => item.id !== selfId && item.status !== "abandoned")
+    .map(item => `<option value="${item.id}" ${item.id === +value ? "selected" : ""}>${esc(storyPlanTypeLabels[item.node_type])} · ${esc(item.title)}</option>`).join("");
+}
+
+function storyPlanLinkPicker(item) {
+  const links = new Set((item.links || []).map(link => `${link.target_type}:${link.target_id}`));
+  const characters = entitiesCache.filter(entity => entity.kind === "人物");
+  const cards = productionCards;
+  if (!characters.length && !cards.length) return "";
+  return `<div class="production-inspector-section"><h3>关联设定</h3><div class="story-plan-link-picker">
+    ${characters.map(entity => `<label><input type="checkbox" data-plan-link="entity" value="${entity.id}" ${links.has(`entity:${entity.id}`) ? "checked" : ""}><span>${esc(entity.name)}</span></label>`).join("")}
+    ${cards.map(card => `<label><input type="checkbox" data-plan-link="production_card" value="${card.id}" ${links.has(`production_card:${card.id}`) ? "checked" : ""}><span>${esc(card.name)}</span></label>`).join("")}
+  </div></div>`;
+}
+
+function storyPlanRealizationHtml(item) {
+  const rows = (item.realizations || []).filter(row => !row.is_stale);
+  if (!rows.length) return "";
+  return `<div class="production-inspector-section"><h3>正文实现</h3>${rows.map(row => `<div class="production-evidence"><b>第${row.chapter_ord || "?"}章 · ${esc({pending:"待核对",partial:"部分实现",realized:"已实现",deviated:"已偏离"}[row.status] || row.status)}</b><br>${esc(row.notes || row.evidence || "无补充")}</div>`).join("")}</div>`;
+}
+
+function storyPlanForm(item) {
+  return `<div class="production-inspector-form story-plan-form" oninput="queueStoryPlanSave()" onchange="queueStoryPlanSave()">
+    <label>标题<input id="storyPlanTitle" maxlength="240" value="${esc(item.title || "")}" placeholder="例如：第一卷 · 失踪案"></label>
+    <div class="production-form-grid">
+      <label>类型<select id="storyPlanType">${Object.entries(storyPlanTypeLabels).map(([value,label]) => `<option value="${value}" ${item.node_type === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+      <label>上级<select id="storyPlanParent">${storyPlanParentOptions(item.parent_id, item.id)}</select></label>
+      <label>状态<select id="storyPlanStatus">${Object.entries(storyPlanStatusLabels).map(([value,label]) => `<option value="${value}" ${item.status === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+      <label>AI 上下文<select id="storyPlanPolicy">${Object.entries(storyPlanPolicyLabels).map(([value,label]) => `<option value="${value}" ${item.context_policy === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+    </div>
+    <label>关联章节<select id="storyPlanChapter">${productionChapterSelectOptions(item.chapter_id)}</select></label>
+    <div class="production-form-grid"><label>范围起点<select id="storyPlanRangeStart">${productionChapterSelectOptions(item.scope_start_chapter_id)}</select></label><label>范围终点<select id="storyPlanRangeEnd">${productionChapterSelectOptions(item.scope_end_chapter_id)}</select></label></div>
+    <label>摘要<textarea id="storyPlanSummary">${esc(item.summary || "")}</textarea></label>
+    <label>写作目标<textarea id="storyPlanGoal">${esc(item.goal || "")}</textarea></label>
+    <label>核心冲突<textarea id="storyPlanConflict">${esc(item.conflict || "")}</textarea></label>
+    <label>预期结果<textarea id="storyPlanOutcome">${esc(item.expected_outcome || "")}</textarea></label>
+    <label>上下文摘要<textarea id="storyPlanContextSummary" placeholder="自动模式下发给 AI 的压缩方向">${esc(item.context_summary || "")}</textarea></label>
+    <label>详细计划<textarea id="storyPlanDetail" rows="8">${esc(item.detail || "")}</textarea></label>
+    ${storyPlanLinkPicker(item)}${storyPlanRealizationHtml(item)}
+    <div class="production-inspector-actions"><button onclick="saveStoryPlanFromInspector()">${item.id ? "保存规划" : "创建规划"}</button>${item.id ? `<button onclick="showStoryPlanVersions(${item.id})">版本</button><button class="danger-link" onclick="abandonStoryPlan(${item.id})">废弃</button>` : '<button onclick="closeProductionInspector({discard:true})">取消</button>'}</div>
+  </div>`;
+}
+
+function setStoryPlanAgentTarget(item) {
+  agentSelection = { context_kind: "canvas_target", target_type: "story_plan", target_id: item.id,
+    text: `[作者计划 / 尚未发生]\n${item.title}\n${item.summary || ""}\n目标：${item.goal || ""}\n冲突：${item.conflict || ""}\n预期结果：${item.expected_outcome || ""}`,
+    title: item.title || "剧情规划" };
+  renderAgentSelection();
+}
+
+function inspectStoryPlan(planId) {
+  const item = storyPlanNodes.find(row => row.id === planId);
+  if (!item) return;
+  stashProductionInspectorDraft();
+  clearTimeout(storyPlanSaveTimer);
+  productionSelected = { type: "story_plan", item };
+  setStoryPlanAgentTarget(item);
+  renderStoryPlan();
+  openProductionInspector(item.title, `${storyPlanTypeLabels[item.node_type] || item.node_type} · v${item.revision}`, storyPlanForm(item));
+}
+
+function newStoryPlanNode(parentId = null) {
+  const item = { id: null, parent_id: parentId, node_type: parentId ? "chapter" : "book", title: "", summary: "", detail: "", goal: "", conflict: "", expected_outcome: "", context_summary: "", status: "planned", context_policy: "auto", links: [], realizations: [] };
+  productionSelected = { type: "story_plan", item };
+  openProductionInspector("新建剧情规划", "作者计划 · 尚未发生", storyPlanForm(item));
+  setTimeout(() => $("storyPlanTitle")?.focus(), 30);
+}
+
+function readStoryPlanForm() {
+  const links = [...document.querySelectorAll("[data-plan-link]:checked")].map(input => ({ target_type: input.dataset.planLink, target_id: +input.value }));
+  return {
+    title: $("storyPlanTitle").value.trim(), node_type: $("storyPlanType").value,
+    parent_id: +$("storyPlanParent").value || null, status: $("storyPlanStatus").value,
+    context_policy: $("storyPlanPolicy").value, chapter_id: +$("storyPlanChapter").value || null,
+    scope_start_chapter_id: +$("storyPlanRangeStart").value || null,
+    scope_end_chapter_id: +$("storyPlanRangeEnd").value || null,
+    summary: $("storyPlanSummary").value, goal: $("storyPlanGoal").value,
+    conflict: $("storyPlanConflict").value, expected_outcome: $("storyPlanOutcome").value,
+    context_summary: $("storyPlanContextSummary").value, detail: $("storyPlanDetail").value, links,
+  };
+}
+
+function storyPlanDraftKey(selection = productionSelected) {
+  if (!selection || !currentWorkId) return "";
+  return `storyPlanDraft:${currentUsername || "user"}:${currentWorkId}:${selection.item?.id || "new"}`;
+}
+
+function stashStoryPlanDraft() {
+  if (productionSelected?.type !== "story_plan" || !$("storyPlanTitle")) return;
+  localStorage.setItem(storyPlanDraftKey(), JSON.stringify({ values: readStoryPlanForm(), saved_at: Date.now() }));
+}
+
+function restoreStoryPlanDraft() {
+  let draft;
+  try { draft = JSON.parse(localStorage.getItem(storyPlanDraftKey()) || "null"); } catch (e) { draft = null; }
+  if (!draft?.values) return;
+  const map = { title:"storyPlanTitle", node_type:"storyPlanType", parent_id:"storyPlanParent", status:"storyPlanStatus", context_policy:"storyPlanPolicy", chapter_id:"storyPlanChapter", scope_start_chapter_id:"storyPlanRangeStart", scope_end_chapter_id:"storyPlanRangeEnd", summary:"storyPlanSummary", goal:"storyPlanGoal", conflict:"storyPlanConflict", expected_outcome:"storyPlanOutcome", context_summary:"storyPlanContextSummary", detail:"storyPlanDetail" };
+  Object.entries(map).forEach(([key,id]) => { if ($(id) && draft.values[key] != null) $(id).value = draft.values[key]; });
+  (draft.values.links || []).forEach(link => { const input = document.querySelector(`[data-plan-link="${link.target_type}"][value="${link.target_id}"]`); if (input) input.checked = true; });
+  $("productionSaveStatus").textContent = "已恢复本机草稿";
+}
+
+function queueStoryPlanSave() {
+  stashStoryPlanDraft();
+  $("productionSaveStatus").textContent = "已本机暂存";
+  clearTimeout(storyPlanSaveTimer);
+  if (!productionSelected?.item?.id) return;
+  storyPlanSaveTimer = setTimeout(() => {
+    storyPlanSaveTimer = null;
+    saveStoryPlanFromInspector(true);
+  }, 900);
+}
+
+async function saveStoryPlanFromInspector(quiet = false) {
+  if (productionSelected?.type !== "story_plan") return null;
+  const selection = productionSelected;
+  const planId = selection.item.id || null;
+  const body = readStoryPlanForm();
+  if (!body.title) { if (!quiet) showToast("请填写规划标题", "err"); return null; }
+  const oldDraftKey = storyPlanDraftKey(selection);
+  const draftSnapshot = localStorage.getItem(oldDraftKey);
+  return productionSaveQueue.run(async () => {
+    const latest = planId
+      ? (storyPlanNodes.find(row => row.id === planId) || selection.item)
+      : selection.item;
+    body.expected_revision = latest.revision;
+    storyPlanSaving = true;
+    $("productionSaveStatus").textContent = "正在同步…";
+    try {
+      const saved = await api(planId ? `/api/story-plan/${planId}` : `/api/works/${currentWorkId}/story-plan`, { method: planId ? "PUT" : "POST", body });
+      if (localStorage.getItem(oldDraftKey) === draftSnapshot) localStorage.removeItem(oldDraftKey);
+      const index = storyPlanNodes.findIndex(row => row.id === saved.id);
+      if (index >= 0) storyPlanNodes[index] = saved; else storyPlanNodes.push(saved);
+      selection.item = saved;
+      $("productionSaveStatus").textContent = "已同步";
+      renderStoryPlan();
+      if (!quiet || !planId) inspectStoryPlan(saved.id);
+      if (!quiet) showToast(planId ? "剧情规划已保存" : "剧情规划已创建", "ok");
+      return saved;
+    } catch (e) {
+      $("productionSaveStatus").textContent = "同步失败，草稿仍在本机";
+      if (!quiet) showToast(e.message, "err");
+      return null;
+    } finally { storyPlanSaving = false; }
+  });
+}
+
+async function abandonStoryPlan(planId) {
+  if (!await askCard({ title: "废弃这条规划？", msg: "它会保留在历史中，但不再进入写作上下文。", okText: "废弃", danger: true })) return;
+  try { await api(`/api/story-plan/${planId}`, { method: "DELETE" }); await closeProductionInspector({ discard: true, flush: false }); await loadStoryPlan(); }
+  catch (e) { showToast(e.message, "err"); }
+}
+
+async function showStoryPlanVersions(planId) {
+  try {
+    const versions = await api(`/api/story-plan/${planId}/versions`, { method: "GET" });
+    const item = storyPlanNodes.find(row => row.id === planId);
+    openProductionInspector(item?.title || "规划版本", "历史版本", `<div class="production-inspector-form"><div class="story-plan-version-list">${versions.map(version => `<button onclick="restoreStoryPlanVersion(${planId},${version.revision})"><b>v${version.revision}</b><span>${esc(new Date(version.created_at * 1000).toLocaleString())}</span><small>${esc(version.snapshot?.summary || version.snapshot?.goal || "无摘要")}</small></button>`).join("") || '<div class="production-empty compact">暂无版本</div>'}</div><div class="production-inspector-actions"><button onclick="inspectStoryPlan(${planId})">返回编辑</button></div></div>`);
+  } catch (e) { showToast(e.message, "err"); }
+}
+
+async function restoreStoryPlanVersion(planId, revision) {
+  const item = storyPlanNodes.find(row => row.id === planId);
+  if (!item) return;
+  try { await api(`/api/story-plan/${planId}/restore`, { body: { revision, expected_revision: item.revision } }); await loadStoryPlan(); inspectStoryPlan(planId); showToast(`已恢复 v${revision} 并生成新版本`, "ok"); }
+  catch (e) { showToast(e.message, "err"); }
 }
 
 function productionStateBrief(state) {
@@ -5578,30 +5886,36 @@ function markProductionInspectorDraft() {
   if ($("productionSaveStatus")) $("productionSaveStatus").textContent = "已本机暂存";
 }
 
-window.addEventListener("pagehide", stashProductionInspectorDraft);
+window.addEventListener("pagehide", () => { stashProductionInspectorDraft(); stashStoryPlanDraft(); });
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") stashProductionInspectorDraft();
+  if (document.visibilityState === "hidden") { stashProductionInspectorDraft(); stashStoryPlanDraft(); }
 });
 
 async function closeProductionInspector(options = {}) {
   const { flush = true, discard = false } = options;
   const selection = productionSelected;
   const shouldFlush = !!productionInspectorSaveTimer && !!productionSelected?.item?.id;
+  const shouldFlushPlan = !!storyPlanSaveTimer && productionSelected?.type === "story_plan" && !!productionSelected?.item?.id;
   if (!discard) stashProductionInspectorDraft("all");
+  if (!discard) stashStoryPlanDraft();
   clearTimeout(productionInspectorSaveTimer);
+  clearTimeout(storyPlanSaveTimer);
   productionInspectorSaveTimer = null;
+  storyPlanSaveTimer = null;
   await productionSaveQueue.wait();
   if (flush && shouldFlush && productionSelected === selection) {
     if (productionSelected?.type === "card") await saveProductionCardFromInspector(true);
     else if (productionSelected?.type === "scene") await saveProductionSceneFromInspector(true);
   }
+  if (flush && shouldFlushPlan && productionSelected === selection) await saveStoryPlanFromInspector(true);
   if (discard) {
     clearProductionInspectorDraft(productionDraftKey(selection, "base"));
     clearProductionInspectorDraft(productionDraftKey(selection, "state"));
+    if (selection?.type === "story_plan") localStorage.removeItem(storyPlanDraftKey(selection));
   }
   $("productionWorkspace")?.classList.remove("inspector-open");
   productionSelected = null;
-  renderProductionResources();
+  if (productionSection === "plan") renderStoryPlan(); else renderProductionResources();
 }
 
 function openProductionInspector(title, meta, html) {
@@ -5609,7 +5923,7 @@ function openProductionInspector(title, meta, html) {
   $("productionInspectorMeta").textContent = meta || "";
   $("productionInspectorBody").innerHTML = html;
   $("productionWorkspace").classList.add("inspector-open");
-  restoreProductionInspectorDraft();
+  if (productionSelected?.type === "story_plan") restoreStoryPlanDraft(); else restoreProductionInspectorDraft();
   applyIcons();
 }
 

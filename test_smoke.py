@@ -2003,6 +2003,69 @@ ok(_memory_overview["counts"]["stale"] >= 1, "来源版本变化后故事记忆�
 _memory_mark = db.mark_chapter_story_memory_stale(memory_c1, uidA)
 ok(_memory_mark["ok"] and _memory_mark["later_chapters"] >= 1, "重大修改可标记本章资料失效并提示后续风险")
 
+# Story Plan：作者计划与 Canon / World State 分离，按章节选择性进入写作上下文。
+_plan_book = c.post(f"/api/works/{wid}/story-plan", json={
+    "node_type": "book", "title": "全书方向", "summary": "林晚追查真相",
+    "conflict": "信任与真相之间的冲突",
+    "context_summary": "围绕信任与真相推进，不提前揭露幕后人。", "context_policy": "auto",
+}, headers=H(tokA)).json()
+_plan_chapter = c.post(f"/api/works/{wid}/story-plan", json={
+    "parent_id": _plan_book["id"], "node_type": "chapter", "title": "月钥章计划",
+    "summary": "林晚核验月钥线索", "goal": "确认月钥是否真实", "chapter_id": memory_c2,
+    "context_policy": "auto", "status": "committed",
+}, headers=H(tokA)).json()
+_plan_future = c.post(f"/api/works/{wid}/story-plan", json={
+    "parent_id": _plan_book["id"], "node_type": "chapter", "title": "终局秘密",
+    "summary": "幕后人身份揭晓", "context_policy": "planning_only",
+}, headers=H(tokA)).json()
+ok(_plan_book["revision"] == 1 and _plan_book["conflict"] == "信任与真相之间的冲突"
+   and _plan_chapter["parent_id"] == _plan_book["id"],
+   "剧情规划支持总纲到章节计划的层级结构")
+_plan_updated = c.put(f"/api/story-plan/{_plan_chapter['id']}", json={
+    "summary": "林晚核验月钥来源与真伪", "expected_revision": _plan_chapter["revision"],
+}, headers=H(tokA)).json()
+ok(_plan_updated["revision"] == 2
+   and len(c.get(f"/api/story-plan/{_plan_chapter['id']}/versions", headers=H(tokA)).json()) == 2,
+   "剧情规划自动形成版本历史")
+ok(c.put(f"/api/story-plan/{_plan_chapter['id']}", json={
+    "summary": "陈旧页面覆盖", "expected_revision": 1,
+}, headers=H(tokA)).status_code == 409, "剧情规划使用版本号阻止陈旧页面覆盖")
+_writing_context = context_builder.build_context(
+    uidA, "continue_writing", wid, memory_c2, instruction="按本章计划续写", profile="writing",
+)
+_writing_plan_text = "\n".join(item["content"] for item in _writing_context["context_items"] if item["type"] == "story_plan")
+ok("林晚核验月钥来源与真伪" in _writing_plan_text and "围绕信任与真相" in _writing_plan_text
+   and "幕后人身份揭晓" not in _writing_plan_text and "作者对未来的计划" in _writing_plan_text,
+   "写作上下文只加载当前章和压缩总纲，并明确标记为尚未发生")
+ok(any(item["id"] == _plan_future["id"] and "仅剧情规划" in item["reason"]
+       for item in _writing_context["context_exclusions"]), "上下文预览说明远期计划未发送的原因")
+_world_context = context_builder.build_context(
+    uidA, "analyze_world_state", wid, memory_c2, profile="world_state",
+)
+ok(not any(item["type"] == "story_plan" for item in _world_context["context_items"])
+   and "幕后人身份揭晓" not in context_builder.render_context(_world_context),
+   "World State 分析完全排除作者未来计划")
+_realized = c.post(f"/api/story-plan/{_plan_chapter['id']}/realizations", json={
+    "chapter_id": memory_c2, "status": "realized", "evidence": "",
+    "notes": "作者确认本章已经完成计划", "source": "manual",
+}, headers=H(tokA)).json()
+ok(any(row["source_current"] and row["status"] == "realized" for row in _realized["realizations"]),
+   "规划实现状态绑定规划版本与正文版本")
+c.put(f"/api/chapters/{memory_c2}", json={"content": "林晚决定改走另一条调查路线。"}, headers=H(tokA))
+_realized_after_edit = c.get(f"/api/story-plan/{_plan_chapter['id']}", headers=H(tokA)).json()
+ok(any(row["is_stale"] for row in _realized_after_edit["realizations"]),
+   "正文修改后旧的规划实现证据自动失效")
+_adopt_once = c.post(f"/api/sandboxes/{_sandbox['id']}/nodes/branch-a/adopt", json={
+    "mode": "plan",
+}, headers=H(tokA)).json()
+_adopt_twice = c.post(f"/api/sandboxes/{_sandbox['id']}/nodes/branch-a/adopt", json={
+    "mode": "plan",
+}, headers=H(tokA)).json()
+ok(_adopt_once["plan"]["id"] == _adopt_twice["plan"]["id"], "同一沙盘候选重复采纳保持幂等")
+ok({"list_story_plan", "read_story_plan", "save_story_plan", "set_story_plan_status",
+    "get_writing_plan_context", "review_story_plan_realization", "adopt_sandbox_node"}.issubset(_agent_tool_names),
+   "Agent 暴露剧情规划、上下文、实现核对与沙盘采纳工具")
+
 # 删除
 ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")
 ok(c.delete(f"/api/works/{wid}", headers=H(tokA)).status_code == 200, "删作品")
@@ -2027,6 +2090,9 @@ with db.get_conn() as conn:
     _nsandbox = conn.execute("SELECT COUNT(*) FROM story_sandboxes WHERE work_id=?", (wid,)).fetchone()[0]
     _nbookjobs = conn.execute("SELECT COUNT(*) FROM book_disassembly_jobs WHERE target_work_id=?", (wid,)).fetchone()[0]
 ok(_nsandbox == 0 and _nbookjobs == 0, "删作品级联清空情节沙盘与拆书任务")
+with db.get_conn() as conn:
+    _nplans = conn.execute("SELECT COUNT(*) FROM story_plan_nodes WHERE work_id=?", (wid,)).fetchone()[0]
+ok(_nplans == 0, "删作品级联清空剧情规划及其版本和实现记录")
 with db.get_conn() as conn:
     _nmaterial_settings = conn.execute("SELECT COUNT(*) FROM work_material_settings WHERE work_id=?", (wid,)).fetchone()[0]
     _nmaterial_docs = conn.execute("SELECT COUNT(*) FROM work_reference_documents WHERE work_id=?", (wid,)).fetchone()[0]

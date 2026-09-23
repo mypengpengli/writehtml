@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=integrity-20260922">
+  <link rel="stylesheet" href="style.css?v=story-plan-20260923">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -162,8 +162,9 @@
           <div><b>创作生产画布</b><small id="productionSubtitle">全书脉络与章节状态</small></div>
         </div>
         <div class="production-view-switch" role="group" aria-label="画布视图">
-          <button id="productionOverviewBtn" class="active" onclick="showProductionOverview()">全书</button>
-          <button id="productionChapterBtn" onclick="showProductionChapter()">本章</button>
+          <button id="productionCanonBtn" class="active" onclick="setProductionSection('canon')">设定库</button>
+          <button id="productionPlanBtn" onclick="setProductionSection('plan')">剧情规划</button>
+          <button id="productionStateBtn" onclick="setProductionSection('state')">章节状态</button>
         </div>
         <select id="productionChapterSelect" onchange="changeProductionChapter(this.value)" aria-label="选择画布章节"></select>
         <span id="productionSaveStatus" class="production-save-status"></span>
@@ -204,11 +205,42 @@
           <div id="productionResourceList" class="production-resource-list"></div>
         </aside>
 
+        <aside id="storyPlanTreePane" class="production-resources story-plan-tree-pane hidden">
+          <div class="production-pane-head">
+            <div><b>规划结构</b><small id="storyPlanCount">0 项</small></div>
+            <span>
+              <button class="ic" data-ic="plus" onclick="newStoryPlanNode()" title="新建规划节点"></button>
+              <button class="ic" data-ic="x" onclick="toggleProductionResources(false)" title="收起规划结构"></button>
+            </span>
+          </div>
+          <div class="story-plan-tree-actions">
+            <button onclick="openOutlineSandbox()" data-ic="nodes" data-label="剧情推演"></button>
+          </div>
+          <div id="storyPlanTree" class="story-plan-tree"></div>
+        </aside>
+
         <main class="production-stage-shell">
           <div id="productionLoading" class="production-loading hidden"><span class="spinner"></span><span>正在读取画布</span></div>
           <div id="productionOverview" class="production-overview"></div>
           <div id="productionCanvasViewport" class="production-canvas-viewport hidden">
             <div id="productionCanvas" class="production-canvas"></div>
+          </div>
+          <div id="storyPlanWorkspace" class="story-plan-workspace hidden">
+            <div id="legacyNotesBanner" class="legacy-notes-banner hidden"></div>
+            <div class="story-plan-toolbar">
+              <div class="story-plan-filters" role="tablist">
+                <button class="active" data-plan-filter="all" onclick="setStoryPlanFilter('all')">全部</button>
+                <button data-plan-filter="book" onclick="setStoryPlanFilter('book')">总纲</button>
+                <button data-plan-filter="volume" onclick="setStoryPlanFilter('volume')">卷 / 阶段</button>
+                <button data-plan-filter="chapter" onclick="setStoryPlanFilter('chapter')">章节</button>
+                <button data-plan-filter="thread" onclick="setStoryPlanFilter('thread')">支线 / 伏笔</button>
+              </div>
+              <span>
+                <button onclick="newStoryPlanNode()" data-ic="plus" data-label="新建计划"></button>
+                <button onclick="openOutlineSandbox()" data-ic="nodes" data-label="剧情推演"></button>
+              </span>
+            </div>
+            <div id="storyPlanBoard" class="story-plan-board"></div>
           </div>
         </main>
 
@@ -337,10 +369,10 @@
             <button data-workflow="final" onclick="setWorkflowStatus('final')">定稿</button>
           </div>
           <div class="story-section">
-            <label>本章目标<textarea id="workflowGoal" placeholder="本章要推进什么、不能违背什么"></textarea></label>
-            <label>本章摘要<textarea id="workflowSummary" placeholder="已完成的剧情与下一步衔接"></textarea></label>
+            <label>工作流目标<textarea id="workflowGoal" placeholder="本章当前要处理的工作"></textarea></label>
+            <label>复核备注<textarea id="workflowSummary" placeholder="作者的工作备注，不作为正文事实摘要"></textarea></label>
             <div class="set-actions">
-              <button id="workflowSaveBtn" onclick="saveWorkflow()">保存本章计划</button>
+              <button id="workflowSaveBtn" onclick="saveWorkflow()">保存工作状态</button>
               <button id="workflowReviewBtn" onclick="runChapterReview()">AI 复核</button>
             </div>
             <span id="workflowMsg" class="msg"></span>
@@ -631,7 +663,9 @@
             <label>涉及角色<input id="sandboxNodeCharacters" maxlength="1000" oninput="updateSelectedSandboxNode()" placeholder="林晚、顾川"></label>
             <div class="set-actions">
               <button id="sandboxOpenChapterBtn" class="ic" onclick="openSandboxChapter()">打开章节</button>
-              <button id="sandboxAdoptBtn" onclick="adoptSandboxNode()">采纳为新章节</button>
+              <button id="sandboxOpenPlanBtn" class="ic hidden" onclick="openSandboxPlan()">打开规划</button>
+              <select id="sandboxAdoptMode" aria-label="采纳方式"><option value="plan">采纳为规划</option><option value="plan_chapter">规划并新建章节</option><option value="update_plan">更新已关联规划</option></select>
+              <button id="sandboxAdoptBtn" onclick="adoptSandboxNode()">采纳</button>
               <button class="ic" onclick="exportSandboxTree(selectedSandboxNodeId)">导出此分支</button>
               <button class="ic danger-lite" onclick="deleteSelectedSandboxNode()">删除节点</button>
             </div>
@@ -1065,6 +1099,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=integrity-20260922"></script>
+  <script src="app.js?v=story-plan-20260923"></script>
 </body>
 </html>

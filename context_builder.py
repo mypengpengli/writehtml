@@ -34,11 +34,11 @@ def _token_estimate(value):
     return max(1, (len(value or "") + 1) // 2)
 
 
-def _item(item_type, title, content, reason, priority):
+def _item(item_type, title, content, reason, priority, **metadata):
     content = (content or "").strip()
     if not content:
         return None
-    return {
+    item = {
         "type": item_type,
         "title": title,
         "content": content,
@@ -46,6 +46,8 @@ def _item(item_type, title, content, reason, priority):
         "priority": priority,
         "estimated_tokens": _token_estimate(content),
     }
+    item.update({key: value for key, value in metadata.items() if value is not None})
+    return item
 
 
 def _state_lines(labels, state):
@@ -72,9 +74,123 @@ def _render_memories(memories):
 
 def _render_summaries(summaries):
     return "\n".join(
-        f"第{item.get('ord') or '?'}章《{item.get('title') or '未命名'}》：{item.get('workflow_summary') or ''}"
+        f"第{item.get('ord') or '?'}章《{item.get('title') or '未命名'}》：{item.get('outcome_summary') or ''}"
         for item in summaries
     )
+
+
+def _plan_body(node, compact=False):
+    parts = []
+    fields = (
+        ("context_summary", "上下文摘要"), ("summary", "摘要"), ("goal", "目标"),
+        ("conflict", "冲突"), ("expected_outcome", "预期结果"), ("detail", "详细计划"),
+    )
+    seen = set()
+    for field, label in fields:
+        value = (node.get(field) or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        if compact and field not in {"context_summary", "summary", "goal"}:
+            continue
+        parts.append(f"{label}：{_clip(value, 900 if compact else 5000)}")
+    return "\n".join(parts)
+
+
+def _story_plan_items(user_id, work_id, chapter, profile):
+    """Select author plans without ever presenting them as established story facts."""
+    nodes = db.list_story_plan_nodes(work_id, user_id, include_abandoned=True) or []
+    if not nodes:
+        return [], []
+    if profile == "world_state":
+        return [], [{"id": node["id"], "title": node["title"], "reason": "World State 只分析已发生正文"}
+                    for node in nodes if node.get("status") != "abandoned"]
+
+    target_ord = (chapter or {}).get("ord")
+    target_id = (chapter or {}).get("id")
+    chapter_ords = {item["id"]: item.get("ord") for item in (db.list_chapters(work_id, user_id) or [])}
+    by_id = {node["id"]: node for node in nodes}
+    current_nodes = {node["id"] for node in nodes if target_id and node.get("chapter_id") == target_id}
+    descendants = set(current_nodes)
+    changed = True
+    while changed:
+        before = len(descendants)
+        descendants.update(node["id"] for node in nodes if node.get("parent_id") in descendants)
+        changed = len(descendants) != before
+    ancestors = set()
+    for node_id in current_nodes:
+        parent_id = by_id.get(node_id, {}).get("parent_id")
+        while parent_id and parent_id not in ancestors:
+            ancestors.add(parent_id)
+            parent_id = by_id.get(parent_id, {}).get("parent_id")
+
+    def in_scope(node):
+        start = chapter_ords.get(node.get("scope_start_chapter_id"))
+        end = chapter_ords.get(node.get("scope_end_chapter_id"))
+        if target_ord is None or (start is None and end is None):
+            return False
+        return (start is None or target_ord >= start) and (end is None or target_ord <= end)
+
+    included = []
+    excluded = []
+    planning = profile in {"planning", "sandbox"}
+    for node in nodes:
+        status = node.get("status") or "planned"
+        policy = node.get("context_policy") or "auto"
+        reason = ""
+        compact = False
+        time_scope = "作者计划，尚未发生"
+        if status == "abandoned":
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "已废弃"})
+            continue
+        if status == "realized" and not planning:
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "已写入正文，改用正文派生的 World State"})
+            continue
+        if policy == "never":
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "设置为不发送 AI"})
+            continue
+        if planning:
+            reason = "剧情规划任务需要查看有效计划"
+            compact = node.get("node_type") not in {"chapter", "scene"}
+        elif policy == "planning_only":
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "仅剧情规划时可见"})
+            continue
+        elif node["id"] in current_nodes or node["id"] in descendants:
+            reason = "当前章节的直接计划"
+        elif node["id"] in ancestors:
+            reason = "当前章节计划的上级方向"
+            compact = True
+        elif policy == "writing_range" and in_scope(node):
+            reason = "位于作者指定的写作范围"
+            compact = True
+        elif policy == "auto" and node.get("node_type") == "book":
+            reason = "全书计划的压缩方向"
+            compact = True
+        elif policy == "auto" and node.get("node_type") in {"volume", "arc"} and in_scope(node):
+            reason = "当前章节所在卷段的方向"
+            compact = True
+        elif (policy == "auto" and target_ord is not None and node.get("node_type") == "chapter"
+              and chapter_ords.get(node.get("chapter_id")) == target_ord + 1):
+            reason = "下一章的少量衔接目标"
+            compact = True
+            time_scope = "下一章计划，当前尚未发生"
+        else:
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "不在当前章节的有效范围"})
+            continue
+        body = _plan_body(node, compact=compact)
+        if not body:
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "没有可发送的计划内容"})
+            continue
+        item = _item(
+            "story_plan", f"作者计划（未发生）：{node['title']}",
+            "以下是作者对未来的计划，不是已发生事实，人物也不应自动知道。\n" + body,
+            reason, 1 if node["id"] in current_nodes or node["id"] in descendants else 2,
+            source_id=node["id"], source_version=node.get("revision"), time_scope=time_scope,
+            plan_status=status, context_policy=policy,
+        )
+        if item:
+            included.append(item)
+    return included, excluded
 
 
 def _fit(items: Iterable[dict], token_budget):
@@ -127,10 +243,10 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
     chapter_tail = _clip(chapter_content[-7000:], 7000)
     mentions_text = "\n".join((instruction, selected_text, chapter_tail[-1800:]))
     items = []
-    include_production = profile in {"writing", "sandbox"}
-    include_characters = profile in {"writing", "sandbox"}
-    include_materials = profile in {"writing", "sandbox"}
-    include_skills = profile in {"writing", "sandbox"}
+    include_production = profile in {"writing", "sandbox", "planning"}
+    include_characters = profile in {"writing", "sandbox", "planning"}
+    include_materials = profile in {"writing", "sandbox", "planning"}
+    include_skills = profile in {"writing", "sandbox", "planning"}
 
     if instruction:
         items.append(_item("instruction", "作者本轮指令", instruction, "本轮明确请求", 0))
@@ -146,7 +262,9 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
         if chapter.get("notes"):
             items.append(_item("chapter_notes", "本章备注", _clip(chapter["notes"], 3000), "作者为当前章留下的约束", 1))
 
-    work_notes = db.get_work_notes(work_id, user_id) or ""
+    notes_record = db.get_work_notes_record(work_id, user_id) or {}
+    work_notes = ((notes_record.get("notes") or "") if notes_record.get("notes_role") == "canon"
+                  else (db.get_work_notes_for_context(work_id, user_id) or "") if profile != "world_state" else "")
     if work_notes:
         items.append(_item("work_bible", "作品设定", _clip(work_notes, 9000), "全局创作约束", 1))
 
@@ -156,6 +274,9 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
             "production_bible", "生产画布设定", _clip(production_digest, 14000),
             "当前章节时点生效的规则、地点、技能、道具与保密边界", 1,
         ))
+
+    plan_items, plan_exclusions = _story_plan_items(user_id, work_id, chapter, profile)
+    items.extend(plan_items)
 
     entities = db.list_character_cards(work_id, user_id, chapter_id) if include_characters else []
     entities = entities or []
@@ -237,4 +358,5 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
         "messages": messages,
         "estimated_tokens": sum(item["estimated_tokens"] for item in items),
         "recalled_memory_ids": [memory["id"] for memory in memories],
+        "context_exclusions": plan_exclusions,
     }
