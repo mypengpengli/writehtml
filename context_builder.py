@@ -80,6 +80,12 @@ def _render_summaries(summaries):
 
 
 def _plan_body(node, compact=False):
+    if compact:
+        for field, label in (("context_summary", "上下文方向"), ("summary", "摘要"), ("goal", "目标")):
+            value = (node.get(field) or "").strip()
+            if value:
+                return f"{label}：{_clip(value, 900)}"
+        return ""
     parts = []
     fields = (
         ("context_summary", "上下文摘要"), ("summary", "摘要"), ("goal", "目标"),
@@ -97,14 +103,14 @@ def _plan_body(node, compact=False):
     return "\n".join(parts)
 
 
-def _story_plan_items(user_id, work_id, chapter, profile):
+def _story_plan_items(user_id, work_id, chapter, profile, plan_focus_ids=None):
     """Select author plans without ever presenting them as established story facts."""
-    nodes = db.list_story_plan_nodes(work_id, user_id, include_abandoned=True) or []
+    nodes = db.list_story_plan_nodes(work_id, user_id) or []
     if not nodes:
         return [], []
     if profile == "world_state":
         return [], [{"id": node["id"], "title": node["title"], "reason": "World State 只分析已发生正文"}
-                    for node in nodes if node.get("status") != "abandoned"]
+                    for node in nodes]
 
     target_ord = (chapter or {}).get("ord")
     target_id = (chapter or {}).get("id")
@@ -123,13 +129,35 @@ def _story_plan_items(user_id, work_id, chapter, profile):
         while parent_id and parent_id not in ancestors:
             ancestors.add(parent_id)
             parent_id = by_id.get(parent_id, {}).get("parent_id")
+    focus = {int(value) for value in (plan_focus_ids or []) if isinstance(value, int)}
+    focus_related = set(focus)
+    for node_id in focus:
+        parent_id = by_id.get(node_id, {}).get("parent_id")
+        while parent_id and parent_id not in focus_related:
+            focus_related.add(parent_id)
+            parent_id = by_id.get(parent_id, {}).get("parent_id")
 
     def in_scope(node):
+        if node.get("context_policy") == "writing_range" and not (
+                node.get("scope_start_chapter_id") or node.get("scope_end_chapter_id")):
+            return False
         start = chapter_ords.get(node.get("scope_start_chapter_id"))
         end = chapter_ords.get(node.get("scope_end_chapter_id"))
+        if ((node.get("scope_start_chapter_id") and start is None)
+                or (node.get("scope_end_chapter_id") and end is None)):
+            return False
         if target_ord is None or (start is None and end is None):
             return False
         return (start is None or target_ord >= start) and (end is None or target_ord <= end)
+
+    def current_realization(node):
+        if target_ord is None:
+            return None
+        for record in reversed(node.get("realizations") or []):
+            if (record.get("source_current") and record.get("chapter_ord") is not None
+                    and record["chapter_ord"] <= target_ord):
+                return record
+        return None
 
     included = []
     excluded = []
@@ -143,11 +171,24 @@ def _story_plan_items(user_id, work_id, chapter, profile):
         if status == "abandoned":
             excluded.append({"id": node["id"], "title": node["title"], "reason": "已废弃"})
             continue
-        if status == "realized" and not planning:
-            excluded.append({"id": node["id"], "title": node["title"], "reason": "已写入正文，改用正文派生的 World State"})
-            continue
         if policy == "never":
             excluded.append({"id": node["id"], "title": node["title"], "reason": "设置为不发送 AI"})
+            continue
+        if planning and focus and node["id"] not in focus_related:
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "不在当前推演分支"})
+            continue
+        if planning and not focus and target_id and node["id"] not in current_nodes | descendants | ancestors:
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "不在当前章节规划路径"})
+            continue
+        if planning and not focus and not target_id and node.get("node_type") != "book":
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "未指定推演分支或章节时点"})
+            continue
+        if not planning and policy == "writing_range" and not in_scope(node):
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "不在指定写作范围，或范围已失效"})
+            continue
+        realization = current_realization(node)
+        if not planning and realization and realization["status"] == "realized":
+            excluded.append({"id": node["id"], "title": node["title"], "reason": "截至本章已由正文实现"})
             continue
         if planning:
             reason = "剧情规划任务需要查看有效计划"
@@ -181,10 +222,12 @@ def _story_plan_items(user_id, work_id, chapter, profile):
         if not body:
             excluded.append({"id": node["id"], "title": node["title"], "reason": "没有可发送的计划内容"})
             continue
+        commitment = ("作者已确定计划，尚未发生。除非本轮明确要求修改，否则应遵循。" if status == "committed"
+                      else "作者规划，可调整，尚未发生。")
         item = _item(
             "story_plan", f"作者计划（未发生）：{node['title']}",
-            "以下是作者对未来的计划，不是已发生事实，人物也不应自动知道。\n" + body,
-            reason, 1 if node["id"] in current_nodes or node["id"] in descendants else 2,
+            "以下是作者对未来的计划，不是已发生事实。" + commitment + "人物不应自动知道未来计划。\n" + body,
+            reason, 1 if status == "committed" or node["id"] in current_nodes or node["id"] in descendants else 2,
             source_id=node["id"], source_version=node.get("revision"), time_scope=time_scope,
             plan_status=status, context_policy=policy,
         )
@@ -220,7 +263,7 @@ def render_context(context, types=None):
 
 
 def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", selection=None,
-                  skill_ids=None, token_budget=None, profile="writing"):
+                  skill_ids=None, token_budget=None, profile="writing", plan_focus_ids=None):
     """Return prompt messages plus every source item and its recall reason.
 
     The returned structure is intentionally useful to both a model and the context
@@ -243,6 +286,7 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
     chapter_tail = _clip(chapter_content[-7000:], 7000)
     mentions_text = "\n".join((instruction, selected_text, chapter_tail[-1800:]))
     items = []
+    planning_at_start = profile in {"planning", "sandbox"} and not chapter
     include_production = profile in {"writing", "sandbox", "planning"}
     include_characters = profile in {"writing", "sandbox", "planning"}
     include_materials = profile in {"writing", "sandbox", "planning"}
@@ -262,20 +306,21 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
         if chapter.get("notes"):
             items.append(_item("chapter_notes", "本章备注", _clip(chapter["notes"], 3000), "作者为当前章留下的约束", 1))
 
-    notes_record = db.get_work_notes_record(work_id, user_id) or {}
-    work_notes = ((notes_record.get("notes") or "") if notes_record.get("notes_role") == "canon"
-                  else (db.get_work_notes_for_context(work_id, user_id) or "") if profile != "world_state" else "")
+    work_notes = db.get_work_notes(work_id, user_id) if profile != "world_state" else ""
     if work_notes:
-        items.append(_item("work_bible", "作品设定", _clip(work_notes, 9000), "全局创作约束", 1))
+        items.append(_item("work_bible", "创作总则", _clip(work_notes, 9000), "作者对创作方式的要求", 1))
 
-    production_digest = db.production_context_digest(work_id, user_id, chapter_id) if include_production else ""
+    production_digest = db.production_context_digest(
+        work_id, user_id, chapter_id,
+        include_dynamic_state=not planning_at_start, global_only=planning_at_start,
+    ) if include_production else ""
     if production_digest:
         items.append(_item(
             "production_bible", "生产画布设定", _clip(production_digest, 14000),
             "当前章节时点生效的规则、地点、技能、道具与保密边界", 1,
         ))
 
-    plan_items, plan_exclusions = _story_plan_items(user_id, work_id, chapter, profile)
+    plan_items, plan_exclusions = _story_plan_items(user_id, work_id, chapter, profile, plan_focus_ids)
     items.extend(plan_items)
 
     entities = db.list_character_cards(work_id, user_id, chapter_id) if include_characters else []
@@ -288,7 +333,9 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
             facts.append("基础设定：" + _clip(entity["summary"], 900))
         if entity.get("detail"):
             facts.append("详细设定：" + _clip(entity["detail"], 1600))
-        state = _state_lines(db.CHARACTER_STATE_LABELS, entity.get("current_state") or {})
+        state = "" if planning_at_start else _state_lines(
+            db.CHARACTER_STATE_LABELS, entity.get("current_state") or {},
+        )
         if state:
             facts.append("当前状态：" + state)
         if facts:
@@ -304,14 +351,14 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
         if state:
             items.append(_item("plot_state", "当前剧情状态", state, "当前章节时点的已确认剧情推进", 1))
 
-    relationships = db.get_relationship_digest(work_id, user_id)
+    relationships = db.get_relationship_digest(work_id, user_id) if not planning_at_start else ""
     if relationships:
         items.append(_item("relationships", "人物关系", _clip(relationships, 5000), "保持人物互动连续", 2))
 
     recall_query = "\n".join((instruction, selected_text, chapter_tail[-1200:]))
     material_settings = materials.get_settings(user_id, work_id) or materials.DEFAULT_SETTINGS
     memories = []
-    if material_settings.get("use_story_memory", True):
+    if material_settings.get("use_story_memory", True) and not planning_at_start:
         memories = db.search_story_memories(
             work_id, user_id, recall_query, entity_ids=entity_ids or None,
             before_chapter_id=chapter_id, limit=12,
@@ -324,7 +371,7 @@ def build_context(user_id, task_type, work_id, chapter_id=None, instruction="", 
             "关键词、当前出场人物和章节时点匹配", 2,
         ))
 
-    summaries = db.list_recent_chapter_summaries(work_id, user_id, before_chapter_id=chapter_id, limit=4) or []
+    summaries = (db.list_recent_chapter_summaries(work_id, user_id, before_chapter_id=chapter_id, limit=4) or []) if not planning_at_start else []
     if summaries:
         items.append(_item("chapter_summary", "最近章节摘要", _render_summaries(summaries), "补足近期剧情衔接", 3))
 

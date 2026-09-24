@@ -2051,10 +2051,92 @@ _realized = c.post(f"/api/story-plan/{_plan_chapter['id']}/realizations", json={
 }, headers=H(tokA)).json()
 ok(any(row["source_current"] and row["status"] == "realized" for row in _realized["realizations"]),
    "规划实现状态绑定规划版本与正文版本")
+ok(_realized["status"] == "committed", "正文已实现不覆盖作者确定的规划状态")
+_no_op = c.put(f"/api/story-plan/{_plan_chapter['id']}", json={
+    "summary": _plan_updated["summary"], "links": [], "expected_revision": _realized["revision"],
+}, headers=H(tokA)).json()
+ok(_no_op["revision"] == _realized["revision"] and _no_op["realizations"][0]["source_current"],
+   "重复保存相同规划与关联不增加版本、不使实现记录失效")
+_after_realized_context = context_builder.build_context(uidA, "continue_writing", wid, memory_c2, profile="writing")
+ok(not any(item.get("source_id") == _plan_chapter["id"] for item in _after_realized_context["context_items"]),
+   "已由当前正文实现的计划不再作为待实现目标发送")
+ok(db.upsert_story_plan_realization(_plan_chapter["id"], uidA, memory_c2, status="realized",
+    evidence="", source="agent", expected_plan_revision=_realized["revision"],
+    expected_content_revision=db.get_chapter_meta(memory_c2, uidA)["content_revision"]).get("invalid_evidence"),
+   "Agent 不可空证据确认实现")
+ok(db.upsert_story_plan_realization(_plan_chapter["id"], uidA, memory_c2, status="realized",
+    evidence="正文不存在的引文", source="agent", expected_plan_revision=_realized["revision"],
+    expected_content_revision=db.get_chapter_meta(memory_c2, uidA)["content_revision"]).get("invalid_evidence"),
+   "Agent 引用不存在的正文不可落库")
+ok(db.upsert_story_plan_realization(_plan_chapter["id"], uidA, memory_c2, status="realized",
+    evidence="月钥", source="agent", expected_plan_revision=1,
+    expected_content_revision=db.get_chapter_meta(memory_c2, uidA)["content_revision"]).get("conflict"),
+   "Agent 使用陈旧规划版本时不能写入核对结果")
+_invalid_range = c.post(f"/api/works/{wid}/story-plan", json={
+    "title": "缺端点的范围", "context_policy": "writing_range",
+}, headers=H(tokA))
+ok(_invalid_range.status_code == 400, "写作范围必须有章节端点")
+_range_plan = c.post(f"/api/works/{wid}/story-plan", json={
+    "title": "限前章计划", "node_type": "chapter", "chapter_id": memory_c2,
+    "summary": "仅第一章能看到的计划", "context_policy": "writing_range",
+    "scope_start_chapter_id": memory_c1, "scope_end_chapter_id": memory_c1,
+}, headers=H(tokA)).json()
+_range_context = context_builder.build_context(uidA, "continue_writing", wid, memory_c2, profile="writing")
+ok(not any(item.get("source_id") == _range_plan["id"] for item in _range_context["context_items"]),
+   "当前章节直接关联的计划不能绕过写作范围")
 c.put(f"/api/chapters/{memory_c2}", json={"content": "林晚决定改走另一条调查路线。"}, headers=H(tokA))
 _realized_after_edit = c.get(f"/api/story-plan/{_plan_chapter['id']}", headers=H(tokA)).json()
 ok(any(row["is_stale"] for row in _realized_after_edit["realizations"]),
    "正文修改后旧的规划实现证据自动失效")
+_after_edit_context = context_builder.build_context(uidA, "continue_writing", wid, memory_c2, profile="writing")
+ok(any(item.get("source_id") == _plan_chapter["id"] for item in _after_edit_context["context_items"]),
+   "正文改写后原规划重新参与待实现计划选择")
+_branch_child = c.post(f"/api/works/{wid}/story-plan", json={
+    "title": "分支子计划", "parent_id": _range_plan["id"],
+}, headers=H(tokA)).json()
+_archived = c.delete(f"/api/story-plan/{_range_plan['id']}", headers=H(tokA)).json()
+ok(_archived["changed"] == 2 and all(item["id"] not in {_range_plan["id"], _branch_child["id"]}
+    for item in c.get(f"/api/works/{wid}/story-plan", headers=H(tokA)).json()),
+   "放弃父计划时整个分支从默认规划列表消失")
+_restored = c.post(f"/api/story-plan/{_range_plan['id']}/restore-branch", json={
+    "expected_revision": _archived["plan"]["revision"],
+}, headers=H(tokA)).json()
+ok(_restored["changed"] == 2 and _restored["plan"]["status"] == "planned"
+   and c.get(f"/api/story-plan/{_branch_child['id']}", headers=H(tokA)).json()["status"] == "planned",
+   "恢复分支保留原计划与子节点")
+_move = c.post(f"/api/story-plan/{_plan_chapter['id']}/move", json={
+    "direction": "down", "expected_revision": _realized_after_edit["revision"],
+}, headers=H(tokA))
+ok(_move.status_code == 200 and _move.json()["parent_id"] == _plan_book["id"],
+   "同级移动不改变规划上级")
+_new_chapter_plan = c.post(f"/api/works/{wid}/story-plan", json={
+    "node_type": "chapter", "title": "新章计划", "parent_id": _plan_book["id"],
+}, headers=H(tokA)).json()
+_created_from_plan = c.post(f"/api/story-plan/{_new_chapter_plan['id']}/chapter", json={}, headers=H(tokA)).json()
+_again_from_plan = c.post(f"/api/story-plan/{_new_chapter_plan['id']}/chapter", json={}, headers=H(tokA)).json()
+ok(_created_from_plan["chapter"]["id"] == _again_from_plan["chapter"]["id"],
+   "重复创建对应章节只得到一章")
+db.update_work_notes(wid, uidA, "叙事视角为第三人称")
+_world_without_guidelines = context_builder.build_context(uidA, "analyze_world_state", wid, memory_c2,
+                                                        profile="world_state")
+ok(not any(item["type"] == "work_bible" for item in _world_without_guidelines["context_items"]),
+   "创作总则不进入 World State 事实分析")
+_focused_planning = context_builder.build_context(uidA, "answer_story_question", wid, None,
+    profile="planning", plan_focus_ids=[_plan_chapter["id"]])
+ok(any(item.get("source_id") == _plan_chapter["id"] for item in _focused_planning["context_items"])
+   and not any(item.get("source_id") == _plan_future["id"] for item in _focused_planning["context_items"])
+   and any(item["type"] in {"production_bible", "character_state"}
+           for item in _focused_planning["context_items"])
+   and not any(item["type"] in {"memory", "chapter_summary", "plot_state"}
+               for item in _focused_planning["context_items"]),
+   "从指定规划推演加载基础设定和当前分支，故事开头不偷读未来动态状态")
+_unanchored_planning = context_builder.build_context(
+    uidA, "answer_story_question", wid, None, profile="planning",
+)
+ok(any(item.get("source_id") == _plan_book["id"] for item in _unanchored_planning["context_items"])
+   and not any(item.get("source_id") in {_plan_chapter["id"], _plan_future["id"]}
+               for item in _unanchored_planning["context_items"]),
+   "未指定章节或分支的推演只读取总纲，不灌入全部未来计划")
 _adopt_once = c.post(f"/api/sandboxes/{_sandbox['id']}/nodes/branch-a/adopt", json={
     "mode": "plan",
 }, headers=H(tokA)).json()
@@ -2062,6 +2144,33 @@ _adopt_twice = c.post(f"/api/sandboxes/{_sandbox['id']}/nodes/branch-a/adopt", j
     "mode": "plan",
 }, headers=H(tokA)).json()
 ok(_adopt_once["plan"]["id"] == _adopt_twice["plan"]["id"], "同一沙盘候选重复采纳保持幂等")
+_adopt_committed = c.put(f"/api/story-plan/{_adopt_once['plan']['id']}", json={
+    "summary": "作者修改后的正式规划", "status": "committed",
+    "expected_revision": _adopt_once["plan"]["revision"],
+}, headers=H(tokA)).json()
+_adopt_again = c.post(f"/api/sandboxes/{_sandbox['id']}/nodes/branch-a/adopt", json={
+    "mode": "plan",
+}, headers=H(tokA)).json()
+ok(_adopt_again["plan"]["revision"] == _adopt_committed["revision"]
+   and _adopt_again["plan"]["summary"] == "作者修改后的正式规划"
+   and _adopt_again["plan"]["status"] == "committed",
+   "重复采纳不覆盖作者后来修改并确定的正式规划")
+_adopt_updated = c.post(f"/api/sandboxes/{_sandbox['id']}/nodes/branch-a/adopt", json={
+    "mode": "update_plan",
+}, headers=H(tokA)).json()
+ok(_adopt_updated["plan"]["status"] == "committed",
+   "显式用沙盘候选更新正式规划时保留作者锁定状态")
+_parent_sandbox = c.post(f"/api/works/{wid}/sandboxes", json={"name": "父子采纳测试", "data": {
+    "nodes": [
+        {"id": "parent", "title": "已有关联", "kind": "volume", "plan_node_id": _plan_book["id"]},
+        {"id": "child", "title": "新分支", "kind": "plot"},
+    ], "edges": [{"from": "parent", "to": "child"}],
+}}, headers=H(tokA)).json()
+_adopt_child = c.post(f"/api/sandboxes/{_parent_sandbox['id']}/nodes/child/adopt", json={
+    "mode": "plan",
+}, headers=H(tokA)).json()
+ok(_adopt_child["plan"]["parent_id"] == _plan_book["id"],
+   "采纳子候选保留沙盘中已关联的正式父规划")
 ok({"list_story_plan", "read_story_plan", "save_story_plan", "set_story_plan_status",
     "get_writing_plan_context", "review_story_plan_realization", "adopt_sandbox_node"}.issubset(_agent_tool_names),
    "Agent 暴露剧情规划、上下文、实现核对与沙盘采纳工具")

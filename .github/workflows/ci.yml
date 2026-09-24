@@ -33,4 +33,5 @@ jobs:
         run: |
           python test_web_search.py
           python test_smoke.py
+          python test_story_plan_scale.py
           python test_pi_runtime.py

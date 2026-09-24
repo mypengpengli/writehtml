@@ -65,10 +65,9 @@ PRODUCTION_CARD_CATEGORY_LABELS = {
 PRODUCTION_SCOPE_TYPES = ("global", "chapter_range", "scene")
 PRODUCTION_PROPOSAL_TYPES = ("new_card", "card_update", "card_state", "scene")
 STORY_PLAN_NODE_TYPES = ("book", "volume", "arc", "chapter", "scene", "subplot", "foreshadow")
-STORY_PLAN_STATUSES = ("planned", "committed", "realized", "abandoned")
+STORY_PLAN_STATUSES = ("planned", "committed", "abandoned")
 STORY_PLAN_CONTEXT_POLICIES = ("auto", "planning_only", "writing_range", "never")
 STORY_PLAN_REALIZATION_STATUSES = ("pending", "partial", "realized", "deviated")
-WORK_NOTES_ROLES = ("mixed", "canon", "plan_imported", "reference")
 MAX_LLM_MODELS = 20
 MAX_LLM_MODEL_ID_LENGTH = 160
 DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS = max(1, int(config.AGENT_CONTEXT_WINDOW_TOKENS))
@@ -1090,7 +1089,6 @@ def _migration_model_runtime_options(conn):
 
 def _migration_story_plan(conn):
     """Separate author plans from canonical facts and prose-derived state."""
-    _add_col(conn, "works", "notes_role", "TEXT NOT NULL DEFAULT 'mixed'")
     _add_col(conn, "chapters", "outcome_summary", "TEXT DEFAULT ''")
     _add_col(conn, "chapters", "outcome_source_hash", "TEXT DEFAULT ''")
     _add_col(conn, "chapters", "outcome_source_revision", "INTEGER")
@@ -1172,10 +1170,13 @@ def _migration_story_plan(conn):
             ON story_plan_realizations(chapter_id, stale, status);
         """
     )
-    conn.execute(
-        "UPDATE works SET notes_role='canon' WHERE TRIM(COALESCE(notes,''))='' "
-        "AND notes_role='mixed'"
-    )
+
+
+def _migration_story_plan_refinement(conn):
+    _add_col(conn, "story_plan_realizations", "plan_content_hash", "TEXT NOT NULL DEFAULT ''")
+    _add_col(conn, "story_plan_nodes", "archived_from_status", "TEXT")
+    _add_col(conn, "story_plan_nodes", "archived_branch_id", "INTEGER")
+    conn.execute("UPDATE story_plan_nodes SET status='committed' WHERE status='realized'")
 
 
 _MIGRATIONS = (
@@ -1196,6 +1197,7 @@ _MIGRATIONS = (
     (15, "world_state_analysis_inputs", _migration_world_state_analysis_inputs),
     (16, "model_runtime_options", _migration_model_runtime_options),
     (17, "story_plan", _migration_story_plan),
+    (18, "story_plan_refinement", _migration_story_plan_refinement),
 )
 
 
@@ -1604,7 +1606,7 @@ def init_db():
         _add_col(conn, "user_settings", "asr_base_url", "TEXT")
         _add_col(conn, "user_settings", "asr_api_key", "TEXT")
         _add_col(conn, "works", "user_id", "INTEGER DEFAULT 0")
-        _add_col(conn, "works", "notes", "TEXT DEFAULT ''")  # 作品设定(人物/世界观/大纲)
+        _add_col(conn, "works", "notes", "TEXT DEFAULT ''")  # 创作总则（文风、视角、作者禁忌）
         _add_col(conn, "users", "is_admin", "INTEGER DEFAULT 0")  # 后台管理员标记
         _add_col(conn, "agent_skills", "source_kind", "TEXT DEFAULT 'manual'")
         _add_col(conn, "agent_skills", "source_markdown", "TEXT DEFAULT ''")
@@ -2390,28 +2392,12 @@ def list_chapters_full(wid, user_id):
 
 
 def get_work_notes(wid, user_id):
-    """Return the legacy free-form work notes without changing their context role."""
+    """Return the author's work-wide writing guidelines."""
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
             return None
         r = conn.execute("SELECT notes FROM works WHERE id=?", (wid,)).fetchone()
         return r["notes"] if r else None
-
-
-def get_work_notes_record(wid, user_id):
-    with get_conn() as conn:
-        if not _work_owned(conn, wid, user_id):
-            return None
-        row = conn.execute("SELECT notes,notes_role FROM works WHERE id=?", (wid,)).fetchone()
-        return dict(row) if row else None
-
-
-def get_work_notes_for_context(wid, user_id):
-    """Only canonical or still-unreviewed notes participate in automatic context."""
-    record = get_work_notes_record(wid, user_id)
-    if not record or record.get("notes_role") not in {"canon", "mixed"}:
-        return ""
-    return record.get("notes") or ""
 
 
 def update_work_notes(wid, user_id, notes):
@@ -2421,18 +2407,6 @@ def update_work_notes(wid, user_id, notes):
             return False
         conn.execute("UPDATE works SET notes=?, updated_at=? WHERE id=?", (notes, now, wid))
         return True
-
-
-def set_work_notes_role(wid, user_id, role):
-    if role not in WORK_NOTES_ROLES:
-        return {"invalid_role": True}
-    now = time.time()
-    with get_conn() as conn:
-        if not _work_owned(conn, wid, user_id):
-            return None
-        conn.execute("UPDATE works SET notes_role=?,updated_at=? WHERE id=?", (role, now, wid))
-        row = conn.execute("SELECT notes,notes_role FROM works WHERE id=?", (wid,)).fetchone()
-        return dict(row) if row else None
 
 
 # ---------- 可视化大纲 / 情节分支沙盘 ----------
@@ -2590,6 +2564,8 @@ def _record_story_plan_version(conn, row):
 
 
 def _story_plan_realizations(conn, plan_id):
+    plan = conn.execute("SELECT * FROM story_plan_nodes WHERE id=?", (plan_id,)).fetchone()
+    plan_hash = _story_plan_content_hash(conn, plan)
     rows = conn.execute(
         "SELECT r.*,c.title AS chapter_title,c.ord AS chapter_ord,c.content_hash AS current_content_hash,"
         "c.content_revision AS current_content_revision,n.revision AS current_plan_revision "
@@ -2598,17 +2574,44 @@ def _story_plan_realizations(conn, plan_id):
         "WHERE r.plan_node_id=? AND c.deleted_at IS NULL ORDER BY c.ord,r.id DESC",
         (plan_id,),
     ).fetchall()
-    result = []
-    for row in rows:
-        item = dict(row)
-        item["source_current"] = (
-            not bool(item.get("stale"))
-            and (item.get("source_content_hash") or "") == (item.get("current_content_hash") or "")
-            and int(item.get("plan_revision") or 0) == int(item.get("current_plan_revision") or 0)
-        )
-        item["is_stale"] = not item["source_current"]
-        result.append(item)
-    return result
+    return [_realization_payload(row, plan_hash) for row in rows]
+
+
+_PLAN_CONTENT_FIELDS = (
+    "node_type", "title", "summary", "detail", "goal", "conflict", "expected_outcome",
+    "parent_id", "chapter_id", "scope_start_chapter_id", "scope_end_chapter_id",
+)
+
+
+def _story_plan_content_hash(conn, row, links=None):
+    if not row:
+        return ""
+    if links is None:
+        links = conn.execute(
+            "SELECT target_type,target_id FROM story_plan_links WHERE plan_node_id=? "
+            "ORDER BY target_type,target_id", (row["id"],),
+        ).fetchall()
+    payload = {field: row[field] for field in _PLAN_CONTENT_FIELDS}
+    payload["links"] = sorted((link["target_type"], link["target_id"]) for link in links)
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _story_plan_links(conn, plan_id):
+    return [dict(link) for link in conn.execute(
+        "SELECT id,target_type,target_id,label,created_at FROM story_plan_links "
+        "WHERE plan_node_id=? ORDER BY id", (plan_id,),
+    )]
+
+
+def _realization_payload(row, plan_hash):
+    item = dict(row)
+    item["source_current"] = (
+        not bool(item.get("stale"))
+        and (item.get("source_content_hash") or "") == (item.get("current_content_hash") or "")
+        and (item.get("plan_content_hash") or "") == plan_hash
+    )
+    item["is_stale"] = not item["source_current"]
+    return item
 
 
 def _story_plan_payload(conn, row, include_related=True):
@@ -2616,10 +2619,7 @@ def _story_plan_payload(conn, row, include_related=True):
         return None
     item = dict(row)
     if include_related:
-        item["links"] = [dict(link) for link in conn.execute(
-            "SELECT id,target_type,target_id,label,created_at FROM story_plan_links "
-            "WHERE plan_node_id=? ORDER BY id", (item["id"],),
-        ).fetchall()]
+        item["links"] = _story_plan_links(conn, item["id"])
         item["realizations"] = _story_plan_realizations(conn, item["id"])
     return item
 
@@ -2666,7 +2666,41 @@ def _replace_story_plan_links(conn, plan_id, work_id, links):
         )
 
 
-def list_story_plan_nodes(wid, user_id, include_abandoned=True):
+def _story_plan_link_values(conn, plan_id):
+    return sorted((row["target_type"], row["target_id"], row["label"] or "") for row in conn.execute(
+        "SELECT target_type,target_id,label FROM story_plan_links WHERE plan_node_id=?", (plan_id,),
+    ))
+
+
+def _requested_story_plan_links(conn, wid, plan_id, links):
+    result = set()
+    for raw in links if isinstance(links, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        kind = (raw.get("target_type") or "").strip()
+        target = _validate_story_plan_reference(conn, wid, kind, raw.get("target_id"))
+        if target is not None and not (kind == "plan_node" and target == plan_id):
+            result.add((kind, target, _clean_story_plan_text("title", raw.get("label"))))
+    return sorted(result)
+
+
+def _story_plan_scope_error(conn, wid, policy, start_id, end_id):
+    if policy != "writing_range":
+        return None
+    if start_id is None and end_id is None:
+        return "invalid_range"
+    if start_id and end_id:
+        rows = conn.execute(
+            "SELECT id,ord FROM chapters WHERE work_id=? AND deleted_at IS NULL AND id IN (?,?)",
+            (wid, start_id, end_id),
+        ).fetchall()
+        orders = {row["id"]: row["ord"] for row in rows}
+        if len(orders) != (1 if start_id == end_id else 2) or orders[start_id] > orders[end_id]:
+            return "invalid_range"
+    return None
+
+
+def list_story_plan_nodes(wid, user_id, include_abandoned=False):
     with get_conn() as conn:
         if not _work_owned(conn, wid, user_id):
             return None
@@ -2680,7 +2714,32 @@ def list_story_plan_nodes(wid, user_id, include_abandoned=True):
             "WHERE " + " AND ".join(clauses) + " ORDER BY COALESCE(n.parent_id,0),n.ord,n.id",
             params,
         ).fetchall()
-        return [_story_plan_payload(conn, row) for row in rows]
+        if not rows:
+            return []
+        links_by_plan = {}
+        for link in conn.execute(
+            "SELECT l.* FROM story_plan_links l JOIN story_plan_nodes n ON n.id=l.plan_node_id "
+            "WHERE n.work_id=? AND n.deleted_at IS NULL ORDER BY l.id", (wid,),
+        ):
+            links_by_plan.setdefault(link["plan_node_id"], []).append(dict(link))
+        realizations_by_plan = {}
+        for realization in conn.execute(
+            "SELECT r.*,c.title AS chapter_title,c.ord AS chapter_ord,c.content_hash AS current_content_hash,"
+            "c.content_revision AS current_content_revision,n.revision AS current_plan_revision "
+            "FROM story_plan_realizations r JOIN story_plan_nodes n ON n.id=r.plan_node_id "
+            "JOIN chapters c ON c.id=r.chapter_id AND c.deleted_at IS NULL "
+            "WHERE n.work_id=? AND n.deleted_at IS NULL ORDER BY c.ord,r.id DESC", (wid,),
+        ):
+            realizations_by_plan.setdefault(realization["plan_node_id"], []).append(dict(realization))
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["links"] = links_by_plan.get(item["id"], [])
+            plan_hash = _story_plan_content_hash(conn, row, item["links"])
+            item["realizations"] = [_realization_payload(r, plan_hash)
+                                    for r in realizations_by_plan.get(item["id"], [])]
+            result.append(item)
+        return result
 
 
 def get_story_plan_node(plan_id, user_id):
@@ -2710,6 +2769,13 @@ def create_story_plan_node(wid, user_id, values):
         chapter_id = _validate_story_plan_reference(conn, wid, "chapter", values.get("chapter_id"))
         start_id = _validate_story_plan_reference(conn, wid, "chapter", values.get("scope_start_chapter_id"))
         end_id = _validate_story_plan_reference(conn, wid, "chapter", values.get("scope_end_chapter_id"))
+        for field, resolved in (("parent_id", parent_id), ("chapter_id", chapter_id),
+                                ("scope_start_chapter_id", start_id), ("scope_end_chapter_id", end_id)):
+            if values.get(field) not in (None, "") and resolved is None:
+                return {f"invalid_{field}": True}
+        scope_error = _story_plan_scope_error(conn, wid, policy, start_id, end_id)
+        if scope_error:
+            return {scope_error: True}
         source_sandbox_id = values.get("source_sandbox_id")
         source_node_id = _clean_story_plan_text("title", values.get("source_node_id"))
         if source_sandbox_id and source_node_id:
@@ -2820,10 +2886,19 @@ def update_story_plan_node(plan_id, user_id, values, expected_revision=None):
                 updates["ord"] = max(1, int(values.get("ord")))
             except (TypeError, ValueError):
                 return {"invalid_ord": True}
+        policy = updates.get("context_policy", current["context_policy"])
+        start_id = updates.get("scope_start_chapter_id", current["scope_start_chapter_id"])
+        end_id = updates.get("scope_end_chapter_id", current["scope_end_chapter_id"])
+        scope_error = _story_plan_scope_error(conn, current["work_id"], policy, start_id, end_id)
+        if scope_error:
+            return {scope_error: True}
         changed = any(updates.get(key) != current.get(key) for key in updates)
-        links_changed = "links" in values
+        links_changed = "links" in values and _requested_story_plan_links(
+            conn, current["work_id"], plan_id, values["links"],
+        ) != _story_plan_link_values(conn, plan_id)
         if not changed and not links_changed:
             return _story_plan_payload(conn, current)
+        previous_content_hash = _story_plan_content_hash(conn, current)
         updates["revision"] = revision + 1
         updates["updated_at"] = now
         assignments = ",".join(f"{key}=?" for key in updates)
@@ -2836,8 +2911,9 @@ def update_story_plan_node(plan_id, user_id, values, expected_revision=None):
             return {"conflict": True, "current": _story_plan_payload(conn, latest)}
         if links_changed:
             _replace_story_plan_links(conn, plan_id, current["work_id"], values.get("links"))
-        conn.execute("UPDATE story_plan_realizations SET stale=1,updated_at=? WHERE plan_node_id=?", (now, plan_id))
         row = _story_plan_row(conn, plan_id, work_id=current["work_id"])
+        if previous_content_hash != _story_plan_content_hash(conn, row):
+            conn.execute("UPDATE story_plan_realizations SET stale=1,updated_at=? WHERE plan_node_id=?", (now, plan_id))
         _record_story_plan_version(conn, row)
         conn.execute("UPDATE works SET updated_at=? WHERE id=?", (now, current["work_id"]))
         return _story_plan_payload(conn, row)
@@ -2888,7 +2964,8 @@ def restore_story_plan_version(plan_id, user_id, revision, expected_revision=Non
     )
 
 
-def upsert_story_plan_realization(plan_id, user_id, chapter_id, status="pending", evidence="", notes="", source="manual"):
+def upsert_story_plan_realization(plan_id, user_id, chapter_id, status="pending", evidence="", notes="", source="manual",
+                                  expected_plan_revision=None, expected_content_revision=None):
     status = (status or "pending").strip()
     if status not in STORY_PLAN_REALIZATION_STATUSES:
         return {"invalid_status": True}
@@ -2903,66 +2980,137 @@ def upsert_story_plan_realization(plan_id, user_id, chapter_id, status="pending"
         ).fetchone()
         if not chapter or chapter["work_id"] != plan["work_id"]:
             return {"invalid_chapter": True}
-        if status == "realized" and plan["status"] != "realized":
-            conn.execute(
-                "UPDATE story_plan_nodes SET status='realized',revision=revision+1,updated_at=? WHERE id=?",
-                (now, plan_id),
+        try:
+            revisions_match = (
+                (expected_plan_revision is None or int(expected_plan_revision) == plan["revision"])
+                and (expected_content_revision is None or int(expected_content_revision) == chapter["content_revision"])
             )
-            plan = _story_plan_row(conn, plan_id, work_id=plan["work_id"])
-            _record_story_plan_version(conn, plan)
+        except (TypeError, ValueError):
+            return {"invalid_revision": True}
+        if not revisions_match:
+            return {"conflict": True}
+        if source == "agent" and status in {"partial", "realized", "deviated"}:
+            content = conn.execute("SELECT content FROM chapters WHERE id=?", (chapter_id,)).fetchone()["content"] or ""
+            if not evidence or evidence not in content:
+                return {"invalid_evidence": True}
         source_hash = chapter["content_hash"] or _content_fingerprint("")
+        plan_hash = _story_plan_content_hash(conn, plan)
         conn.execute(
             "UPDATE story_plan_realizations SET stale=1,updated_at=? WHERE plan_node_id=? AND chapter_id=? "
-            "AND (source_content_hash<>? OR plan_revision<>?)",
-            (now, plan_id, chapter_id, source_hash, plan["revision"]),
+            "AND (source_content_hash<>? OR plan_content_hash<>?)",
+            (now, plan_id, chapter_id, source_hash, plan_hash),
         )
         conn.execute(
             "INSERT INTO story_plan_realizations(plan_node_id,plan_revision,chapter_id,source_content_hash,"
-            "source_content_revision,status,evidence,notes,source,stale,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,0,?,?) ON CONFLICT(plan_node_id,chapter_id,source_content_hash) DO UPDATE SET "
+            "source_content_revision,status,evidence,notes,source,plan_content_hash,stale,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?) ON CONFLICT(plan_node_id,chapter_id,source_content_hash) DO UPDATE SET "
             "plan_revision=excluded.plan_revision,source_content_revision=excluded.source_content_revision,"
             "status=excluded.status,evidence=excluded.evidence,notes=excluded.notes,source=excluded.source,"
-            "stale=0,updated_at=excluded.updated_at",
+            "plan_content_hash=excluded.plan_content_hash,stale=0,updated_at=excluded.updated_at",
             (
                 plan_id, plan["revision"], chapter_id, source_hash, chapter["content_revision"], status,
                 _clean_story_plan_text("detail", evidence), _clean_story_plan_text("summary", notes),
-                (source or "manual")[:40], now, now,
+                (source or "manual")[:40], plan_hash, now, now,
             ),
         )
         return _story_plan_payload(conn, _story_plan_row(conn, plan_id, work_id=plan["work_id"]))
 
 
-def import_work_notes_to_story_plan(wid, user_id, mode):
-    mode = (mode or "").strip()
-    if mode not in {"plan", "canon", "reference"}:
-        return {"invalid_mode": True}
+def get_or_create_story_plan_chapter(plan_id, user_id):
     with atomic_transaction(immediate=True) as conn:
-        if not _work_owned(conn, wid, user_id):
+        plan = _story_plan_row(conn, plan_id, user_id=user_id)
+        if not plan:
             return None
-        record = conn.execute("SELECT notes,notes_role FROM works WHERE id=?", (wid,)).fetchone()
-        notes = (record["notes"] or "").strip()
-        if mode == "canon":
-            conn.execute("UPDATE works SET notes_role='canon',updated_at=? WHERE id=?", (time.time(), wid))
-            return {"mode": mode, "notes_role": "canon"}
-        if mode == "reference":
-            conn.execute("UPDATE works SET notes_role='reference',updated_at=? WHERE id=?", (time.time(), wid))
-            return {"mode": mode, "notes_role": "reference"}
-        existing = conn.execute(
-            "SELECT id FROM story_plan_nodes WHERE work_id=? AND source_node_id='legacy-work-notes' "
-            "AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", (wid,),
-        ).fetchone()
-        if existing:
-            conn.execute("UPDATE works SET notes_role='plan_imported',updated_at=? WHERE id=?", (time.time(), wid))
-            return {"mode": mode, "notes_role": "plan_imported", "plan": _story_plan_payload(
-                conn, _story_plan_row(conn, existing["id"], work_id=wid),
-            )}
-        plan = create_story_plan_node(wid, user_id, {
-            "node_type": "book", "title": "旧版作品规划", "detail": notes,
-            "summary": notes[:1200], "context_summary": notes[:1200],
-            "context_policy": "planning_only", "source_node_id": "legacy-work-notes",
-        })
-        conn.execute("UPDATE works SET notes_role='plan_imported',updated_at=? WHERE id=?", (time.time(), wid))
-        return {"mode": mode, "notes_role": "plan_imported", "plan": plan}
+        if plan["node_type"] != "chapter":
+            return {"invalid_node_type": True}
+        chapter = get_chapter_meta(plan["chapter_id"], user_id) if plan["chapter_id"] else None
+        if not chapter:
+            chapter = create_chapter(plan["work_id"], user_id, plan["title"])
+            update_chapter_workflow(chapter["id"], user_id, status="planning",
+                                    goal=plan["goal"] or plan["summary"] or plan["title"])
+            plan = update_story_plan_node(plan_id, user_id, {"chapter_id": chapter["id"]},
+                                          expected_revision=plan["revision"])
+            if plan.get("conflict") is True:
+                return plan
+        return {"plan": _story_plan_payload(conn, _story_plan_row(conn, plan_id, user_id=user_id)),
+                "chapter": chapter}
+
+
+def move_story_plan_node(plan_id, user_id, direction, expected_revision=None):
+    if direction not in {"up", "down"}:
+        return {"invalid_order": True}
+    with atomic_transaction(immediate=True) as conn:
+        row = _story_plan_row(conn, plan_id, user_id=user_id)
+        if not row:
+            return None
+        try:
+            if expected_revision is not None and int(expected_revision) != row["revision"]:
+                return {"conflict": True}
+        except (TypeError, ValueError):
+            return {"invalid_revision": True}
+        if row["parent_id"] is None:
+            siblings = conn.execute(
+                "SELECT * FROM story_plan_nodes WHERE work_id=? AND parent_id IS NULL "
+                "AND deleted_at IS NULL ORDER BY ord,id", (row["work_id"],),
+            ).fetchall()
+        else:
+            siblings = conn.execute(
+                "SELECT * FROM story_plan_nodes WHERE work_id=? AND parent_id=? "
+                "AND deleted_at IS NULL ORDER BY ord,id", (row["work_id"], row["parent_id"]),
+            ).fetchall()
+        index = next(i for i, sibling in enumerate(siblings) if sibling["id"] == plan_id)
+        other = index + (-1 if direction == "up" else 1)
+        if other < 0 or other >= len(siblings):
+            return _story_plan_payload(conn, row)
+        siblings[index], siblings[other] = siblings[other], siblings[index]
+        now = time.time()
+        for ordinal, sibling in enumerate(siblings, 1):
+            if sibling["ord"] == ordinal:
+                continue
+            conn.execute(
+                "UPDATE story_plan_nodes SET ord=?,revision=revision+1,updated_at=? WHERE id=?",
+                (ordinal, now, sibling["id"]),
+            )
+            _record_story_plan_version(conn, _story_plan_row(conn, sibling["id"], work_id=row["work_id"]))
+        return _story_plan_payload(conn, _story_plan_row(conn, plan_id, work_id=row["work_id"]))
+
+
+def archive_story_plan_branch(plan_id, user_id, restore=False, expected_revision=None):
+    with atomic_transaction(immediate=True) as conn:
+        root = _story_plan_row(conn, plan_id, user_id=user_id)
+        if not root:
+            return None
+        try:
+            if expected_revision is not None and int(expected_revision) != root["revision"]:
+                return {"conflict": True}
+        except (TypeError, ValueError):
+            return {"invalid_revision": True}
+        rows = conn.execute(
+            "SELECT * FROM story_plan_nodes WHERE work_id=? AND deleted_at IS NULL", (root["work_id"],),
+        ).fetchall()
+        by_parent = {}
+        for row in rows:
+            by_parent.setdefault(row["parent_id"], []).append(row)
+        stack = [root]
+        changed = 0
+        while stack:
+            row = stack.pop()
+            stack.extend(by_parent.get(row["id"], []))
+            if restore and (row["status"] != "abandoned" or row["archived_branch_id"] != plan_id):
+                continue
+            if not restore and row["status"] == "abandoned":
+                continue
+            status = (row["archived_from_status"] or "planned") if restore else "abandoned"
+            archived_from = None if restore else row["status"]
+            conn.execute(
+                "UPDATE story_plan_nodes SET status=?,archived_from_status=?,archived_branch_id=?,"
+                "revision=revision+1,updated_at=? WHERE id=?",
+                (status, archived_from, None if restore else plan_id, time.time(), row["id"]),
+            )
+            _record_story_plan_version(conn, _story_plan_row(conn, row["id"], work_id=root["work_id"]))
+            changed += 1
+        return {"changed": changed, "plan": _story_plan_payload(
+            conn, _story_plan_row(conn, plan_id, work_id=root["work_id"]))}
 
 
 # ---------- 拆书任务（逐章落盘，可暂停、重试和续跑） ----------
@@ -5544,28 +5692,31 @@ def _production_scope_applies(conn, card, chapter_id):
     return (not start or chapter["ord"] >= start["ord"]) and (not end or chapter["ord"] <= end["ord"])
 
 
-def production_context_digest(wid, user_id, chapter_id=None, limit=80):
+def production_context_digest(wid, user_id, chapter_id=None, limit=80,
+                              include_dynamic_state=True, global_only=False):
     cards = list_production_cards(wid, user_id, chapter_id, include_pending=False)
     if not cards:
         return ""
     lines = []
     with get_conn() as conn:
         for card in cards:
-            if len(lines) >= limit or not _production_scope_applies(conn, card, chapter_id):
+            if (len(lines) >= limit or (global_only and card.get("scope_type") != "global")
+                    or not _production_scope_applies(conn, card, chapter_id)):
                 continue
             pieces = [card.get("summary") or card.get("detail") or ""]
             state = (card.get("current_state") or {}).get("state") or {}
-            if state:
+            if state and include_dynamic_state:
                 public_state = "；".join(
                     f"{key}={value}" for key, value in state.items() if value and not str(key).startswith("_")
                 )
                 if public_state:
                     pieces.append("当前状态：" + public_state)
             truth = card.get("truth") or {}
-            reader_known = state.get("_reader_known", truth.get("reader_known"))
-            character_knowledge = state.get("_character_knowledge", truth.get("character_knowledge"))
-            secrecy = state.get("_secrecy", truth.get("secrecy"))
-            reader_state = state.get("_reader_state", card.get("reader_state"))
+            reader_known = (state.get("_reader_known") if include_dynamic_state else None) or truth.get("reader_known")
+            character_knowledge = (state.get("_character_knowledge") if include_dynamic_state else None) or truth.get("character_knowledge")
+            secrecy = (state.get("_secrecy") if include_dynamic_state else None) or truth.get("secrecy")
+            reader_state = ((state.get("_reader_state") if include_dynamic_state else None)
+                            or card.get("reader_state"))
             if truth.get("objective"):
                 pieces.append("客观真相：" + str(truth["objective"]))
             if reader_known:
@@ -5578,7 +5729,8 @@ def production_context_digest(wid, user_id, chapter_id=None, limit=80):
                 pieces.append("读者侧状态：" + str(reader_state))
             content = "；".join(piece for piece in pieces if piece)
             lines.append(f"[{card['category_label']}] {card['name']}：{content}")
-    return "生产画布已确认设定（按当前章节时点生效）：\n" + "\n".join(lines) if lines else ""
+    label = "生产画布全书设定" if global_only else "生产画布已确认设定（按当前章节时点生效）"
+    return label + "：\n" + "\n".join(lines) if lines else ""
 
 
 def get_production_overview(wid, user_id):

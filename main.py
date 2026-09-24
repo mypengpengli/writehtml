@@ -592,10 +592,10 @@ async def del_work(wid: int, request: Request):
 
 @app.get("/api/works/{wid}/notes")
 async def get_work_notes_api(wid: int, request: Request):
-    record = db.get_work_notes_record(wid, _auth(request))
-    if record is None:
+    notes = db.get_work_notes(wid, _auth(request))
+    if notes is None:
         raise HTTPException(404, "作品不存在")
-    return {"notes": record.get("notes") or "", "notes_role": record.get("notes_role") or "mixed"}
+    return {"notes": notes}
 
 
 @app.put("/api/works/{wid}/notes")
@@ -604,17 +604,6 @@ async def save_work_notes(wid: int, request: Request):
     if not db.update_work_notes(wid, _auth(request), body.get("notes", "")):
         raise HTTPException(404, "作品不存在")
     return {"ok": True}
-
-
-@app.post("/api/works/{wid}/notes/classify")
-async def classify_work_notes(wid: int, request: Request):
-    body = await request.json()
-    result = db.import_work_notes_to_story_plan(wid, _auth(request), body.get("mode"))
-    if result is None:
-        raise HTTPException(404, "作品不存在")
-    if result.get("invalid_mode"):
-        raise HTTPException(400, "请选择保留为设定、导入剧情规划或仅作参考")
-    return result
 
 
 # ---------- 可视化大纲 / 情节分支沙盘 ----------
@@ -644,6 +633,9 @@ def _normalize_sandbox_data(data, wid, uid):
         chapter_id = raw.get("chapter_id")
         if chapter_id not in chapter_ids:
             chapter_id = None
+        context_chapter_id = raw.get("context_chapter_id", chapter_id)
+        if context_chapter_id not in chapter_ids:
+            context_chapter_id = None
         kind = raw.get("kind") if raw.get("kind") in {"volume", "chapter", "plot", "choice", "ending"} else "plot"
         direction = raw.get("direction") if raw.get("direction") in {"发散", "收束", "推进", "主线", ""} else ""
         characters = raw.get("characters")
@@ -662,7 +654,8 @@ def _normalize_sandbox_data(data, wid, uid):
             "id": node_id, "title": str(raw.get("title") or "未命名情节点").strip()[:160] or "未命名情节点",
             "summary": str(raw.get("summary") or "").strip()[:4000], "kind": kind,
             "direction": direction, "characters": str(characters or "").strip()[:1000],
-            "chapter_id": chapter_id, "x": round(x, 2), "y": round(y, 2),
+            "chapter_id": chapter_id, "context_chapter_id": context_chapter_id,
+            "x": round(x, 2), "y": round(y, 2),
             "plan_node_id": plan_node_id, "collapsed": bool(raw.get("collapsed")),
         })
     edges, edge_seen = [], set()
@@ -736,8 +729,11 @@ def _story_plan_error(result):
             "invalid_parent_id": "上级节点无效或形成循环", "invalid_chapter_id": "关联章节无效",
             "invalid_scope_start_chapter_id": "范围起始章节无效",
             "invalid_scope_end_chapter_id": "范围结束章节无效", "invalid_ord": "排序值无效",
+            "invalid_order": "移动方向无效",
             "invalid_revision": "版本号无效", "invalid_version": "历史版本不存在",
             "invalid_chapter": "关联章节不存在", "conflict": "规划已在其他位置更新，请刷新后重试",
+            "invalid_range": "写作范围缺失或章节顺序无效",
+            "invalid_evidence": "AI 核对必须引用当前正文中的原文证据",
         }
         for key, message in messages.items():
             # Story Plan also has a user-authored `conflict` text field.  Only
@@ -749,7 +745,7 @@ def _story_plan_error(result):
 
 @app.get("/api/works/{wid}/story-plan")
 async def list_story_plan(wid: int, request: Request):
-    include_abandoned = request.query_params.get("include_abandoned", "1") not in {"0", "false"}
+    include_abandoned = request.query_params.get("include_abandoned", "0") not in {"0", "false"}
     result = db.list_story_plan_nodes(wid, _auth(request), include_abandoned=include_abandoned)
     if result is None:
         raise HTTPException(404, "作品不存在")
@@ -776,12 +772,45 @@ async def save_story_plan(plan_id: int, request: Request):
 
 @app.delete("/api/story-plan/{plan_id}")
 async def abandon_story_plan(plan_id: int, request: Request):
-    current = db.get_story_plan_node(plan_id, _auth(request))
-    if not current:
-        raise HTTPException(404, "剧情规划对象不存在")
-    return _story_plan_error(db.update_story_plan_node(
-        plan_id, _auth(request), {"status": "abandoned"}, expected_revision=current.get("revision"),
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    return _story_plan_error(db.archive_story_plan_branch(
+        plan_id, _auth(request), expected_revision=body.get("expected_revision"),
     ))
+
+
+@app.post("/api/story-plan/{plan_id}/restore-branch")
+async def restore_story_plan_branch(plan_id: int, request: Request):
+    body = await request.json()
+    return _story_plan_error(db.archive_story_plan_branch(
+        plan_id, _auth(request), restore=True, expected_revision=body.get("expected_revision"),
+    ))
+
+
+@app.post("/api/story-plan/{plan_id}/move")
+async def move_story_plan(plan_id: int, request: Request):
+    body = await request.json()
+    return _story_plan_error(db.move_story_plan_node(
+        plan_id, _auth(request), body.get("direction"), body.get("expected_revision"),
+    ))
+
+
+@app.post("/api/story-plan/{plan_id}/chapter")
+async def get_or_create_story_plan_chapter(plan_id: int, request: Request):
+    return _story_plan_error(db.get_or_create_story_plan_chapter(plan_id, _auth(request)))
+
+
+@app.get("/api/chapters/{cid}/story-plan-context")
+async def preview_story_plan_context(cid: int, request: Request):
+    uid = _auth(request)
+    chapter = db.get_chapter_meta(cid, uid)
+    if not chapter:
+        raise HTTPException(404, "章节不存在")
+    snapshot = context_builder.build_context(
+        uid, "continue_writing", chapter["work_id"], cid, token_budget=18000, profile="writing",
+    )
+    return {"chapter_id": cid,
+            "included": [item for item in snapshot["context_items"] if item["type"] == "story_plan"],
+            "excluded": snapshot["context_exclusions"]}
 
 
 @app.get("/api/story-plan/{plan_id}/versions")
@@ -802,7 +831,9 @@ async def save_story_plan_realization(plan_id: int, request: Request):
     body = await request.json()
     return _story_plan_error(db.upsert_story_plan_realization(
         plan_id, _auth(request), body.get("chapter_id"), body.get("status") or "pending",
-        body.get("evidence") or "", body.get("notes") or "", body.get("source") or "manual",
+        body.get("evidence") or "", body.get("notes") or "", "manual",
+        expected_plan_revision=body.get("expected_plan_revision"),
+        expected_content_revision=body.get("expected_content_revision"),
     ))
 
 
@@ -812,54 +843,79 @@ async def adopt_sandbox_plan_node(sid: int, node_id: str, request: Request):
     return _adopt_sandbox_node(uid, sid, node_id, **(await request.json()))
 
 
-def _adopt_sandbox_node(uid, sid, node_id, mode="plan", target_plan_id=None, **_):
-    sandbox = db.get_story_sandbox(sid, uid)
-    if not sandbox:
-        raise HTTPException(404, "沙盘不存在")
-    data = sandbox.get("data") or {}
-    node = next((item for item in data.get("nodes", []) if str(item.get("id")) == node_id), None)
-    if not node:
-        raise HTTPException(404, "情节点不存在")
+def _adopt_sandbox_node(uid, sid, node_id, mode="plan", target_plan_id=None, parent_plan_id=None, **_):
     mode = mode or "plan"
     if mode not in {"plan", "update_plan", "plan_chapter"}:
         raise HTTPException(400, "采纳方式无效")
-    target_id = target_plan_id or node.get("plan_node_id")
-    plan_values = {
-        "node_type": ({"volume": "volume", "chapter": "chapter", "ending": "arc"}.get(node.get("kind"), "scene")),
-        "title": node.get("title") or "未命名情节点", "summary": node.get("summary") or "",
-        "detail": node.get("summary") or "", "goal": node.get("summary") or "",
-        "context_summary": (node.get("summary") or "")[:1200], "status": "planned",
-        "context_policy": "auto", "source_sandbox_id": sid, "source_node_id": node_id,
-    }
-    if target_id:
-        current = db.get_story_plan_node(int(target_id), uid)
-        if not current or current.get("work_id") != sandbox["work_id"]:
-            raise HTTPException(404, "要更新的规划节点不存在")
-        plan = db.update_story_plan_node(
-            current["id"], uid, plan_values, expected_revision=current.get("revision"),
-        )
-    else:
-        plan = db.create_story_plan_node(sandbox["work_id"], uid, plan_values)
-    plan = _story_plan_error(plan)
-    chapter = None
-    if mode == "plan_chapter":
-        chapter_id = plan.get("chapter_id") or node.get("chapter_id")
-        chapter = db.get_chapter_meta(chapter_id, uid) if chapter_id else None
-        if not chapter:
-            chapter = db.create_chapter(sandbox["work_id"], uid, plan["title"])
-            db.update_chapter_workflow(chapter["id"], uid, status="planning", goal=plan.get("summary") or plan["title"])
-        if plan.get("chapter_id") != chapter["id"]:
-            plan = _story_plan_error(db.update_story_plan_node(
-                plan["id"], uid, {"chapter_id": chapter["id"]}, expected_revision=plan.get("revision"),
-            ))
-    for item in data.get("nodes", []):
-        if str(item.get("id")) == node_id:
-            item["plan_node_id"] = plan["id"]
-            if chapter:
-                item["chapter_id"] = chapter["id"]
-    normalized = _normalize_sandbox_data(data, sandbox["work_id"], uid)
-    db.update_story_sandbox(sid, uid, data=normalized)
-    return {"ok": True, "plan": plan, "chapter": chapter}
+    with db.atomic_transaction(immediate=True):
+        sandbox = db.get_story_sandbox(sid, uid)
+        if not sandbox:
+            raise HTTPException(404, "沙盘不存在")
+        data = sandbox.get("data") or {}
+        node = next((item for item in data.get("nodes", []) if str(item.get("id")) == node_id), None)
+        if not node:
+            raise HTTPException(404, "情节点不存在")
+        target_id = target_plan_id or node.get("plan_node_id")
+        if target_id:
+            current = db.get_story_plan_node(int(target_id), uid)
+            if not current or current.get("work_id") != sandbox["work_id"]:
+                raise HTTPException(404, "要更新的规划节点不存在")
+        elif mode == "update_plan":
+            raise HTTPException(400, "请指定要更新的规划")
+        else:
+            current = None
+        parents = {str(edge.get("from")) for edge in data.get("edges", []) if str(edge.get("to")) == node_id}
+        linked_parents = {int(item["plan_node_id"]) for item in data.get("nodes", [])
+                          if str(item.get("id")) in parents and item.get("plan_node_id")}
+        if parent_plan_id is not None:
+            parent = db.get_story_plan_node(int(parent_plan_id), uid)
+            if not parent or parent["work_id"] != sandbox["work_id"]:
+                raise HTTPException(400, "上级规划无效")
+            parent_id = parent["id"]
+        elif len(linked_parents) == 1:
+            parent_id = next(iter(linked_parents))
+        elif len(linked_parents) > 1 and not current:
+            raise HTTPException(400, "存在多个已关联的上级，请指定 parent_plan_id")
+        else:
+            parent_id = None
+        plan_values = {
+            "node_type": {"volume": "volume", "chapter": "chapter", "ending": "arc"}.get(node.get("kind"), "scene"),
+            "title": node.get("title") or "未命名情节点", "summary": node.get("summary") or "",
+            "detail": node.get("summary") or "", "goal": node.get("summary") or "",
+            "context_summary": (node.get("summary") or "")[:1200],
+            "context_policy": "auto", "source_sandbox_id": sid, "source_node_id": node_id,
+        }
+        if parent_id is not None:
+            plan_values["parent_id"] = parent_id
+        if current and mode == "update_plan":
+            plan = db.update_story_plan_node(current["id"], uid, plan_values,
+                                             expected_revision=current["revision"])
+        elif current:
+            plan = current
+        else:
+            plan = db.create_story_plan_node(sandbox["work_id"], uid,
+                                             {**plan_values, "status": "planned"})
+        plan = _story_plan_error(plan)
+        chapter = None
+        if mode == "plan_chapter":
+            if plan["node_type"] != "chapter":
+                raise HTTPException(400, "只有章节计划可以创建对应正文")
+            chapter_id = plan.get("chapter_id") or node.get("chapter_id")
+            chapter = db.get_chapter_meta(chapter_id, uid) if chapter_id else None
+            if not chapter:
+                chapter = db.create_chapter(sandbox["work_id"], uid, plan["title"])
+                db.update_chapter_workflow(chapter["id"], uid, status="planning",
+                                           goal=plan.get("summary") or plan["title"])
+            if plan.get("chapter_id") != chapter["id"]:
+                plan = _story_plan_error(db.update_story_plan_node(
+                    plan["id"], uid, {"chapter_id": chapter["id"]}, expected_revision=plan["revision"],
+                ))
+        node["plan_node_id"] = plan["id"]
+        if chapter:
+            node["chapter_id"] = chapter["id"]
+        normalized = _normalize_sandbox_data(data, sandbox["work_id"], uid)
+        db.update_story_sandbox(sid, uid, data=normalized)
+        return {"ok": True, "plan": plan, "chapter": chapter}
 
 
 @app.post("/api/sandboxes/{sid}/expand")
@@ -893,16 +949,15 @@ async def expand_sandbox_node(sid: int, request: Request):
         cursor = incoming.get(cursor)
     path.reverse()
     context_chapter_id = next(
-        (item.get("chapter_id") for item in reversed(path)
-         if isinstance(item.get("chapter_id"), int) and not isinstance(item.get("chapter_id"), bool)),
+        (item["context_chapter_id"] for item in reversed(path)
+         if isinstance(item.get("context_chapter_id"), int)
+         and not isinstance(item.get("context_chapter_id"), bool)),
         None,
     )
-    if context_chapter_id is None:
-        work_chapters = db.list_chapters(sandbox["work_id"], uid) or []
-        context_chapter_id = work_chapters[-1]["id"] if work_chapters else None
+    plan_focus_ids = [item["plan_node_id"] for item in path if isinstance(item.get("plan_node_id"), int)]
     context = context_builder.build_context(
         uid, "answer_story_question", sandbox["work_id"], context_chapter_id,
-        token_budget=14000, profile="planning",
+        token_budget=14000, profile="planning", plan_focus_ids=plan_focus_ids,
     ) or {"context_items": []}
     confirmed_context = context_builder.render_context(
         context,
@@ -918,6 +973,7 @@ async def expand_sandbox_node(sid: int, request: Request):
             "只返回 JSON 数组，不要 Markdown 或解释。",
             "候选必须遵守 confirmed_world_state，不能把未揭露真相提前写出。",
             "branch_path 是当前分支已经决定的剧情，不得退回或重复成长。",
+            "branch_path 只是当前沙盘的假设路径，不是已经写入正文的事实。",
         ],
         "branch_path": [{"title": item.get("title") or "", "summary": item.get("summary") or "",
                          "direction": item.get("direction") or "", "chapter_id": item.get("chapter_id")}
@@ -2390,7 +2446,7 @@ async def do_process(request: Request):
 
 @app.post("/api/chat")
 async def chat(request: Request):
-    """头脑风暴：多轮对话，不碰正文。带作品设定+本章备注+正文末尾作上下文。"""
+    """头脑风暴：多轮对话，不碰正文。带相关写作资料、本章备注和正文末尾。"""
     uid = _auth(request)
     body = await request.json()
     msgs = body.get("messages")
@@ -2412,7 +2468,7 @@ async def chat(request: Request):
         if chap:
             bible = _agent_bible(chap["work_id"], uid, cid)
             if bible:
-                sys_ctx.append({"role": "system", "content": "作品设定（人物/世界观/大纲），探讨时请遵循：\n" + bible})
+                sys_ctx.append({"role": "system", "content": "创作总则和当前章节相关资料（未来计划不是既成事实）：\n" + bible})
             notes = chap.get("notes") or ""
             if notes:
                 sys_ctx.append({"role": "system", "content": "本章备注：\n" + notes})
@@ -3151,7 +3207,7 @@ AGENT_TOOLS = [
         "parameters": {"type": "object", "properties": {"chapter_id": _CHAPTER_ID_PROPERTY}}}},
     {"type": "function", "function": {
         "name": "check_consistency",
-        "description": "对照作品设定校验目标章节正文，列出人物、时间线或设定冲突；不改正文。",
+        "description": "对照世界设定、人物卡和创作总则校验目标章节正文，列出人物、时间线或设定冲突；不改正文。",
         "parameters": {"type": "object", "properties": {"chapter_id": _CHAPTER_ID_PROPERTY}}}},
     {"type": "function", "function": {
         "name": "search_story_memory",
@@ -3322,17 +3378,17 @@ AGENT_TOOLS = [
             "title": {"type": "string"}, "summary": {"type": "string"}, "detail": {"type": "string"},
             "goal": {"type": "string"}, "conflict": {"type": "string"},
             "expected_outcome": {"type": "string"}, "context_summary": {"type": "string"},
-            "status": {"type": "string", "enum": ["planned","committed","realized","abandoned"]},
+            "status": {"type": "string", "enum": ["planned","committed","abandoned"]},
             "context_policy": {"type": "string", "enum": ["auto","planning_only","writing_range","never"]},
             "chapter_id": {"type": "integer"}, "scope_start_chapter_id": {"type": "integer"},
             "scope_end_chapter_id": {"type": "integer"}, "expected_revision": {"type": "integer"}},
             "required": ["title"]}}},
     {"type": "function", "function": {
         "name": "set_story_plan_status",
-        "description": "改变规划生命周期：planned 计划中、committed 已锁定、realized 已写入正文、abandoned 废弃。",
+        "description": "改变作者规划状态：planned 规划中、committed 已确定、abandoned 已放弃。正文实现请使用 review_story_plan_realization。",
         "parameters": {"type": "object", "properties": {
             "plan_id": {"type": "integer"},
-            "status": {"type": "string", "enum": ["planned","committed","realized","abandoned"]},
+            "status": {"type": "string", "enum": ["planned","committed","abandoned"]},
             "expected_revision": {"type": "integer"}}, "required": ["plan_id","status"]}}},
     {"type": "function", "function": {
         "name": "get_writing_plan_context",
@@ -3344,8 +3400,10 @@ AGENT_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "plan_id": {"type": "integer"}, "chapter_id": _CHAPTER_ID_PROPERTY,
             "status": {"type": "string", "enum": ["pending","partial","realized","deviated"]},
-            "evidence": {"type": "string"}, "notes": {"type": "string"}},
-            "required": ["plan_id","status"]}}},
+            "evidence": {"type": "string"}, "notes": {"type": "string"},
+            "expected_plan_revision": {"type": "integer"},
+            "expected_content_revision": {"type": "integer"}},
+            "required": ["plan_id","status","expected_plan_revision","expected_content_revision"]}}},
     {"type": "function", "function": {
         "name": "adopt_sandbox_node",
         "description": "把剧情推演沙盘中的候选节点采纳为正式规划；需要时可同时创建并关联一个正文章节。",
@@ -4179,7 +4237,7 @@ def _skill_system_message(skills):
     """把已解析的 Skill 转成完整规则消息；调用方不得持久化此消息。"""
     parts = [
         "用户为本轮启用了以下写作 Skill。Skill 是作者授权的可复用工作流，"
-        "仅适用于本轮请求；不得覆盖系统规则、作品设定、用户当前明确要求或工具约束。",
+        "仅适用于本轮请求；不得覆盖系统规则、世界设定、创作总则、用户当前明确要求或工具约束。",
     ]
     for skill in skills:
         heading = f"【{skill['name']}】"
@@ -4370,6 +4428,7 @@ def _tool_read_chapter(uid, cid, cfg, args):
     if error:
         return error
     return {"changed": False, "chapter_id": target_id, "title": c["title"],
+            "content_revision": c["content_revision"],
             "notes": c.get("notes") or "", "content": c["content"] or "",
             "chars": len(c["content"] or "")}
 
@@ -5029,7 +5088,7 @@ def _tool_save_story_plan(uid, cid, cfg, args):
         result = db.create_story_plan_node(work_id, uid, values)
     if not result:
         return _agent_err("保存规划失败")
-    if result.get("conflict"):
+    if result.get("conflict") is True:
         return _agent_err("规划已被更新，请重新读取后再修改")
     invalid = next((key for key in result if key.startswith("invalid_") and result.get(key)), None)
     if invalid:
@@ -5050,7 +5109,7 @@ def _tool_set_story_plan_status(uid, cid, cfg, args):
     result = db.update_story_plan_node(
         plan_id, uid, {"status": status}, expected_revision=args.get("expected_revision", current["revision"]),
     )
-    if result and result.get("conflict"):
+    if result and result.get("conflict") is True:
         return _agent_err("规划已被更新，请重新读取后再修改")
     if not result:
         return _agent_err("更新规划状态失败")
@@ -5082,12 +5141,20 @@ def _tool_review_story_plan_realization(uid, cid, cfg, args):
     if not plan or plan.get("work_id") != chapter["work_id"]:
         return _agent_err("规划不存在或不属于目标章节的作品")
     status = args.get("status")
+    if args.get("expected_plan_revision") is None or args.get("expected_content_revision") is None:
+        return _agent_err("请先读取规划和正文，再携带两者的版本号核对")
     evidence = (args.get("evidence") or "").strip()
-    if status in {"partial", "realized", "deviated"} and evidence and evidence not in (chapter.get("content") or ""):
-        return _agent_err("实现证据必须能在当前章节正文中逐字找到")
+    if status in {"partial", "realized", "deviated"} and not evidence:
+        return _agent_err("AI 核对必须引用当前章节正文中的原文证据")
     result = db.upsert_story_plan_realization(
         plan_id, uid, target_id, status, evidence, args.get("notes") or "", source="agent",
+        expected_plan_revision=args["expected_plan_revision"],
+        expected_content_revision=args["expected_content_revision"],
     )
+    if result and result.get("conflict") is True:
+        return _agent_err("规划或正文已变化，请重新读取后核对")
+    if result and result.get("invalid_evidence") is True:
+        return _agent_err("证据不在当前正文中，请重新核对")
     if not result or result.get("invalid_status") or result.get("invalid_chapter"):
         return _agent_err("记录规划实现状态失败")
     return {"changed": False, "production_dirty": True, "plan": _story_plan_tool_item(result),

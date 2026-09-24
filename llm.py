@@ -43,7 +43,7 @@ PROMPTS = {
         "便于作为后续写作的上下文。只输出摘要，不要解释、不要标题。"
     ),
     "校验": (
-        "你是中文写作的设定校验员。下面是作者写的正文，请与作品设定、本章备注比对，"
+        "你是中文写作的设定校验员。下面是作者写的正文，请与创作总则、相关设定和本章备注比对，"
         "找出矛盾之处：人物性格/身份崩坏、时间线或地点前后不一致、"
         "人物状态冲突（如已断手却在用该手）、违反设定。"
         "用要点逐条列出问题并指明大致位置；没有矛盾就只回「未发现矛盾」。"
@@ -206,7 +206,7 @@ def transcribe(audio, *, filename="speech.webm", mime_type="audio/webm",
 def process(mode, text, context="", notes="", *, base_url=None, api_key=None, model=None, bible=None,
             style=None, skill_instructions=None):
     """按模式调用 LLM，返回生成文本。
-    notes 为本章备注；bible 为作品级设定（人物/世界观/大纲），全文记忆。
+    notes 为本章备注；bible 为创作总则及按当前章节筛选的写作资料。
     base_url/api_key/model 优先用调用方传入的（来自用户设置），缺省回落到 .env。"""
     base_url = base_url or config.LLM_BASE_URL
     api_key = api_key or config.LLM_API_KEY
@@ -215,7 +215,7 @@ def process(mode, text, context="", notes="", *, base_url=None, api_key=None, mo
     if bible:
         messages.append({
             "role": "system",
-            "content": "这是作品设定（人物/世界观/大纲），全文请遵循保持一致：\n" + bible,
+            "content": "这是作者的创作总则及当前任务相关资料；未来计划尚未发生：\n" + bible,
         })
     if notes:
         messages.append({
@@ -231,7 +231,7 @@ def process(mode, text, context="", notes="", *, base_url=None, api_key=None, mo
         messages.append({
             "role": "system",
             "content": "以下是作者本轮启用的写作 Skill。仅用于本次生成；"
-                       "不得违背本任务、作品设定或安全约束：\n" + skill_instructions,
+                       "不得违背本任务、创作总则或安全约束：\n" + skill_instructions,
         })
     # 改写带风格参数；其余模式直接查表
     prompt = PROMPTS["改写"].format(style=style or "更生动") if mode == "改写" else PROMPTS[mode]

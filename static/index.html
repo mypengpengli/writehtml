@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=story-plan-20260923">
+  <link rel="stylesheet" href="style.css?v=story-plan-20260924a">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -162,11 +162,12 @@
           <div><b>创作生产画布</b><small id="productionSubtitle">全书脉络与章节状态</small></div>
         </div>
         <div class="production-view-switch" role="group" aria-label="画布视图">
-          <button id="productionCanonBtn" class="active" onclick="setProductionSection('canon')">设定库</button>
+          <button id="productionCanonBtn" class="active" onclick="setProductionSection('canon')">世界设定</button>
           <button id="productionPlanBtn" onclick="setProductionSection('plan')">剧情规划</button>
           <button id="productionStateBtn" onclick="setProductionSection('state')">章节状态</button>
         </div>
-        <select id="productionChapterSelect" onchange="changeProductionChapter(this.value)" aria-label="选择画布章节"></select>
+        <select id="productionPlanLocate" class="hidden" onchange="locateStoryPlanChapter(this.value)" aria-label="定位规划章节"></select>
+        <select id="productionChapterSelect" class="hidden" onchange="changeProductionChapter(this.value)" aria-label="选择画布章节"></select>
         <span id="productionSaveStatus" class="production-save-status"></span>
         <div class="production-head-actions">
           <button class="production-edit-body" data-ic="pen" data-label="编辑正文" onclick="closeProductionCanvas()" title="编辑正文"></button>
@@ -216,6 +217,7 @@
           <div class="story-plan-tree-actions">
             <button onclick="openOutlineSandbox()" data-ic="nodes" data-label="剧情推演"></button>
           </div>
+          <label class="production-resource-search"><span data-ic="search"></span><input id="storyPlanSearch" placeholder="搜索标题、目标或正文计划" oninput="renderStoryPlan()"></label>
           <div id="storyPlanTree" class="story-plan-tree"></div>
         </aside>
 
@@ -223,10 +225,11 @@
           <div id="productionLoading" class="production-loading hidden"><span class="spinner"></span><span>正在读取画布</span></div>
           <div id="productionOverview" class="production-overview"></div>
           <div id="productionCanvasViewport" class="production-canvas-viewport hidden">
+            <div id="chapterPlanSummary" class="chapter-plan-summary"></div>
             <div id="productionCanvas" class="production-canvas"></div>
           </div>
           <div id="storyPlanWorkspace" class="story-plan-workspace hidden">
-            <div id="legacyNotesBanner" class="legacy-notes-banner hidden"></div>
+            <div id="storyPlanHealth" class="story-plan-health"></div>
             <div class="story-plan-toolbar">
               <div class="story-plan-filters" role="tablist">
                 <button class="active" data-plan-filter="all" onclick="setStoryPlanFilter('all')">全部</button>
@@ -236,7 +239,9 @@
                 <button data-plan-filter="thread" onclick="setStoryPlanFilter('thread')">支线 / 伏笔</button>
               </div>
               <span>
-                <button onclick="newStoryPlanNode()" data-ic="plus" data-label="新建计划"></button>
+                <span class="story-plan-view-switch" role="group" aria-label="规划视图"><button id="storyPlanRouteBtn" class="active" onclick="setStoryPlanView('route')">路线</button><button id="storyPlanCardBtn" onclick="setStoryPlanView('cards')">卡片</button></span>
+                <button id="storyPlanArchiveBtn" onclick="toggleStoryPlanArchive()" data-ic="archive" data-label="废案"></button>
+                <select id="storyPlanNewType" class="story-plan-new-type" aria-label="新建规划类型" onchange="if(this.value){newStoryPlanNode(null,this.value);this.value=''}"><option value="">＋ 新建</option><option value="book">总纲</option><option value="volume">卷纲</option><option value="arc">阶段</option><option value="chapter">章节计划</option><option value="subplot">支线</option><option value="foreshadow">伏笔</option><option value="scene">场景计划</option></select>
                 <button onclick="openOutlineSandbox()" data-ic="nodes" data-label="剧情推演"></button>
               </span>
             </div>
@@ -289,7 +294,7 @@
       <div id="agentMsgs" class="chat-msgs"></div>
       <div id="agentSelection" class="agent-selection hidden">
         <div class="agent-selection-head">
-          <span data-ic="bot" data-label="已引用选区"></span>
+          <span data-ic="bot" data-label="本轮引用"></span>
           <button class="ic" data-ic="x" onclick="clearAgentSelection()" title="取消引用"></button>
         </div>
         <div id="agentSelectionText" class="agent-selection-text"></div>
@@ -660,6 +665,7 @@
             <label>摘要<textarea id="sandboxNodeSummary" rows="7" maxlength="4000" oninput="updateSelectedSandboxNode()"></textarea></label>
             <label>层级<select id="sandboxNodeKind" onchange="updateSelectedSandboxNode()"><option value="volume">卷</option><option value="chapter">章</option><option value="plot">情节点</option><option value="choice">选择</option><option value="ending">结局</option></select></label>
             <label>走向<select id="sandboxNodeDirection" onchange="updateSelectedSandboxNode()"><option value="">未指定</option><option value="推进">推进 · 绿色</option><option value="发散">发散 · 橙色</option><option value="收束">收束 · 青色</option><option value="主线">主线 · 蓝色</option></select></label>
+            <label>推演时点<select id="sandboxNodeContextChapter" onchange="updateSelectedSandboxNode()"></select></label>
             <label>涉及角色<input id="sandboxNodeCharacters" maxlength="1000" oninput="updateSelectedSandboxNode()" placeholder="林晚、顾川"></label>
             <div class="set-actions">
               <button id="sandboxOpenChapterBtn" class="ic" onclick="openSandboxChapter()">打开章节</button>
@@ -1030,13 +1036,13 @@
     </div>
   </div>
 
-  <!-- 作品设定（人物/世界观/大纲，喂给 AI 当全文记忆） -->
+  <!-- 作者的全书创作要求 -->
   <div id="wnOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>作品设定</span><button class="ic" data-ic="x" onclick="closeWorkNotes()"></button></div>
+      <div class="overlay-head"><span>创作总则</span><button class="ic" data-ic="x" onclick="closeWorkNotes()"></button></div>
       <div class="set-form">
-        <p class="set-hint">人物表 / 世界观 / 大纲。本作品下所有 AI（润色/扩写/续写/找回）都会读到它，保证全文一致。</p>
-        <textarea id="wnText" rows="14" placeholder="主角：……&#10;世界观：……&#10;大纲：……"></textarea>
+        <p class="set-hint">记录叙事视角、文风、基调和写作禁忌。人物与世界事实放在“世界设定”，未来事件放在“剧情规划”。</p>
+        <textarea id="wnText" rows="14" placeholder="叙事视角：……&#10;文风与基调：……&#10;写作禁忌：……"></textarea>
         <div class="set-actions">
           <button onclick="saveWorkNotes()">保存</button>
           <button class="ic" onclick="closeWorkNotes()">取消</button>
@@ -1051,7 +1057,7 @@
     <div class="overlay-card">
       <div class="overlay-head"><span>AI 写作工具</span><button class="ic" data-ic="x" onclick="closeAITools()"></button></div>
       <div class="set-form">
-        <p class="set-hint">基于作品设定 + 本章正文。校验只列问题不改字；摘要会填进备注，成为后续 AI 上下文。</p>
+        <p class="set-hint">基于世界设定、创作总则和本章正文。校验只列问题不改字；摘要会填进备注，成为后续 AI 上下文。</p>
         <div class="set-actions">
           <button id="aiCheckBtn" onclick="aiCheck()">一致性校验</button>
           <button id="aiSynBtn" onclick="aiSynopsis()">生成本章摘要</button>
@@ -1099,6 +1105,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=story-plan-20260923"></script>
+  <script src="app.js?v=story-plan-20260924a"></script>
 </body>
 </html>
