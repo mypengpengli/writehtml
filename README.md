@@ -12,7 +12,7 @@
 - **编辑器语义层与人物档案**：正文编辑时自动高亮人物 / 地点 / 物品 / 组织 / 概念，不要求先写 `@`；悬停查看卡片，点击人物直接打开基础设定、当前动态、人物关系和成长历史。实体仍会自动拼进 AI 的设定（bible），保证全文一致。
 - **Agent 直写人物卡**：AI 助手内置 `list_characters` 和 `save_character_card`。作者说“按正文自动建立/更新人物卡”时，Agent 会先核对已有角色，再按 id 或姓名创建、局部更新正式人物档案；不会再把故事记忆误当人物卡。
 - **角色形象与图库**：人物卡会把基础设定和当前状态组成角色图草稿，可用文字模型一键整理为包含画风、竖版构图、镜头、光线、色调、服装材质、姿态、背景和负面约束的英文生图词。每次生成都保留在角色图库，可按人物筛选、打开大图、查看原提示词、删除或切换主形象，不再用新图覆盖旧图。生图服务支持独立的 OpenAI 兼容 Base URL、Key、模型 ID 和尺寸，也可沿用文字模型地址与 Key。
-- **剧情推演沙盘**：一个作品可建多棵互不影响的候选分支树；可同步真实章节、拖动节点、手工加分支，或让 AI 给出“发散 / 收束 / 推进”三种候选。沙盘节点是候选未来，不改正文也不进入写作上下文；采纳后默认进入正式剧情规划，也可选择“规划并新建章节”。同一候选重复采纳不会重复建计划。
+- **剧情推演沙盘**：一个作品可建多棵互不影响的候选分支树；打开后自动选中首个节点，右侧可直接填写事件、冲突与结果，也可让 AI 给出“发散 / 收束 / 推进”三种候选。候选保留后才成为沙盘节点，沙盘节点本身不改正文也不进入写作上下文；采纳后默认进入正式剧情规划，也可选择“规划并新建章节”。同一候选重复采纳不会重复建计划。沙盘内容自动保存；若其他标签页或 AI 已改动同一沙盘，旧版本不会覆盖新内容，当前修改可从冲突提示旁另存为新沙盘。右侧共用 AI 助手能新建沙盘、编辑候选节点，并按明确要求删除或采纳。
 - **创作生产画布**：独立工作区正式拆成「世界设定 / 剧情规划 / 章节状态」。世界设定管理人物、规则、地点、技能、道具和组织；剧情规划管理总纲、卷纲、阶段、章节、场景、支线与伏笔；章节状态展示“章前状态 → 正文场景 → 变化 → 章后状态”。AI 助手仍共用右侧同一会话。查看对象不会擅自改变 AI 目标，只有点「交给 AI」才作为本轮引用。
 - **拆书引擎**：支持 TXT、Markdown、Word、可复制文字的 PDF 和 EPUB。先自动切章，再按“逐章精读 / 骨架优先”逐章提取摘要、人物、地点、物品、组织和关系；每章完成即保存，可暂停续跑、单章重试或停止并保留已有成果。完成后可点「提炼整本资料」，跨章生成语言指纹、人物说话习惯、描写技法，并把去专名后的桥段机制加入灵感库。
 - **统一创作资料中心**：故事记忆继续作为已确认事实；语言指纹、参考工程、长期文档和灵感只作为可选创作辅助。每本作品可选择是否使用各类资料、设置语言指纹强度，并挂载最多 5 个只读参考工程，分别选择借鉴文风、桥段或世界观。Agent 会明确这些参考不是本书正史，不能照搬人物、地名、事件和独特表达。
@@ -67,7 +67,7 @@ AI 写入正文、执行章节复核，或作者主动点「分析本章」时�
 
 ### Agent 工具
 
-AI 助手可直接使用 `list_story_cards`、`save_story_card`、`save_story_card_state`、`list_chapter_scenes`、`save_chapter_scene`、`analyze_world_state` 和兼容别名 `analyze_chapter_production`。Story Plan 另有 `list_story_plan`、`read_story_plan`、`save_story_plan`、`set_story_plan_status`、`get_writing_plan_context`、`review_story_plan_realization` 与 `adopt_sandbox_node`。画布和正文共用当前 AI 会话与模型；“上下文”面板会显示每条计划的召回原因、版本、时间范围，以及未发送计划的排除原因。
+AI 助手可直接使用 `list_story_cards`、`save_story_card`、`save_story_card_state`、`list_chapter_scenes`、`save_chapter_scene`、`analyze_world_state` 和兼容别名 `analyze_chapter_production`。Story Plan 另有 `list_story_plan`、`read_story_plan`、`save_story_plan`、`set_story_plan_status`、`get_writing_plan_context`、`review_story_plan_realization`。沙盘提供 `list_story_sandboxes`、`create_story_sandbox`、`read_story_sandbox`、`save_sandbox_node`、`delete_sandbox_node` 与 `adopt_sandbox_node`，因此 AI 助手可以真正建立和编辑候选树，而不只是口头建议。画布和正文共用当前 AI 会话与模型；“上下文”面板会显示每条计划的召回原因、版本、时间范围，以及未发送计划的排除原因。
 
 ## 部署（Docker，推荐）
 

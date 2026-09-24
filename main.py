@@ -8,6 +8,7 @@ import io
 import re
 import zipfile
 import time
+import math
 import threading
 import queue
 import asyncio
@@ -708,8 +709,22 @@ async def save_sandbox(sid: int, request: Request):
     if not current:
         raise HTTPException(404, "沙盘不存在")
     body = await request.json()
+    expected_updated_at = body.get("expected_updated_at")
+    if expected_updated_at is not None and (
+        not isinstance(expected_updated_at, (int, float)) or isinstance(expected_updated_at, bool)
+        or not math.isfinite(expected_updated_at) or expected_updated_at <= 0
+    ):
+        raise HTTPException(400, "沙盘版本无效")
     data = _normalize_sandbox_data(body["data"], current["work_id"], uid) if "data" in body else None
-    return db.update_story_sandbox(sid, uid, body.get("name") if "name" in body else None, data)
+    result = db.update_story_sandbox(
+        sid, uid, body.get("name") if "name" in body else None, data,
+        expected_updated_at=expected_updated_at,
+    )
+    if result and result.get("conflict"):
+        raise HTTPException(409, "沙盘已在别处更新；当前输入仍保留，请先核对后再保存")
+    if not result:
+        raise HTTPException(404, "沙盘不存在")
+    return result
 
 
 @app.delete("/api/sandboxes/{sid}")
@@ -3405,6 +3420,38 @@ AGENT_TOOLS = [
             "expected_content_revision": {"type": "integer"}},
             "required": ["plan_id","status","expected_plan_revision","expected_content_revision"]}}},
     {"type": "function", "function": {
+        "name": "list_story_sandboxes",
+        "description": "列出当前作品的剧情推演沙盘。沙盘节点是候选未来，不是正式规划或已发生事实。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "create_story_sandbox",
+        "description": "为当前作品新建一棵空的剧情推演沙盘；然后用 save_sandbox_node 添加起点与候选分支。",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "沙盘名称，例如：如果主角拒绝合作"}},
+            "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "read_story_sandbox",
+        "description": "读取一个剧情推演沙盘的全部节点和连线。修改、增加或删除节点前先读取，避免操作错误分支。",
+        "parameters": {"type": "object", "properties": {
+            "sandbox_id": {"type": "integer"}}, "required": ["sandbox_id"]}}},
+    {"type": "function", "function": {
+        "name": "save_sandbox_node",
+        "description": "在剧情推演沙盘中创建或更新候选节点，不会修改正文或正式剧情规划。新建子节点时提供 parent_node_id；更新时提供 node_id。",
+        "parameters": {"type": "object", "properties": {
+            "sandbox_id": {"type": "integer"}, "node_id": {"type": "string"},
+            "parent_node_id": {"type": "string", "description": "仅新建子节点时使用"},
+            "title": {"type": "string"}, "summary": {"type": "string"},
+            "kind": {"type": "string", "enum": ["volume","chapter","plot","choice","ending"]},
+            "direction": {"type": "string", "enum": ["","发散","收束","推进","主线"]},
+            "characters": {"type": "string"}, "chapter_id": {"type": "integer"},
+            "context_chapter_id": {"type": "integer"}}, "required": ["sandbox_id"]}}},
+    {"type": "function", "function": {
+        "name": "delete_sandbox_node",
+        "description": "按作者明确要求删除一个剧情推演候选节点；子节点会保留为新的起点，不影响正文和已采纳的正式规划。",
+        "parameters": {"type": "object", "properties": {
+            "sandbox_id": {"type": "integer"}, "node_id": {"type": "string"}},
+            "required": ["sandbox_id","node_id"]}}},
+    {"type": "function", "function": {
         "name": "adopt_sandbox_node",
         "description": "把剧情推演沙盘中的候选节点采纳为正式规划；需要时可同时创建并关联一个正文章节。",
         "parameters": {"type": "object", "properties": {
@@ -4103,8 +4150,9 @@ def _agent_system(uid, cid, instruction="", selection=None, skill_ids=None):
         "新设定或重大剧情变化只形成作者待确认项，不能默认为既定事实；"
         "12) 总纲、卷纲、章节计划、未来场景、支线和伏笔属于 Story Plan。使用 list_story_plan、"
         "read_story_plan、save_story_plan 和 set_story_plan_status 管理，不能把未来计划写进规则卡、"
-        "故事记忆或 World State。计划内容仅代表作者意图，人物不能预知；沙盘候选须先调用 "
-        "adopt_sandbox_node 采纳后才成为正式计划；正文写完后可用 review_story_plan_realization "
+        "故事记忆或 World State。计划内容仅代表作者意图，人物不能预知；剧情推演沙盘可用 "
+        "list_story_sandboxes、create_story_sandbox、read_story_sandbox 和 save_sandbox_node 读取并编辑候选分支，作者明确要求时才用 "
+        "delete_sandbox_node 删除；沙盘候选须先调用 adopt_sandbox_node 采纳后才成为正式计划；正文写完后可用 review_story_plan_realization "
         "记录计划实现、部分实现或偏离；13) 回答简洁，做完事说一句即可。"
     ]
     if cid:
@@ -5161,15 +5209,179 @@ def _tool_review_story_plan_realization(uid, cid, cfg, args):
             "summary": f"已记录《{plan['title']}》在本章的实现状态：{status}"}
 
 
+def _sandbox_tool_item(sandbox, include_data=False):
+    item = {
+        "id": sandbox.get("id"), "name": sandbox.get("name") or "未命名沙盘",
+        "work_id": sandbox.get("work_id"), "updated_at": sandbox.get("updated_at"),
+    }
+    if include_data:
+        data = sandbox.get("data") or {"nodes": [], "edges": []}
+        item["nodes"] = data.get("nodes") or []
+        item["edges"] = data.get("edges") or []
+    else:
+        item["node_count"] = sandbox.get("node_count", 0)
+        item["edge_count"] = sandbox.get("edge_count", 0)
+    return item
+
+
+def _tool_list_story_sandboxes(uid, cid, cfg, args):
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not work_id:
+        return _agent_err("当前没有可用作品")
+    rows = db.list_story_sandboxes(work_id, uid) or []
+    return {
+        "changed": False, "sandboxes": [_sandbox_tool_item(item) for item in rows],
+        "summary": f"当前作品共有 {len(rows)} 个剧情推演沙盘；其中内容均为候选未来",
+    }
+
+
+def _tool_create_story_sandbox(uid, cid, cfg, args):
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not work_id:
+        return _agent_err("当前没有可用作品")
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return _agent_err("请填写沙盘名称")
+    sandbox = db.create_story_sandbox(work_id, uid, name, {"nodes": [], "edges": []})
+    if not sandbox:
+        return _agent_err("创建沙盘失败")
+    return {
+        "changed": False, "sandbox_dirty": True, "sandbox_id": sandbox["id"],
+        "sandbox": _sandbox_tool_item(sandbox, include_data=True),
+        "summary": f"已新建剧情推演沙盘《{sandbox['name']}》；尚无候选节点",
+    }
+
+
+def _tool_read_story_sandbox(uid, cid, cfg, args):
+    sandbox_id = args.get("sandbox_id")
+    if not isinstance(sandbox_id, int) or isinstance(sandbox_id, bool):
+        return _agent_err("请提供沙盘 id")
+    sandbox = db.get_story_sandbox(sandbox_id, uid)
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not work_id or not sandbox or sandbox.get("work_id") != work_id:
+        return _agent_err("沙盘不存在或不属于当前作品")
+    return {
+        "changed": False, "sandbox": _sandbox_tool_item(sandbox, include_data=True),
+        "summary": f"已读取剧情推演沙盘《{sandbox['name']}》",
+    }
+
+
+def _tool_save_sandbox_node(uid, cid, cfg, args):
+    sandbox_id = args.get("sandbox_id")
+    if not isinstance(sandbox_id, int) or isinstance(sandbox_id, bool):
+        return _agent_err("请提供沙盘 id")
+    allowed_kinds = {"volume", "chapter", "plot", "choice", "ending"}
+    allowed_directions = {"", "发散", "收束", "推进", "主线"}
+    if "kind" in args and args.get("kind") not in allowed_kinds:
+        return _agent_err("节点层级无效")
+    if "direction" in args and args.get("direction") not in allowed_directions:
+        return _agent_err("节点走向无效")
+    try:
+        with db.atomic_transaction(immediate=True):
+            sandbox = db.get_story_sandbox(sandbox_id, uid)
+            work_id = _tool_work_id(uid, cid, cfg)
+            if not work_id or not sandbox or sandbox.get("work_id") != work_id:
+                return _agent_err("沙盘不存在或不属于当前作品")
+            data = sandbox.get("data") or {"nodes": [], "edges": []}
+            nodes = data.setdefault("nodes", [])
+            edges = data.setdefault("edges", [])
+            node_id = str(args.get("node_id") or "").strip()
+            node = next((item for item in nodes if str(item.get("id")) == node_id), None) if node_id else None
+            if node_id and not node:
+                return _agent_err("要更新的沙盘节点不存在")
+            if node is None:
+                title = str(args.get("title") or "").strip()
+                if not title:
+                    return _agent_err("新建沙盘节点必须填写标题")
+                parent_id = str(args.get("parent_node_id") or "").strip()
+                parent = next((item for item in nodes if str(item.get("id")) == parent_id), None) if parent_id else None
+                if parent_id and not parent:
+                    return _agent_err("父节点不存在")
+                sibling_count = sum(1 for edge in edges if str(edge.get("from")) == parent_id)
+                node_id = f"agent-{secrets.token_hex(8)}"
+                node = {
+                    "id": node_id, "title": title, "summary": str(args.get("summary") or ""),
+                    "kind": args.get("kind") or ("choice" if parent else "plot"),
+                    "direction": args.get("direction") if "direction" in args else ("发散" if parent else ""),
+                    "characters": str(args.get("characters") or ""),
+                    "chapter_id": args.get("chapter_id"),
+                    "context_chapter_id": args.get(
+                        "context_chapter_id", parent.get("context_chapter_id", parent.get("chapter_id")) if parent else None,
+                    ),
+                    "x": (float(parent.get("x") or 0) + 290) if parent else 70 + (len(nodes) % 4) * 260,
+                    "y": (float(parent.get("y") or 0) + sibling_count * 135) if parent else 80 + (len(nodes) // 4) * 150,
+                    "collapsed": False,
+                }
+                nodes.append(node)
+                if parent:
+                    edges.append({
+                        "id": f"agent-edge-{secrets.token_hex(8)}", "from": parent_id, "to": node_id,
+                        "label": node.get("direction") or "分支",
+                    })
+                action = "创建"
+            else:
+                for key in ("title", "summary", "kind", "direction", "characters", "chapter_id", "context_chapter_id"):
+                    if key in args:
+                        node[key] = args.get(key)
+                if not str(node.get("title") or "").strip():
+                    return _agent_err("节点标题不能为空")
+                incoming = next((edge for edge in edges if str(edge.get("to")) == node_id), None)
+                if incoming and "direction" in args:
+                    incoming["label"] = args.get("direction") or incoming.get("label") or "分支"
+                action = "更新"
+            normalized = _normalize_sandbox_data(data, sandbox["work_id"], uid)
+            saved = db.update_story_sandbox(sandbox_id, uid, data=normalized)
+            saved_node = next(item for item in saved["data"]["nodes"] if item["id"] == node_id)
+    except HTTPException as exc:
+        return _agent_err(str(exc.detail))
+    return {
+        "changed": False, "sandbox_dirty": True, "sandbox_id": sandbox_id,
+        "node": saved_node, "summary": f"已在沙盘《{sandbox['name']}》中{action}节点《{saved_node['title']}》",
+    }
+
+
+def _tool_delete_sandbox_node(uid, cid, cfg, args):
+    sandbox_id = args.get("sandbox_id")
+    node_id = str(args.get("node_id") or "").strip()
+    if not isinstance(sandbox_id, int) or isinstance(sandbox_id, bool) or not node_id:
+        return _agent_err("请提供沙盘 id 和节点 id")
+    with db.atomic_transaction(immediate=True):
+        sandbox = db.get_story_sandbox(sandbox_id, uid)
+        work_id = _tool_work_id(uid, cid, cfg)
+        if not work_id or not sandbox or sandbox.get("work_id") != work_id:
+            return _agent_err("沙盘不存在或不属于当前作品")
+        data = sandbox.get("data") or {"nodes": [], "edges": []}
+        node = next((item for item in data.get("nodes", []) if str(item.get("id")) == node_id), None)
+        if not node:
+            return _agent_err("要删除的沙盘节点不存在")
+        data["nodes"] = [item for item in data.get("nodes", []) if str(item.get("id")) != node_id]
+        data["edges"] = [edge for edge in data.get("edges", [])
+                         if str(edge.get("from")) != node_id and str(edge.get("to")) != node_id]
+        normalized = _normalize_sandbox_data(data, sandbox["work_id"], uid)
+        db.update_story_sandbox(sandbox_id, uid, data=normalized)
+    return {
+        "changed": False, "sandbox_dirty": True, "sandbox_id": sandbox_id,
+        "summary": f"已从剧情推演沙盘删除候选节点《{node.get('title') or '未命名'}》；正文和正式规划未改变",
+    }
+
+
 def _tool_adopt_sandbox_node(uid, cid, cfg, args):
+    sandbox_id = args.get("sandbox_id")
+    if not isinstance(sandbox_id, int) or isinstance(sandbox_id, bool):
+        return _agent_err("请提供沙盘 id")
+    work_id = _tool_work_id(uid, cid, cfg)
+    sandbox = db.get_story_sandbox(sandbox_id, uid)
+    if not work_id or not sandbox or sandbox.get("work_id") != work_id:
+        return _agent_err("沙盘不存在或不属于当前作品")
     try:
         result = _adopt_sandbox_node(
-            uid, args.get("sandbox_id"), str(args.get("node_id") or ""),
+            uid, sandbox_id, str(args.get("node_id") or ""),
             mode=args.get("mode") or "plan", target_plan_id=args.get("target_plan_id"),
         )
     except HTTPException as exc:
         return _agent_err(str(exc.detail))
-    return {"changed": False, "production_dirty": True, **result,
+    return {"changed": False, "production_dirty": True, "sandbox_dirty": True,
+            "sandbox_id": sandbox_id, **result,
             "summary": f"已采纳为正式规划《{result['plan']['title']}》"}
 
 
@@ -5368,6 +5580,11 @@ _AGENT_TOOLS = {
     "save_story_plan": _tool_save_story_plan, "set_story_plan_status": _tool_set_story_plan_status,
     "get_writing_plan_context": _tool_get_writing_plan_context,
     "review_story_plan_realization": _tool_review_story_plan_realization,
+    "list_story_sandboxes": _tool_list_story_sandboxes,
+    "create_story_sandbox": _tool_create_story_sandbox,
+    "read_story_sandbox": _tool_read_story_sandbox,
+    "save_sandbox_node": _tool_save_sandbox_node,
+    "delete_sandbox_node": _tool_delete_sandbox_node,
     "adopt_sandbox_node": _tool_adopt_sandbox_node,
     "web_search": _tool_web_search,
 }

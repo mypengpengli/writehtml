@@ -1561,6 +1561,9 @@ let selectedSandboxNodeId = null;
 let sandboxSaveTimer = null;
 let sandboxDrag = null;
 let sandboxAiCandidates = [];
+const sandboxSaveQueue = new SerialSaveQueue();
+let sandboxEditVersion = 0;
+let sandboxUnsaved = false;
 
 function sandboxNodeId(prefix = "plot") {
   return `${prefix}-${globalThis.crypto?.randomUUID?.() || (Date.now().toString(36) + Math.random().toString(36).slice(2))}`;
@@ -1574,12 +1577,18 @@ function sandboxData() {
 async function openOutlineSandbox() {
   if (!currentWorkId) { showToast("先选一个作品", "err"); return; }
   if (!await flushEditorSave()) return;
+  if (currentSandbox && !await flushSandboxSave()) {
+    showToast("当前沙盘尚未保存，暂不能切换", "err"); return;
+  }
   $("outlineOverlay").classList.remove("hidden");
   try {
     sandboxList = await api(`/api/works/${currentWorkId}/sandboxes`, { method: "GET" });
     if (!sandboxList.length) {
       currentSandbox = await api(`/api/works/${currentWorkId}/sandboxes`, { body: { name: "主线推演", data: { nodes: [], edges: [] } } });
-      sandboxList = [{ id: currentSandbox.id, name: currentSandbox.name, node_count: 0, edge_count: 0 }];
+      sandboxUnsaved = false;
+      $("sandboxConflictCopyBtn")?.classList.add("hidden");
+      sandboxList = [{ id: currentSandbox.id, name: currentSandbox.name,
+        updated_at: currentSandbox.updated_at, node_count: 0, edge_count: 0 }];
       syncSandboxChapters(false);
       await saveOutlineSandbox(false);
     } else await loadOutlineSandbox(sandboxList[0].id);
@@ -1587,15 +1596,28 @@ async function openOutlineSandbox() {
   } catch (e) { showToast("沙盘加载失败：" + e.message, "err"); }
 }
 async function closeOutlineSandbox() {
-  clearTimeout(sandboxSaveTimer);
-  if (currentSandbox) await saveOutlineSandbox(false).catch(() => {});
+  if (currentSandbox && !await flushSandboxSave()) {
+    showToast("沙盘尚未保存，请检查网络后重试", "err");
+    return false;
+  }
   $("outlineOverlay").classList.add("hidden");
   sandboxDrag = null;
+  return true;
 }
 async function loadOutlineSandbox(sid) {
+  if (currentSandbox && !await flushSandboxSave()) {
+    showToast("当前沙盘尚未保存，暂不能切换", "err");
+    return false;
+  }
   currentSandbox = await api(`/api/sandboxes/${sid}`, { method: "GET" });
-  selectedSandboxNodeId = null; sandboxAiCandidates = [];
+  sandboxUnsaved = false;
+  $("sandboxConflictCopyBtn")?.classList.add("hidden");
+  const row = sandboxList.find(item => item.id === sid);
+  if (row) Object.assign(row, { name: currentSandbox.name, updated_at: currentSandbox.updated_at,
+    node_count: currentSandbox.data?.nodes?.length || 0, edge_count: currentSandbox.data?.edges?.length || 0 });
+  selectedSandboxNodeId = currentSandbox.data?.nodes?.[0]?.id || null; sandboxAiCandidates = [];
   renderSandboxList(); renderOutlineSandbox(); renderSandboxInspector();
+  return true;
 }
 function renderSandboxList() {
   const host = $("sandboxList"); if (!host) return;
@@ -1614,18 +1636,44 @@ function renderSandboxList() {
 async function newOutlineSandbox() {
   const name = await askCard({ title: "新建情节沙盘", input: "沙盘名称", def: `情节假设 ${sandboxList.length + 1}`, okText: "新建" });
   if (!name) return;
+  if (!await flushSandboxSave()) { showToast("当前沙盘尚未保存，暂不能切换", "err"); return; }
   const created = await api(`/api/works/${currentWorkId}/sandboxes`, { body: { name, data: { nodes: [], edges: [] } } });
-  sandboxList.unshift({ id: created.id, name: created.name, node_count: 0, edge_count: 0 });
+  sandboxList.unshift({ id: created.id, name: created.name,
+    updated_at: created.updated_at, node_count: 0, edge_count: 0 });
   await loadOutlineSandbox(created.id);
+}
+async function forkConflictedSandbox() {
+  if (!currentSandbox || !sandboxUnsaved) return;
+  await sandboxSaveQueue.wait();
+  if (!currentSandbox || !sandboxUnsaved) return;
+  const source = currentSandbox;
+  try {
+    const created = await api(`/api/works/${currentWorkId}/sandboxes`, { body: {
+      name: `${source.name}（未合并修改）`, data: JSON.parse(JSON.stringify(sandboxData())),
+    } });
+    clearTimeout(sandboxSaveTimer);
+    sandboxSaveTimer = null;
+    sandboxList.unshift({ id: created.id, name: created.name, updated_at: created.updated_at,
+      node_count: created.data.nodes.length, edge_count: created.data.edges.length });
+    currentSandbox = created;
+    sandboxUnsaved = false;
+    $("sandboxConflictCopyBtn")?.classList.add("hidden");
+    if ($("sandboxSaveStatus")) $("sandboxSaveStatus").textContent = "已另存副本";
+    renderSandboxList(); renderOutlineSandbox();
+    showToast("当前修改已另存为新沙盘，原沙盘未被覆盖", "ok");
+  } catch (e) { showToast("另存副本失败：" + e.message, "err"); }
 }
 async function renameOutlineSandbox(sid) {
   const row = sandboxList.find(item => item.id === sid); if (!row) return;
   const name = await askCard({ title: "重命名沙盘", input: "沙盘名称", def: row.name, okText: "保存" });
   if (!name || name === row.name) return;
   try {
-    const saved = await api(`/api/sandboxes/${sid}`, { method: "PUT", body: { name } });
-    row.name = saved.name;
-    if (currentSandbox?.id === sid) currentSandbox.name = saved.name;
+    if (currentSandbox?.id === sid && !await flushSandboxSave()) throw new Error("沙盘内容尚未保存");
+    const saved = await api(`/api/sandboxes/${sid}`, { method: "PUT", body: {
+      name, expected_updated_at: currentSandbox?.id === sid ? currentSandbox.updated_at : row.updated_at,
+    } });
+    row.name = saved.name; row.updated_at = saved.updated_at;
+    if (currentSandbox?.id === sid) { currentSandbox.name = saved.name; currentSandbox.updated_at = saved.updated_at; }
     renderSandboxList(); showToast("沙盘已重命名", "ok");
   } catch (e) { showToast("重命名失败：" + e.message, "err"); }
 }
@@ -1633,14 +1681,23 @@ async function deleteOutlineSandbox(sid) {
   const row = sandboxList.find(item => item.id === sid); if (!row) return;
   if (!await askCard({ title: `删除“${row.name}”？`, msg: "该沙盘中的情节推演会被删除，不影响已经采纳的正文章节。", okText: "删除", danger: true })) return;
   try {
+    if (currentSandbox?.id === sid) {
+      clearTimeout(sandboxSaveTimer);
+      sandboxSaveTimer = null;
+      await sandboxSaveQueue.wait();
+    }
     await api(`/api/sandboxes/${sid}`, { method: "DELETE" });
     sandboxList = sandboxList.filter(item => item.id !== sid);
     if (currentSandbox?.id === sid) {
-      currentSandbox = null; selectedSandboxNodeId = null;
+      currentSandbox = null; selectedSandboxNodeId = null; sandboxUnsaved = false;
       if (sandboxList.length) await loadOutlineSandbox(sandboxList[0].id);
       else {
         currentSandbox = await api(`/api/works/${currentWorkId}/sandboxes`, { body: { name: "主线推演", data: { nodes: [], edges: [] } } });
-        sandboxList = [{ id: currentSandbox.id, name: currentSandbox.name, node_count: 0, edge_count: 0 }];
+        sandboxUnsaved = false;
+        $("sandboxConflictCopyBtn")?.classList.add("hidden");
+        sandboxList = [{ id: currentSandbox.id, name: currentSandbox.name,
+          updated_at: currentSandbox.updated_at, node_count: 0, edge_count: 0 }];
+        selectedSandboxNodeId = null;
         renderOutlineSandbox(); renderSandboxInspector();
       }
     }
@@ -1649,22 +1706,62 @@ async function deleteOutlineSandbox(sid) {
 }
 function scheduleSandboxSave() {
   clearTimeout(sandboxSaveTimer);
+  sandboxEditVersion++;
+  sandboxUnsaved = true;
+  if ($("sandboxSaveStatus")) $("sandboxSaveStatus").textContent = "等待同步";
   sandboxSaveTimer = setTimeout(() => saveOutlineSandbox(false), 900);
 }
 async function saveOutlineSandbox(feedback = true) {
-  if (!currentSandbox) return;
+  if (!currentSandbox) return null;
   clearTimeout(sandboxSaveTimer);
+  sandboxSaveTimer = null;
+  const source = currentSandbox;
+  const editVersion = sandboxEditVersion;
+  const payload = { name: source.name, data: JSON.parse(JSON.stringify(sandboxData())) };
   const button = $("sandboxSaveBtn");
+  if ($("sandboxSaveStatus")) $("sandboxSaveStatus").textContent = "正在同步";
   if (feedback) busy(button, true, "保存中");
-  try {
-    const saved = await api(`/api/sandboxes/${currentSandbox.id}`, { method: "PUT", body: { name: currentSandbox.name, data: sandboxData() } });
-    currentSandbox = saved;
-    const row = sandboxList.find(item => item.id === saved.id);
-    if (row) Object.assign(row, { name: saved.name, node_count: saved.data.nodes.length, edge_count: saved.data.edges.length });
-    renderSandboxList();
-    if (feedback) showToast("沙盘已保存", "ok");
-  } catch (e) { if (feedback) showToast("沙盘保存失败：" + e.message, "err"); }
-  finally { if (feedback) busy(button, false, "保存"); }
+  return sandboxSaveQueue.run(async () => {
+    try {
+      const expectedUpdatedAt = currentSandbox?.id === source.id ? currentSandbox.updated_at : source.updated_at;
+      const saved = await api(`/api/sandboxes/${source.id}`, { method: "PUT", body: {
+        ...payload, expected_updated_at: expectedUpdatedAt,
+      } });
+      const row = sandboxList.find(item => item.id === saved.id);
+      if (row) Object.assign(row, { name: saved.name, updated_at: saved.updated_at,
+        node_count: saved.data.nodes.length, edge_count: saved.data.edges.length });
+      if (currentSandbox?.id === saved.id) {
+        currentSandbox.updated_at = saved.updated_at;
+        if (sandboxEditVersion === editVersion && currentSandbox.name === payload.name) {
+          currentSandbox = saved;
+          sandboxUnsaved = false;
+          $("sandboxConflictCopyBtn")?.classList.add("hidden");
+          if ($("sandboxSaveStatus")) $("sandboxSaveStatus").textContent = "已自动保存";
+        } else if (!sandboxSaveTimer) scheduleSandboxSave();
+      }
+      renderSandboxList();
+      if (feedback) showToast("沙盘已保存", "ok");
+      return saved;
+    } catch (e) {
+      if (currentSandbox?.id === source.id) sandboxUnsaved = true;
+      if (currentSandbox?.id === source.id && $("sandboxSaveStatus")) {
+        $("sandboxSaveStatus").textContent = e.status === 409 ? "版本冲突" : "同步失败";
+        $("sandboxConflictCopyBtn")?.classList.toggle("hidden", e.status !== 409);
+      }
+      if (feedback || e.status === 409) showToast("沙盘保存失败：" + e.message, "err");
+      return null;
+    } finally { if (feedback) busy(button, false, "保存"); }
+  });
+}
+async function flushSandboxSave() {
+  if (!currentSandbox) return true;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await sandboxSaveQueue.wait();
+    if (!sandboxUnsaved) return true;
+    if (!await saveOutlineSandbox(false)) return false;
+    if (!sandboxUnsaved) return true;
+  }
+  return false;
 }
 function sandboxKindLabel(kind) {
   return ({ volume: "卷", chapter: "章", plot: "情节", choice: "选择", ending: "结局" })[kind] || "情节";
@@ -1693,6 +1790,10 @@ function sandboxHiddenNodeIds() {
 function renderOutlineSandbox() {
   if (!currentSandbox) return;
   const data = sandboxData(), nodesHost = $("sandboxNodes"), edgeHost = $("sandboxEdges"), world = $("sandboxWorld");
+  if (!data.nodes.some(node => node.id === selectedSandboxNodeId)) {
+    selectedSandboxNodeId = data.nodes[0]?.id || null;
+    sandboxAiCandidates = [];
+  }
   const hidden = sandboxHiddenNodeIds();
   const visibleNodes = data.nodes.filter(node => !hidden.has(node.id));
   const parents = new Set(data.edges.map(edge => edge.from));
@@ -1718,6 +1819,7 @@ function renderOutlineSandbox() {
     button.addEventListener("click", event => { event.stopPropagation(); toggleSandboxCollapse(button.dataset.collapseNode); });
   });
   renderSandboxEdges();
+  renderSandboxInspector();
 }
 function renderSandboxEdges() {
   if (!currentSandbox) return;
@@ -1740,6 +1842,17 @@ function selectSandboxNode(nodeId) {
   selectedSandboxNodeId = nodeId; sandboxAiCandidates = [];
   $("sandboxNodes").querySelectorAll(".sandbox-node").forEach(el => el.classList.toggle("selected", el.dataset.nodeId === nodeId));
   renderSandboxInspector();
+}
+function selectFirstSandboxNode() {
+  const node = currentSandbox && sandboxData().nodes[0];
+  if (node) selectSandboxNode(node.id);
+  else addSandboxRoot();
+}
+function focusSandboxAi() {
+  selectFirstSandboxNode();
+  const section = $("sandboxAiSection");
+  section?.scrollIntoView({ behavior: "smooth", block: "start" });
+  setTimeout(() => $("sandboxAiInstruction")?.focus(), 220);
 }
 function selectedSandboxNode() { return sandboxData().nodes.find(node => node.id === selectedSandboxNodeId); }
 function renderSandboxInspector() {
@@ -1805,9 +1918,10 @@ function addSandboxBranch(candidate = null) {
 async function deleteSelectedSandboxNode() {
   const node = selectedSandboxNode(); if (!node) return;
   if (!await askCard({ title: `删除“${node.title || "未命名节点"}”？`, msg: "只删除这个节点；它的子节点会保留为新的起点。", okText: "删除", danger: true })) return;
+  const nextNode = sandboxData().nodes.find(item => item.id !== node.id);
   sandboxData().nodes = sandboxData().nodes.filter(item => item.id !== node.id);
   sandboxData().edges = sandboxData().edges.filter(edge => edge.from !== node.id && edge.to !== node.id);
-  selectedSandboxNodeId = null; renderOutlineSandbox(); renderSandboxInspector(); scheduleSandboxSave();
+  selectedSandboxNodeId = nextNode?.id || null; renderOutlineSandbox(); scheduleSandboxSave();
 }
 function syncSandboxChapters(feedback = true) {
   if (!currentSandbox) return;
@@ -1874,13 +1988,16 @@ document.addEventListener("pointerup", event => {
   sandboxDrag = null; scheduleSandboxSave();
 });
 async function expandSandboxNode() {
-  const node = selectedSandboxNode(); if (!node) return;
+  let node = selectedSandboxNode();
+  if (!node) { selectFirstSandboxNode(); node = selectedSandboxNode(); }
+  if (!node) { showToast("请先新建一个推演起点", "err"); return; }
   const button = $("sandboxAiBtn"); busy(button, true, "展开中");
   try {
+    if (!await flushSandboxSave()) throw new Error("沙盘尚未保存，请检查网络后重试");
     const result = await api(`/api/sandboxes/${currentSandbox.id}/expand`, { body: { node_id: node.id, instruction: $("sandboxAiInstruction").value.trim() } });
     sandboxAiCandidates = result.candidates || []; renderSandboxCandidates();
   } catch (e) { showToast(e.message, "err"); }
-  finally { busy(button, false, "AI 展开三个候选"); }
+  finally { busy(button, false, "生成 3 条候选路线"); applyIcons(); }
 }
 function renderSandboxCandidates() {
   const host = $("sandboxCandidates"); if (!host) return;
@@ -1931,20 +2048,21 @@ async function exportSandboxTree(rootId = null) {
 async function adoptSandboxNode() {
   const node = selectedSandboxNode(); if (!node) return;
   try {
+    if (!await flushSandboxSave()) throw new Error("沙盘尚未保存，请检查网络后重试");
     const mode = $("sandboxAdoptMode").value;
     const result = await api(`/api/sandboxes/${currentSandbox.id}/nodes/${encodeURIComponent(node.id)}/adopt`, { body: {
       mode, target_plan_id: node.plan_node_id || null,
     }});
-    node.plan_node_id = result.plan?.id || node.plan_node_id;
-    if (result.chapter?.id) { node.chapter_id = result.chapter.id; node.kind = "chapter"; await loadChapters(); }
-    await saveOutlineSandbox(false); renderOutlineSandbox(); renderSandboxInspector();
+    if (result.chapter?.id) await loadChapters();
+    await loadOutlineSandbox(currentSandbox.id);
+    selectSandboxNode(node.id);
     showToast(result.chapter ? "已采纳为正式规划并创建章节" : "已采纳为正式剧情规划", "ok");
   } catch (e) { showToast(e.message, "err"); }
 }
 async function openSandboxPlan() {
   const node = selectedSandboxNode(); if (!node?.plan_node_id) return;
   const planId = node.plan_node_id;
-  await closeOutlineSandbox();
+  if (!await closeOutlineSandbox()) return;
   if (!$("app").classList.contains("production-open")) await openProductionCanvas();
   await setProductionSection("plan");
   inspectStoryPlan(planId);
@@ -1952,7 +2070,8 @@ async function openSandboxPlan() {
 async function openSandboxChapter() {
   const node = selectedSandboxNode(); if (!node?.chapter_id) return;
   const chapterId = node.chapter_id;
-  await closeOutlineSandbox(); await selectChapter(chapterId);
+  if (!await closeOutlineSandbox()) return;
+  await selectChapter(chapterId);
 }
 
 /* ---------- 拆书引擎 ---------- */
@@ -2804,7 +2923,8 @@ async function applyAgentResult(r, selection, baseMessages = null) {
     await loadAgentSessions(false);
   }
   if (r.compacted) showToast("已按上下文预算压缩早期对话", "ok");
-  let contentChanged = false, sidebarDirty = false, entitiesDirty = false, productionDirty = false;
+  let contentChanged = false, sidebarDirty = false, entitiesDirty = false, productionDirty = false, sandboxDirty = false;
+  let sandboxChangedId = null;
   const changedChapterIds = new Set();
   for (const m of resultMessages) {
     if (m.role === "tool") {
@@ -2813,6 +2933,10 @@ async function applyAgentResult(r, selection, baseMessages = null) {
       if (rr.sidebar_dirty) sidebarDirty = true;
       if (rr.entities_dirty) entitiesDirty = true;
       if (rr.production_dirty) productionDirty = true;
+      if (rr.sandbox_dirty) {
+        sandboxDirty = true;
+        if (Number.isInteger(rr.sandbox_id)) sandboxChangedId = rr.sandbox_id;
+      }
       if (rr.changed && Number.isInteger(rr.chapter_id)) changedChapterIds.add(rr.chapter_id);
     }
   }
@@ -2826,6 +2950,12 @@ async function applyAgentResult(r, selection, baseMessages = null) {
   }
   if ((productionDirty || r.production_analysis) && $("app").classList.contains("production-open")) {
     await (productionMode === "chapter" ? loadProductionChapter() : loadProductionOverview());
+  }
+  if (sandboxDirty && !$("outlineOverlay").classList.contains("hidden")) {
+    sandboxList = await api(`/api/works/${currentWorkId}/sandboxes`, { method: "GET" });
+    const targetId = sandboxChangedId || currentSandbox?.id || sandboxList[0]?.id;
+    if (targetId) await loadOutlineSandbox(targetId);
+    else renderSandboxList();
   }
   await notifyStoryUpdates(r);
   if (!$('characterStateOverlay').classList.contains('hidden') && characterStateChapterId === currentChapterId) {
@@ -2860,9 +2990,12 @@ async function sendAgent() {
     try { selection = await refreshCanvasAgentTarget(selection); }
     catch (e) { showToast(e.message, "err"); return; }
   }
-  el.value = "";
   // 先把正文框里未保存的手动编辑落库，避免 AI 基于旧正文操作、回显时覆盖手打内容
   if (!await flushEditorSave()) return;
+  if (currentSandbox && !$("outlineOverlay").classList.contains("hidden") && !await flushSandboxSave()) {
+    showToast("沙盘尚未保存，请检查网络后重试", "err"); return;
+  }
+  el.value = "";
   agentMsgs.push({ role: "user", content: text, temporary: conversationMode === "temporary" });
   agentBusy = true;
   agentReplyDraft = "";
@@ -5495,9 +5628,14 @@ function storyPlanForm(item) {
       ${item.id ? `<button onclick="showStoryPlanVersions(${item.id})">版本历史</button>` : ""}
     </details>
     ${storyPlanRealizationHtml(item)}
-    <div class="production-inspector-actions">
+    <div class="production-inspector-actions story-plan-actions">
       <button onclick="saveStoryPlanFromInspector()">${item.id ? "保存" : "创建规划"}</button>
-      ${item.id ? `<button onclick="handoffStoryPlanToAI(${item.id})">交给 AI</button><button onclick="openSandboxFromStoryPlan(${item.id})">从这里推演</button>${item.node_type === "chapter" ? `<button onclick="openOrCreatePlanChapter(${item.id})">${item.chapter_id ? "打开正文" : "创建对应章节"}</button>` : ""}<button onclick="newStoryPlanNode(${item.id})">新建子计划</button>${item.status === "abandoned" ? `<button onclick="restoreStoryPlanBranch(${item.id})">恢复分支</button>` : `<button onclick="setStoryPlanStatus(${item.id},'${item.status === "committed" ? "planned" : "committed"}')">${item.status === "committed" ? "改回规划中" : "确定采用"}</button><button class="danger-link" onclick="abandonStoryPlan(${item.id})">放弃此规划</button>`}` : '<button onclick="closeProductionInspector({discard:true})">取消</button>'}
+      ${item.id ? `<button onclick="handoffStoryPlanToAI(${item.id})">交给 AI</button><button onclick="openSandboxFromStoryPlan(${item.id})">从这里推演</button>
+      <details class="story-plan-action-menu"><summary aria-label="更多规划操作" title="更多规划操作">${svg("more")}</summary><div class="story-plan-action-list">
+        ${item.node_type === "chapter" ? `<button onclick="openOrCreatePlanChapter(${item.id})">${item.chapter_id ? "打开正文" : "创建对应章节"}</button>` : ""}
+        <button onclick="newStoryPlanNode(${item.id})">新建子计划</button>
+        ${item.status === "abandoned" ? `<button onclick="restoreStoryPlanBranch(${item.id})">恢复分支</button>` : `<button onclick="setStoryPlanStatus(${item.id},'${item.status === "committed" ? "planned" : "committed"}')">${item.status === "committed" ? "改回规划中" : "确定采用"}</button><button class="danger-link" onclick="abandonStoryPlan(${item.id})">放弃此规划</button>`}
+      </div></details>` : '<button onclick="closeProductionInspector({discard:true})">取消</button>'}
     </div>
   </div>`;
 }
@@ -5627,6 +5765,7 @@ async function openSandboxFromStoryPlan(planId) {
     if (!saved) return;
   }
   try {
+    if (currentSandbox && !await flushSandboxSave()) throw new Error("当前沙盘尚未保存，暂不能切换");
     const plan = await api(`/api/story-plan/${planId}`, { method: "GET" });
     if (plan.source_sandbox_id) {
       $("outlineOverlay").classList.remove("hidden");
@@ -5645,6 +5784,8 @@ async function openSandboxFromStoryPlan(planId) {
       context_chapter_id: chapter ? (previous?.id || null) : (storyPlanLocateChapterId || null),
       plan_node_id: plan.id, x: 220, y: 160 }], edges: [] };
     currentSandbox = await api(`/api/works/${currentWorkId}/sandboxes`, { body: { name: `从《${plan.title}》推演`, data } });
+    sandboxUnsaved = false;
+    $("sandboxConflictCopyBtn")?.classList.add("hidden");
     sandboxList = await api(`/api/works/${currentWorkId}/sandboxes`, { method: "GET" });
     selectedSandboxNodeId = id;
     $("outlineOverlay").classList.remove("hidden");
@@ -6326,8 +6467,19 @@ async function closeProductionInspector(options = {}) {
     productionAutoClosedResources = false;
   }
   productionSelected = null;
+  syncProductionInspectorHeaderActions();
   if (productionSection === "plan") renderStoryPlan(); else renderProductionResources();
   return true;
+}
+
+function syncProductionInspectorHeaderActions() {
+  const button = $("productionInspectorDeleteBtn");
+  if (!button) return;
+  const item = productionSelected?.item;
+  const type = productionSelected?.type;
+  const deletable = !!item?.id && ["card", "scene"].includes(type);
+  button.classList.toggle("hidden", !deletable);
+  if (deletable) button.title = type === "card" ? "删除当前设定" : "删除当前场景";
 }
 
 function openProductionInspector(title, meta, html) {
@@ -6337,8 +6489,17 @@ function openProductionInspector(title, meta, html) {
   $("productionInspectorBody").scrollTop = 0;
   $("productionWorkspace").classList.add("inspector-open");
   adjustProductionInspectorLayout();
+  syncProductionInspectorHeaderActions();
   if (productionSelected?.type === "story_plan") restoreStoryPlanDraft(); else restoreProductionInspectorDraft();
   applyIcons();
+}
+
+async function deleteProductionSelection() {
+  const type = productionSelected?.type;
+  const id = productionSelected?.item?.id;
+  if (!id) return;
+  if (type === "card") await archiveProductionCard(id);
+  else if (type === "scene") await deleteProductionScene(id);
 }
 
 function productionChapterSelectOptions(value) {
@@ -6406,7 +6567,7 @@ function inspectProductionCard(cardId, point = "after") {
       </div>
       <label>初始读者侧状态<textarea id="productionCardReaderState">${esc(item.reader_state || "")}</textarea></label>
       ${stateSection}
-      <div class="production-inspector-actions"><button onclick="saveProductionCardFromInspector()">保存设定卡</button><button onclick="handoffProductionObjectToAI('card',${item.id})">交给 AI</button><button class="danger-link" onclick="archiveProductionCard(${item.id})">归档</button></div>
+      <div class="production-inspector-actions"><button onclick="saveProductionCardFromInspector()">保存设定卡</button><button onclick="handoffProductionObjectToAI('card',${item.id})">交给 AI</button><button class="danger-link" onclick="archiveProductionCard(${item.id})">删除</button></div>
     </div>`);
 }
 
@@ -6532,7 +6693,9 @@ async function saveProductionCardStateFromInspector() {
 }
 
 async function archiveProductionCard(cardId) {
-  const ok = await askCard({ title: "归档设定卡", msg: "归档后不会再进入后续写作上下文，历史状态仍保留。", okText: "归档", danger: true });
+  const item = productionSelected?.item;
+  const label = productionCategoryLabels[item?.category] || "设定";
+  const ok = await askCard({ title: `删除${label}“${item?.name || "未命名"}”？`, msg: "删除后将从设定库移除，也不会再进入后续写作上下文；已有章节的历史状态仍会保留。", okText: "删除", danger: true });
   if (!ok) return;
   const selection = productionSelected;
   const draftKeys = [productionDraftKey(selection, "base"), productionDraftKey(selection, "state")];
@@ -6541,7 +6704,7 @@ async function archiveProductionCard(cardId) {
     await api(`/api/production/cards/${cardId}`, { method: "DELETE" });
     draftKeys.forEach(clearProductionInspectorDraft);
     await (productionMode === "chapter" ? loadProductionChapter() : loadProductionOverview());
-    showToast("设定卡已归档", "ok");
+    showToast(`${label}已删除`, "ok");
   } catch (e) { showToast(e.message, "err"); }
 }
 

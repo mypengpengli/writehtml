@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=story-plan-20260924a">
+  <link rel="stylesheet" href="style.css?v=story-plan-20260924g">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -252,7 +252,10 @@
         <aside id="productionInspector" class="production-inspector" aria-label="画布对象详情">
           <div class="production-pane-head">
             <div><b id="productionInspectorTitle">详情</b><small id="productionInspectorMeta"></small></div>
-            <button class="ic" data-ic="x" onclick="closeProductionInspector()" title="关闭详情"></button>
+            <span class="production-pane-head-actions">
+              <button id="productionInspectorDeleteBtn" class="ic danger-lite hidden" data-ic="trash" onclick="deleteProductionSelection()" title="删除当前对象"></button>
+              <button class="ic" data-ic="x" onclick="closeProductionInspector()" title="关闭详情"></button>
+            </span>
           </div>
           <div id="productionInspectorBody" class="production-inspector-body"></div>
         </aside>
@@ -634,14 +637,17 @@
   <div id="outlineOverlay" class="overlay sandbox-overlay hidden">
     <div class="sandbox-shell">
       <div class="overlay-head sandbox-head">
-        <span>可视化大纲 · 情节分支沙盘</span>
+        <span><b>剧情推演沙盘</b><small id="sandboxSaveStatus">自动保存</small></span>
         <span class="overlay-head-actions">
+          <button class="ic" data-ic="bot" data-label="AI 助手" onclick="toggleAISide()"></button>
           <button class="ic" onclick="syncSandboxChapters()">同步章节</button>
           <button class="ic" onclick="addSandboxRoot()">新增根节点</button>
           <button class="ic" onclick="addSandboxBranch()">添加分支</button>
+          <button class="ic sandbox-ai-head-btn" data-ic="sparkles" data-label="AI 推演" onclick="focusSandboxAi()"></button>
           <button class="ic" onclick="autoLayoutSandbox()">整理布局</button>
           <button class="ic" onclick="exportSandboxTree()">导出整树</button>
           <button id="sandboxSaveBtn" onclick="saveOutlineSandbox()">保存</button>
+          <button id="sandboxConflictCopyBtn" class="ic hidden" data-ic="copy" onclick="forkConflictedSandbox()" title="将当前修改另存为新沙盘"></button>
           <button class="ic" data-ic="x" onclick="closeOutlineSandbox()" title="关闭"></button>
         </span>
       </div>
@@ -658,11 +664,24 @@
           </div>
         </main>
         <aside class="sandbox-inspector">
-          <div id="sandboxEmptyInspector" class="empty">选择一个节点后编辑或展开分支</div>
+          <div id="sandboxEmptyInspector" class="sandbox-empty-inspector">
+            <b>从一个情节点开始</b>
+            <p>选择画布节点即可编辑；也可以先建立起点，再让 AI 生成三条候选路线。</p>
+            <div class="set-actions">
+              <button onclick="selectFirstSandboxNode()">选择已有节点</button>
+              <button class="ic" onclick="addSandboxRoot()">新建起点</button>
+            </div>
+          </div>
           <div id="sandboxNodeInspector" class="sandbox-node-form hidden">
             <div class="sandbox-panel-title"><b>节点详情</b><span id="sandboxNodeBadge"></span></div>
             <label>标题<input id="sandboxNodeTitle" maxlength="160" oninput="updateSelectedSandboxNode()"></label>
-            <label>摘要<textarea id="sandboxNodeSummary" rows="7" maxlength="4000" oninput="updateSelectedSandboxNode()"></textarea></label>
+            <label>这里会发生什么<textarea id="sandboxNodeSummary" rows="6" maxlength="4000" oninput="updateSelectedSandboxNode()" placeholder="写清事件、冲突、选择和预期结果"></textarea></label>
+            <section id="sandboxAiSection" class="sandbox-ai-section">
+              <div class="sandbox-ai-title"><b>AI 推演</b><small>生成候选，不改正文</small></div>
+              <label>本次要求<textarea id="sandboxAiInstruction" rows="3" maxlength="1000" placeholder="例如：三条路线都不要让反派立刻现身；至少一条路线制造朋友之间的误会"></textarea></label>
+              <button id="sandboxAiBtn" data-ic="sparkles" data-label="生成 3 条候选路线" onclick="expandSandboxNode()"></button>
+              <div id="sandboxCandidates" class="sandbox-candidates"></div>
+            </section>
             <label>层级<select id="sandboxNodeKind" onchange="updateSelectedSandboxNode()"><option value="volume">卷</option><option value="chapter">章</option><option value="plot">情节点</option><option value="choice">选择</option><option value="ending">结局</option></select></label>
             <label>走向<select id="sandboxNodeDirection" onchange="updateSelectedSandboxNode()"><option value="">未指定</option><option value="推进">推进 · 绿色</option><option value="发散">发散 · 橙色</option><option value="收束">收束 · 青色</option><option value="主线">主线 · 蓝色</option></select></label>
             <label>推演时点<select id="sandboxNodeContextChapter" onchange="updateSelectedSandboxNode()"></select></label>
@@ -675,10 +694,6 @@
               <button class="ic" onclick="exportSandboxTree(selectedSandboxNodeId)">导出此分支</button>
               <button class="ic danger-lite" onclick="deleteSelectedSandboxNode()">删除节点</button>
             </div>
-            <hr class="sep">
-            <label>AI 展开要求<input id="sandboxAiInstruction" maxlength="1000" placeholder="例如：三条路线都不要让反派立刻现身"></label>
-            <button id="sandboxAiBtn" onclick="expandSandboxNode()">AI 展开三个候选</button>
-            <div id="sandboxCandidates" class="sandbox-candidates"></div>
           </div>
         </aside>
       </div>
@@ -1105,6 +1120,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=story-plan-20260924a"></script>
+  <script src="app.js?v=story-plan-20260924g"></script>
 </body>
 </html>

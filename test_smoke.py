@@ -632,6 +632,15 @@ ok(len(_sandbox_saved["data"]["nodes"]) == 2 and _sandbox_saved["data"]["nodes"]
    and _sandbox_saved["data"]["nodes"][1]["direction"] == "主线"
    and len(c.get(f"/api/works/{wid}/sandboxes", headers=H(tokA)).json()) == 1,
    "沙盘节点、折叠状态、语义走向与分支连线可持久保存")
+_sandbox_cas = c.put(f"/api/sandboxes/{_sandbox['id']}", json={
+    "name": "主线推演", "expected_updated_at": _sandbox_saved["updated_at"],
+}, headers=H(tokA)).json()
+_sandbox_stale = c.put(f"/api/sandboxes/{_sandbox['id']}", json={
+    "name": "不应覆盖", "expected_updated_at": _sandbox_saved["updated_at"],
+}, headers=H(tokA))
+ok(_sandbox_cas["updated_at"] > _sandbox_saved["updated_at"] and _sandbox_stale.status_code == 409
+   and db.get_story_sandbox(_sandbox["id"], uidA)["name"] == "主线推演",
+   "沙盘旧版本保存返回冲突，不覆盖 AI 或其他标签页的新内容")
 ok(c.get(f"/api/sandboxes/{_sandbox['id']}", headers=H(tokB)).status_code == 404,
    "其他用户无法读取情节沙盘")
 _orig_sandbox_chat = llm.chat
@@ -2172,8 +2181,52 @@ _adopt_child = c.post(f"/api/sandboxes/{_parent_sandbox['id']}/nodes/child/adopt
 ok(_adopt_child["plan"]["parent_id"] == _plan_book["id"],
    "采纳子候选保留沙盘中已关联的正式父规划")
 ok({"list_story_plan", "read_story_plan", "save_story_plan", "set_story_plan_status",
-    "get_writing_plan_context", "review_story_plan_realization", "adopt_sandbox_node"}.issubset(_agent_tool_names),
-   "Agent 暴露剧情规划、上下文、实现核对与沙盘采纳工具")
+    "get_writing_plan_context", "review_story_plan_realization", "list_story_sandboxes", "create_story_sandbox",
+    "read_story_sandbox", "save_sandbox_node", "delete_sandbox_node", "adopt_sandbox_node"}.issubset(_agent_tool_names),
+   "Agent 暴露剧情规划、上下文、实现核对与完整沙盘操作工具")
+_agent_sandboxes = _call_agent_tool("list_story_sandboxes", {})
+ok(any(item["id"] == _sandbox["id"] for item in _agent_sandboxes["sandboxes"]),
+   "Agent 可列出当前作品的剧情推演沙盘")
+_agent_new_sandbox = _call_agent_tool("create_story_sandbox", {"name": "如果拒绝合作"})
+ok(_agent_new_sandbox.get("sandbox_dirty") and _agent_new_sandbox["sandbox"]["nodes"] == []
+   and db.get_story_sandbox(_agent_new_sandbox["sandbox_id"], uidA)["name"] == "如果拒绝合作",
+   "Agent 可为当前作品新建空沙盘，再写入候选节点")
+_agent_sandbox = _call_agent_tool("read_story_sandbox", {"sandbox_id": _sandbox["id"]})
+ok(any(item["id"] == "branch-a" for item in _agent_sandbox["sandbox"]["nodes"]),
+   "Agent 可读取沙盘节点与连线")
+_agent_branch = _call_agent_tool("save_sandbox_node", {
+    "sandbox_id": _sandbox["id"], "parent_node_id": "chapter-root",
+    "title": "AI 候选路线", "summary": "先调查来信来源", "kind": "choice", "direction": "发散",
+})
+_agent_branch_id = _agent_branch["node"]["id"]
+ok(_agent_branch.get("sandbox_dirty") and any(
+    item["id"] == _agent_branch_id for item in db.get_story_sandbox(_sandbox["id"], uidA)["data"]["nodes"]
+), "Agent 可在沙盘中创建候选分支")
+_agent_branch_updated = _call_agent_tool("save_sandbox_node", {
+    "sandbox_id": _sandbox["id"], "node_id": _agent_branch_id,
+    "title": "AI 候选路线（修订）", "summary": "先核对证词再调查来信", "direction": "推进",
+})
+ok(_agent_branch_updated["node"]["title"] == "AI 候选路线（修订）"
+   and _agent_branch_updated["node"]["direction"] == "推进",
+   "Agent 可更新已有沙盘节点")
+_agent_branch_deleted = _call_agent_tool("delete_sandbox_node", {
+    "sandbox_id": _sandbox["id"], "node_id": _agent_branch_id,
+})
+ok(_agent_branch_deleted.get("sandbox_dirty") and not any(
+    item["id"] == _agent_branch_id for item in db.get_story_sandbox(_sandbox["id"], uidA)["data"]["nodes"]
+), "Agent 可按明确要求删除沙盘候选节点且立即持久化")
+_other_work_sandbox = c.post(f"/api/works/{_reference_work_id}/sandboxes", json={
+    "name": "隔离沙盘", "data": {"nodes": [{"id": "other-root", "title": "不可跨作品修改", "kind": "plot"}], "edges": []},
+}, headers=H(tokA)).json()
+for _tool_name, _args in (
+    ("read_story_sandbox", {"sandbox_id": _other_work_sandbox["id"]}),
+    ("save_sandbox_node", {"sandbox_id": _other_work_sandbox["id"], "node_id": "other-root", "title": "越界修改"}),
+    ("delete_sandbox_node", {"sandbox_id": _other_work_sandbox["id"], "node_id": "other-root"}),
+    ("adopt_sandbox_node", {"sandbox_id": _other_work_sandbox["id"], "node_id": "other-root"}),
+):
+    ok(bool(_call_agent_tool(_tool_name, _args).get("error")), f"Agent {_tool_name} 不跨当前作品操作沙盘")
+ok(db.get_story_sandbox(_other_work_sandbox["id"], uidA)["data"]["nodes"][0]["title"] == "不可跨作品修改",
+   "跨作品调用未改动沙盘节点")
 
 # 删除
 ok(c.delete(f"/api/chapters/{cid}", headers=H(tokA)).status_code == 200, "删章节")

@@ -2471,21 +2471,28 @@ def create_story_sandbox(wid, user_id, name="主线推演", data=None):
         return _sandbox_payload(row)
 
 
-def update_story_sandbox(sid, user_id, name=None, data=None):
-    now = time.time()
+def update_story_sandbox(sid, user_id, name=None, data=None, expected_updated_at=None):
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT s.id FROM story_sandboxes s JOIN works w ON w.id=s.work_id "
+            "SELECT s.id,s.updated_at FROM story_sandboxes s JOIN works w ON w.id=s.work_id "
             "WHERE s.id=? AND w.user_id=?", (sid, user_id),
         ).fetchone()
         if not row:
             return None
+        now = max(time.time(), row["updated_at"] + 0.000001)
         clean_name = None if name is None else (" ".join((name or "").split())[:80] or "未命名沙盘")
         raw = None if data is None else json.dumps(data, ensure_ascii=False)
-        conn.execute(
-            "UPDATE story_sandboxes SET name=COALESCE(?,name),data_json=COALESCE(?,data_json),updated_at=? WHERE id=?",
-            (clean_name, raw, now, sid),
+        expected_clause = " AND updated_at=?" if expected_updated_at is not None else ""
+        params = (clean_name, raw, now, sid)
+        if expected_updated_at is not None:
+            params += (expected_updated_at,)
+        updated = conn.execute(
+            "UPDATE story_sandboxes SET name=COALESCE(?,name),data_json=COALESCE(?,data_json),updated_at=? "
+            "WHERE id=?" + expected_clause,
+            params,
         )
+        if not updated.rowcount:
+            return {"conflict": True}
         result = conn.execute(
             "SELECT id,work_id,name,data_json,created_at,updated_at FROM story_sandboxes WHERE id=?", (sid,),
         ).fetchone()
