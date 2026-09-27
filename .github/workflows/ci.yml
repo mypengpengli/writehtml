@@ -23,7 +23,7 @@ jobs:
       - run: npm ci --prefix pi_runtime --ignore-scripts
       - name: Syntax checks
         run: |
-          python -m py_compile main.py db.py materials.py context_builder.py config.py
+          python -m py_compile main.py db.py materials.py context_builder.py config.py writing_guidance.py builtin_skills.py
           node --check static/app.js
           node --check pi_runtime/bridge.mjs
           bash -n deploy.sh
@@ -34,4 +34,5 @@ jobs:
           python test_web_search.py
           python test_smoke.py
           python test_story_plan_scale.py
+          python test_writing_guidance.py
           python test_pi_runtime.py

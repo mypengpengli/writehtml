@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=story-plan-20260924g">
+  <link rel="stylesheet" href="style.css?v=writing-director-20260927">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -178,6 +178,7 @@
           <button class="ic" data-ic="x" onclick="closeProductionCanvas()" title="关闭画布"></button>
         </div>
       </header>
+      <div id="writingGuideFlow" class="writing-guide-flow hidden" aria-label="创作进度"></div>
       <div id="productionSettingsBar" class="production-settings-bar hidden">
         <label><input id="productionEvidenceEnabled" type="checkbox" onchange="saveProductionSettings()"> 保存 AI 分析证据</label>
         <label><input id="productionAutoAnalyze" type="checkbox" onchange="saveProductionSettings()"> 离开未分析章节时提醒</label>
@@ -210,7 +211,7 @@
           <div class="production-pane-head">
             <div><b>规划结构</b><small id="storyPlanCount">0 项</small></div>
             <span>
-              <button class="ic" data-ic="plus" onclick="newStoryPlanNode()" title="新建规划节点"></button>
+              <button id="storyPlanTreeNewBtn" class="ic" data-ic="plus" onclick="newStoryPlanNode()" title="新建规划节点"></button>
               <button class="ic" data-ic="x" onclick="toggleProductionResources(false)" title="收起规划结构"></button>
             </span>
           </div>
@@ -294,6 +295,7 @@
       <button id="agentSummaryBar" class="agent-summary-bar hidden" onclick="openAgentSessions()" title="查看已压缩的早期对话摘要">
         <span data-ic="archive"></span><span>早期对话已压缩</span><span data-ic="chevR"></span>
       </button>
+      <div id="writingGuideCard" class="writing-guide-card hidden" aria-live="polite"></div>
       <div id="agentMsgs" class="chat-msgs"></div>
       <div id="agentSelection" class="agent-selection hidden">
         <div class="agent-selection-head">
@@ -757,6 +759,14 @@
     </div>
   </div>
 
+  <!-- 按需写作体检 -->
+  <div id="writingQualityOverlay" class="overlay hidden" role="dialog" aria-modal="true" aria-label="写作体检">
+    <div class="overlay-card writing-quality-dialog">
+      <div class="overlay-head"><span id="writingQualityTitle">写作体检</span><button class="ic" data-ic="x" onclick="closeWritingQualityReview()" title="关闭体检"></button></div>
+      <div id="writingQualityBody" class="writing-quality-body"></div>
+    </div>
+  </div>
+
   <!-- 实体卡片 wiki -->
   <div id="wikiOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
@@ -1120,6 +1130,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=story-plan-20260924g"></script>
+  <script src="app.js?v=writing-director-20260927"></script>
 </body>
 </html>

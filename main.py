@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-import config, context_builder, db, image_generation, inspiration, llm, materials, pi_agent, skill_runtime, tavily_search
+import config, context_builder, db, image_generation, inspiration, llm, materials, pi_agent, skill_runtime, tavily_search, writing_guidance
 
 app = FastAPI(title="写作")
 db.init_db()
@@ -746,6 +746,7 @@ def _story_plan_error(result):
             "invalid_scope_end_chapter_id": "范围结束章节无效", "invalid_ord": "排序值无效",
             "invalid_order": "移动方向无效",
             "invalid_revision": "版本号无效", "invalid_version": "历史版本不存在",
+            "invalid_status_transition": "请使用放弃或恢复分支操作更改废案状态",
             "invalid_chapter": "关联章节不存在", "conflict": "规划已在其他位置更新，请刷新后重试",
             "invalid_range": "写作范围缺失或章节顺序无效",
             "invalid_evidence": "AI 核对必须引用当前正文中的原文证据",
@@ -765,6 +766,127 @@ async def list_story_plan(wid: int, request: Request):
     if result is None:
         raise HTTPException(404, "作品不存在")
     return result
+
+
+@app.get("/api/chapters/{cid}/story-plans")
+async def list_chapter_story_plans(cid: int, request: Request):
+    result = db.list_chapter_story_plans(cid, _auth(request))
+    if result is None:
+        raise HTTPException(404, "章节不存在")
+    return result
+
+
+@app.get("/api/works/{wid}/writing-guidance")
+async def get_writing_guidance(wid: int, request: Request):
+    try:
+        chapter_id = int(request.query_params["chapter_id"]) if request.query_params.get("chapter_id") else None
+        result = writing_guidance.build_writing_guidance(
+            _auth(request), wid, chapter_id, request.query_params.get("intent") or "general",
+        )
+    except ValueError:
+        raise HTTPException(400, "写作引导参数无效")
+    if result is None:
+        raise HTTPException(404, "作品或章节不存在")
+    return result
+
+
+def _run_writing_quality_review(uid, kind, item_id, model=None):
+    if kind == "chapter":
+        item = db.get_chapter_meta(item_id, uid)
+        if not item:
+            raise HTTPException(404, "章节不存在")
+        source = (item.get("content") or "").strip()
+        if not source:
+            raise HTTPException(400, "本章还没有正文")
+        excerpted = len(source) > 18000
+        if excerpted:
+            source = source[:9000] + "\n[中间正文未送审]\n" + source[-9000:]
+        title = item["title"]
+        fields = ["开头吸引力", "剧情推进", "人物", "对话", "冲突张力", "节奏", "悬念", "语言"]
+        source_version = item.get("content_revision")
+    else:
+        item = db.get_story_plan_node(item_id, uid)
+        if not item:
+            raise HTTPException(404, "规划不存在")
+        if item["status"] == "abandoned":
+            raise HTTPException(400, "废案不参与规划体检")
+        title = item["title"]
+        descendants = []
+        all_plans = db.list_story_plan_nodes(item["work_id"], uid) or []
+        by_parent = {}
+        for plan in all_plans:
+            by_parent.setdefault(plan["parent_id"], []).append(plan)
+        queue = list(by_parent.get(item_id, []))
+        while queue and len(descendants) < 60:
+            child = queue.pop(0)
+            descendants.append({key: child.get(key) for key in
+                ("node_type", "title", "summary", "goal", "conflict", "expected_outcome")})
+            queue.extend(by_parent.get(child["id"], []))
+        current = {key: (item.get(key) or "")[:1500] for key in
+            ("node_type", "title", "summary", "goal", "conflict", "expected_outcome", "detail")}
+        current["detail"] = (item.get("detail") or "")[:8000]
+        source_data = {"current": current, "descendants": descendants}
+        source = json.dumps(source_data, ensure_ascii=False)
+        while len(source) > 20000 and descendants:
+            descendants.pop()
+            source = json.dumps(source_data, ensure_ascii=False)
+        fields = ["主角目标", "动机", "因果链", "冲突升级", "风险递增", "人物选择", "伏笔回收", "支线关联", "高潮铺垫"]
+        source_version = item.get("revision")
+        excerpted = False
+    settings = db.get_settings(uid) or {}
+    api_key = settings.get("llm_api_key") or config.LLM_API_KEY
+    if not api_key:
+        raise HTTPException(400, "请先配置文字模型 API Key")
+    prompt = {
+        "task": "对作者主动提交的正文进行文学层面的体检" if kind == "chapter" else "对作者主动提交的故事规划进行结构体检",
+        "title": title, "source": source, "dimensions": fields,
+        "author_guidance": ((db.get_work(item["work_id"], uid) or {}).get("notes") or "")[:3000],
+        "output": {"summary": "简短整体判断", "dimensions": [{
+            "name": "指定维度之一", "score": "0-10 的整数", "evidence": "输入中的具体依据；缺资料时说明未提供",
+            "suggestion": "可执行建议；没有必要改动时可留空",
+        }]},
+        "rules": ["只返回 JSON 对象", "不强加特定文风、篇幅或题材", "不把主观偏好说成事实错误",
+                  "分数仅表示本轮主观参考，证据不足时不要编造情节", "不执行修改"],
+    }
+    try:
+        parsed = _parse_json_from_model(llm.chat([
+            {"role": "system", "content": "你是尊重作者意图的小说编辑。只依据给出的文本和规划评价，不虚构证据。输出 JSON。"},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ], base_url=settings.get("llm_base_url") or config.LLM_BASE_URL,
+            api_key=api_key, model=model or settings.get("llm_model") or config.LLM_MODEL))
+    except Exception as exc:
+        raise HTTPException(502, "体检失败：" + _provider_error(exc))
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("dimensions"), list):
+        raise HTTPException(502, "模型没有返回有效体检结果")
+    rows = []
+    seen = set()
+    for row in parsed["dimensions"]:
+        if not isinstance(row, dict) or row.get("name") not in fields or row["name"] in seen:
+            continue
+        try:
+            score = round(float(row.get("score")))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        seen.add(row["name"])
+        rows.append({"name": row["name"], "score": min(10, max(0, score)),
+                     "evidence": str(row.get("evidence") or "")[:700],
+                     "suggestion": str(row.get("suggestion") or "")[:700]})
+    if not rows:
+        raise HTTPException(502, "模型没有返回可用的评价维度")
+    return {"kind": kind, "item_id": item_id, "title": title, "source_version": source_version,
+            "excerpted": excerpted, "summary": str(parsed.get("summary") or "")[:1000], "dimensions": rows}
+
+
+@app.post("/api/chapters/{cid}/writing-quality-review")
+async def review_chapter_writing_quality(cid: int, request: Request):
+    body = await request.json()
+    return await asyncio.to_thread(_run_writing_quality_review, _auth(request), "chapter", cid, body.get("model"))
+
+
+@app.post("/api/story-plan/{plan_id}/quality-review")
+async def review_story_plan_quality(plan_id: int, request: Request):
+    body = await request.json()
+    return await asyncio.to_thread(_run_writing_quality_review, _auth(request), "plan", plan_id, body.get("model"))
 
 
 @app.post("/api/works/{wid}/story-plan")
@@ -3393,18 +3515,30 @@ AGENT_TOOLS = [
             "title": {"type": "string"}, "summary": {"type": "string"}, "detail": {"type": "string"},
             "goal": {"type": "string"}, "conflict": {"type": "string"},
             "expected_outcome": {"type": "string"}, "context_summary": {"type": "string"},
-            "status": {"type": "string", "enum": ["planned","committed","abandoned"]},
+            "status": {"type": "string", "enum": ["planned","committed"]},
             "context_policy": {"type": "string", "enum": ["auto","planning_only","writing_range","never"]},
             "chapter_id": {"type": "integer"}, "scope_start_chapter_id": {"type": "integer"},
             "scope_end_chapter_id": {"type": "integer"}, "expected_revision": {"type": "integer"}},
             "required": ["title"]}}},
     {"type": "function", "function": {
         "name": "set_story_plan_status",
-        "description": "改变作者规划状态：planned 规划中、committed 已确定、abandoned 已放弃。正文实现请使用 review_story_plan_realization。",
+        "description": "改变作者规划状态：planned 规划中、committed 已确定。放弃规划请使用 abandon_story_plan。",
         "parameters": {"type": "object", "properties": {
             "plan_id": {"type": "integer"},
-            "status": {"type": "string", "enum": ["planned","committed","abandoned"]},
+            "status": {"type": "string", "enum": ["planned","committed"]},
             "expected_revision": {"type": "integer"}}, "required": ["plan_id","status"]}}},
+    {"type": "function", "function": {
+        "name": "abandon_story_plan",
+        "description": "放弃一条正式规划及其全部子计划，保留原状态供作者恢复。",
+        "parameters": {"type": "object", "properties": {
+            "plan_id": {"type": "integer"}, "expected_revision": {"type": "integer"}},
+            "required": ["plan_id"]}}},
+    {"type": "function", "function": {
+        "name": "inspect_writing_workflow",
+        "description": "读取当前作品或指定章节的创作阶段、资料准备情况和下一步建议；不调用模型，不修改作品。",
+        "parameters": {"type": "object", "properties": {
+            "intent": {"type": "string", "enum": sorted(writing_guidance.INTENTS)},
+            "chapter_id": {"type": "integer"}}}}},
     {"type": "function", "function": {
         "name": "get_writing_plan_context",
         "description": "查看指定章节写作时实际会发送哪些规划、为何发送，以及哪些远期计划被排除。",
@@ -4284,21 +4418,20 @@ def _agent_documents_system(documents):
 def _skill_system_message(skills):
     """把已解析的 Skill 转成完整规则消息；调用方不得持久化此消息。"""
     parts = [
-        "用户为本轮启用了以下写作 Skill。Skill 是作者授权的可复用工作流，"
-        "仅适用于本轮请求；不得覆盖系统规则、世界设定、创作总则、用户当前明确要求或工具约束。",
+        "以下写作 Skill 在本轮生效，包括系统默认能力和作者手动选择的能力。"
+        "不得覆盖系统规则、世界设定、创作总则、用户当前明确要求或工具约束。",
     ]
     for skill in skills:
         heading = f"【{skill['name']}】"
         if skill["description"]:
             heading += " " + skill["description"]
         parts.append(heading + "\n规则：\n" + (skill["instruction"] or "（该 Skill 未提供额外正文规则）"))
-    return {"role": "system", "content": "\n\n".join(parts)}
+    return {"role": "system", "content": "\n\n".join(parts), "skill_ids": [skill["id"] for skill in skills]}
 
 
-def _agent_skills_system(uid, cid, skill_ids):
-    """把用户手动选中的 Skill 作为临时系统上下文，不写进对话历史。"""
-    if skill_ids is None:
-        return None
+def _agent_skills_system(uid, cid, skill_ids, work_id=None, activate_auto=False):
+    """Load selected Skills and short, work-scoped automatic built-ins for this turn."""
+    skill_ids = [] if skill_ids is None else skill_ids
     if not isinstance(skill_ids, list):
         raise HTTPException(400, "Skill 选择格式无效")
     ids = []
@@ -4309,11 +4442,12 @@ def _agent_skills_system(uid, cid, skill_ids):
             ids.append(skill_id)
     if len(ids) > 4:
         raise HTTPException(400, "一次最多启用 4 个 Skill")
-    if not ids:
-        return None
-
     chapter = db.get_chapter_meta(cid, uid) if cid else None
-    skills = db.get_agent_skills_for_turn(uid, chapter["work_id"] if chapter else None, ids)
+    scope_work_id = chapter["work_id"] if chapter else work_id
+    skills = db.get_agent_skills_for_turn(uid, scope_work_id, ids) if ids else []
+    if activate_auto and scope_work_id:
+        auto_skills = db.get_auto_agent_skills_for_turn(uid, scope_work_id)
+        skills = auto_skills + [skill for skill in skills if skill["id"] not in {item["id"] for item in auto_skills}]
     if not skills:
         return None
     if sum(len(s["name"]) + len(s["description"]) + len(s["instruction"]) for s in skills) > 12000:
@@ -4342,6 +4476,15 @@ def _agent_skill_catalog_system(uid, cid):
     }
 
 
+def _agent_guidance_system(uid, cid, work_id, instruction, guide_action=None):
+    intent = writing_guidance.infer_intent(instruction)
+    if not work_id or (not intent and not guide_action):
+        return None
+    guidance = writing_guidance.build_writing_guidance(uid, work_id, cid, intent or "general")
+    note = writing_guidance.guide_system_note(guidance, guide_action)
+    return {"role": "system", "content": note} if note else None
+
+
 def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instruction="",
                             session_id=None, use_history=True, work_id=None, documents=None):
     """把下一回合真正拼装的上下文以可审阅结构返回，不暴露 API Key。"""
@@ -4363,10 +4506,13 @@ def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instructio
         instruction=instruction, selection=selection, skill_ids=skill_ids, token_budget=18000,
     ) if chapter else {"context_items": [], "estimated_tokens": 0, "recalled_memory_ids": []}
     system_messages = [_agent_system(uid, cid, instruction=instruction, selection=selection, skill_ids=skill_ids)]
+    guidance_message = _agent_guidance_system(uid, cid, scope["work_id"], instruction)
+    if guidance_message:
+        system_messages.append(guidance_message)
     catalog = _agent_skill_catalog_system(uid, cid)
     if catalog:
         system_messages.append(catalog)
-    selected = _agent_skills_system(uid, cid, skill_ids)
+    selected = _agent_skills_system(uid, cid, skill_ids, scope["work_id"], True)
     if selected:
         system_messages.append(selected)
     selection_message = _agent_selection_system(uid, cid, selection)
@@ -5148,11 +5294,11 @@ def _tool_save_story_plan(uid, cid, cfg, args):
 def _tool_set_story_plan_status(uid, cid, cfg, args):
     plan_id = args.get("plan_id")
     status = args.get("status")
-    if not isinstance(plan_id, int) or isinstance(plan_id, bool) or status not in db.STORY_PLAN_STATUSES:
+    if not isinstance(plan_id, int) or isinstance(plan_id, bool) or status not in {"planned", "committed"}:
         return _agent_err("规划 id 或状态无效")
     current = db.get_story_plan_node(plan_id, uid)
     work_id = _tool_work_id(uid, cid, cfg)
-    if not current or (work_id and current.get("work_id") != work_id):
+    if not current or not work_id or current.get("work_id") != work_id:
         return _agent_err("规划不存在或不属于当前作品")
     result = db.update_story_plan_node(
         plan_id, uid, {"status": status}, expected_revision=args.get("expected_revision", current["revision"]),
@@ -5161,8 +5307,46 @@ def _tool_set_story_plan_status(uid, cid, cfg, args):
         return _agent_err("规划已被更新，请重新读取后再修改")
     if not result:
         return _agent_err("更新规划状态失败")
+    invalid = next((key for key in result if key.startswith("invalid_") and result.get(key)), None)
+    if invalid:
+        return _agent_err("规划状态不能这样修改，请按整条分支放弃或恢复")
     return {"changed": False, "production_dirty": True, "plan": _story_plan_tool_item(result),
             "summary": f"规划《{result['title']}》状态已更新为 {status}"}
+
+
+def _tool_abandon_story_plan(uid, cid, cfg, args):
+    plan_id = args.get("plan_id")
+    if not isinstance(plan_id, int) or isinstance(plan_id, bool):
+        return _agent_err("请提供规划 id")
+    current = db.get_story_plan_node(plan_id, uid)
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not current or not work_id or current["work_id"] != work_id:
+        return _agent_err("规划不存在或不属于当前作品")
+    result = db.archive_story_plan_branch(
+        plan_id, uid, expected_revision=args.get("expected_revision", current["revision"]),
+    )
+    if result and result.get("conflict"):
+        return _agent_err("规划已被更新，请重新读取后再修改")
+    if not result or result.get("invalid_revision"):
+        return _agent_err("放弃规划失败")
+    return {"changed": False, "production_dirty": True,
+            "summary": f"已放弃《{current['title']}》及其分支，共 {result['changed']} 条规划"}
+
+
+def _tool_inspect_writing_workflow(uid, cid, cfg, args):
+    work_id = _tool_work_id(uid, cid, cfg)
+    if not work_id:
+        return _agent_err("当前没有可用作品")
+    chapter_id = args.get("chapter_id", cid)
+    if chapter_id is not None and (not isinstance(chapter_id, int) or isinstance(chapter_id, bool)):
+        return _agent_err("章节 id 无效")
+    try:
+        result = writing_guidance.build_writing_guidance(uid, work_id, chapter_id, args.get("intent") or "general")
+    except ValueError:
+        return _agent_err("创作意图无效")
+    if result is None:
+        return _agent_err("作品或章节不存在")
+    return {"changed": False, "guidance": result, "summary": result["message"]}
 
 
 def _tool_get_writing_plan_context(uid, cid, cfg, args):
@@ -5578,6 +5762,8 @@ _AGENT_TOOLS = {
     "analyze_world_state": _tool_analyze_chapter_production,
     "list_story_plan": _tool_list_story_plan, "read_story_plan": _tool_read_story_plan,
     "save_story_plan": _tool_save_story_plan, "set_story_plan_status": _tool_set_story_plan_status,
+    "abandon_story_plan": _tool_abandon_story_plan,
+    "inspect_writing_workflow": _tool_inspect_writing_workflow,
     "get_writing_plan_context": _tool_get_writing_plan_context,
     "review_story_plan_realization": _tool_review_story_plan_realization,
     "list_story_sandboxes": _tool_list_story_sandboxes,
@@ -5740,20 +5926,21 @@ def _pi_recent_history(messages):
 
 
 def _pi_system_prompt(uid, cid, selection, skill_ids, runtime_system, summary, cfg,
-                      instruction="", documents=None):
+                      instruction="", documents=None, guide_action=None):
     system_messages = [_agent_system(uid, cid, instruction=instruction, selection=selection, skill_ids=skill_ids)]
+    guidance_message = _agent_guidance_system(uid, cid, cfg.get("work_id"), instruction, guide_action)
+    if guidance_message:
+        system_messages.append(guidance_message)
     if runtime_system:
         system_messages.append(runtime_system)
     skill_catalog = _agent_skill_catalog_system(uid, cid)
     if skill_catalog:
         system_messages.append(skill_catalog)
-    skill_msg = _agent_skills_system(uid, cid, skill_ids)
+    skill_msg = _agent_skills_system(uid, cid, skill_ids, cfg.get("work_id"), True)
     if skill_msg:
         system_messages.append(skill_msg)
         cfg["skill_instructions"] = skill_msg["content"]
-        cfg["active_skill_ids"] = {
-            skill_id for skill_id in skill_ids if isinstance(skill_id, int) and not isinstance(skill_id, bool)
-        }
+        cfg["active_skill_ids"] = set(skill_msg["skill_ids"])
     selection_msg = _agent_selection_system(uid, cid, selection)
     if selection_msg:
         system_messages.append(selection_msg)
@@ -5790,7 +5977,7 @@ def _history_before_persisted_input(messages, history_text, input_persisted):
 def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                   runtime_system=None, persist=True, session_id=None, work_id=None,
                   use_history=True, retain_history=True, on_event=None, documents=None,
-                  input_persisted=False):
+                  input_persisted=False, guide_action=None):
     """Run the writing agent through the official Pi Coding Agent process."""
     audio = None
     context_instruction = history_text
@@ -5836,7 +6023,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
     history = list(stored_history) if use_history else []
     system_prompt = _pi_system_prompt(
         uid, cid, selection, skill_ids, runtime_system, summary if use_history else "",
-        cfg, context_instruction, documents,
+        cfg, context_instruction, documents, guide_action,
     )
     pre_compacted = False
     context_usage = {
@@ -5855,7 +6042,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
                 stored_history = list(history)
                 system_prompt = _pi_system_prompt(
                     uid, cid, selection, skill_ids, runtime_system, summary,
-                    cfg, context_instruction, documents,
+                    cfg, context_instruction, documents, guide_action,
                 )
         except Exception:
             pass
@@ -5976,7 +6163,7 @@ def _run_pi_agent(uid, cid, history_text, selection=None, skill_ids=None, model_
 def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                runtime_system=None, persist=True, session_id=None, work_id=None,
                use_history=True, retain_history=True, on_event=None, documents=None,
-               input_persisted=False):
+               input_persisted=False, guide_action=None):
     """执行一轮 agent。
 
     history_text 是持久化到 SQLite 的安全文本；model_turn 可在本轮替换成音频等
@@ -6018,17 +6205,20 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
 
     # 发给模型的数组：系统提示 + 早期摘要(若有) + 当前对话
     system_messages = [_agent_system(uid, cid, instruction=history_text, selection=selection, skill_ids=skill_ids)]
+    guidance_message = _agent_guidance_system(uid, cid, work_id, history_text, guide_action)
+    if guidance_message:
+        system_messages.append(guidance_message)
     if runtime_system:
         system_messages.append(runtime_system)
     skill_catalog = _agent_skill_catalog_system(uid, cid)
     if skill_catalog:
         system_messages.append(skill_catalog)
-    skill_msg = _agent_skills_system(uid, cid, skill_ids)
+    skill_msg = _agent_skills_system(uid, cid, skill_ids, work_id, True)
     if skill_msg:
         system_messages.append(skill_msg)
         # 工具内会再次调用文本模型生成正文，必须带上同一组 Skill 规则。
         cfg["skill_instructions"] = skill_msg["content"]
-        cfg["active_skill_ids"] = set(skill_id for skill_id in skill_ids if isinstance(skill_id, int) and not isinstance(skill_id, bool))
+        cfg["active_skill_ids"] = set(skill_msg["skill_ids"])
     selection_msg = _agent_selection_system(uid, cid, selection)
     if selection_msg:
         system_messages.append(selection_msg)
@@ -6237,7 +6427,7 @@ def _apply_story_update_proposals(uid, state_requests):
 
 def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, model_turn=None,
                     session_id=None, work_id=None, use_history=True, retain_history=True,
-                    on_event=None, documents=None, input_persisted=False):
+                    on_event=None, documents=None, input_persisted=False, guide_action=None):
     """执行 Agent，并在启用本机运行时时先缓冲回答、等 after/recovery 确认。"""
     def emit(event):
         if not on_event:
@@ -6284,7 +6474,7 @@ def _run_agent_turn(uid, cid, history_text, selection=None, skill_ids=None, mode
             persist=turn is None, session_id=session_id, work_id=work_id,
             use_history=use_history, retain_history=retain_history,
             on_event=relay if on_event else None, documents=documents,
-            input_persisted=input_persisted,
+            input_persisted=input_persisted, guide_action=guide_action,
         )
     except skill_runtime.SkillRuntimeError as e:
         raise HTTPException(502, {"message": str(e), "turn_id": e.turn_id})
@@ -6385,6 +6575,12 @@ def _prepare_agent_turn(uid, body, title_hint, history_text=None):
     if not scope:
         raise HTTPException(404, "作品或章节不存在")
     work_id = scope["work_id"]
+    try:
+        guide_action = writing_guidance.validate_guide_action(
+            uid, work_id, cid, body.get("guide_action"),
+        )
+    except ValueError:
+        raise HTTPException(400, "写作引导操作已失效，请刷新后重试")
     mode = body.get("conversation_mode") or "standard"
     if mode not in {"standard", "ignore_history", "temporary"}:
         raise HTTPException(400, "会话上下文模式无效")
@@ -6419,6 +6615,7 @@ def _prepare_agent_turn(uid, body, title_hint, history_text=None):
         "chapter_id": cid, "work_id": work_id, "session_id": session_id,
         "use_history": use_history, "retain_history": retain_history,
         "conversation_mode": mode, "input_persisted": input_persisted,
+        "guide_action": guide_action,
     }
 
 
@@ -6441,6 +6638,7 @@ async def agent(request: Request):
                 session_id=turn["session_id"], work_id=turn["work_id"],
                 use_history=turn["use_history"], retain_history=turn["retain_history"],
                 documents=body.get("documents"), input_persisted=turn["input_persisted"],
+                guide_action=turn["guide_action"],
             ),
         )
     finally:
@@ -6525,6 +6723,7 @@ async def agent_stream(request: Request):
                 use_history=turn["use_history"], retain_history=turn["retain_history"],
                 on_event=publish, documents=body.get("documents"),
                 input_persisted=turn["input_persisted"],
+                guide_action=turn["guide_action"],
             ),
             scope_lock=scope_lock,
         )
@@ -6599,6 +6798,7 @@ async def agent_audio(request: Request):
                 session_id=turn["session_id"], work_id=turn["work_id"],
                 use_history=turn["use_history"], retain_history=turn["retain_history"],
                 documents=body.get("documents"), input_persisted=turn["input_persisted"],
+                guide_action=turn["guide_action"],
             ),
         )
         settings = db.get_settings(uid) or {}
@@ -6640,6 +6840,7 @@ async def agent_audio_stream(request: Request):
             use_history=turn["use_history"], retain_history=turn["retain_history"],
             on_event=publish, documents=body.get("documents"),
             input_persisted=turn["input_persisted"],
+            guide_action=turn["guide_action"],
         )
         settings = db.get_settings(uid) or {}
         result["voice"] = {

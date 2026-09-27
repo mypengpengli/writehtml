@@ -368,9 +368,13 @@ ok(c.post(
 _alice_builtin_skills = c.get("/api/agent/skills", headers=H(tokA)).json()
 _bob_builtin_skills = c.get("/api/agent/skills", headers=H(tokB)).json()
 novel_writer_skill = next((item for item in _alice_builtin_skills if item["name"] == "novel-writer"), None)
+director_skill = next((item for item in _alice_builtin_skills if item["name"] == "writing-director"), None)
 _bob_novel_writer = next((item for item in _bob_builtin_skills if item["name"] == "novel-writer"), None)
 ok(novel_writer_skill and novel_writer_skill["source_kind"] == "builtin" and novel_writer_skill["enabled"]
    and novel_writer_skill["resource_count"] == 12, "新账号默认拥有内置 novel-writer 和完整 references")
+ok(director_skill and director_skill["auto_activate"] and director_skill["enabled"]
+   and not novel_writer_skill["auto_activate"],
+   "写作导演默认启用，novel-writer 仍由用户按需选择")
 ok(_bob_novel_writer and _bob_novel_writer["id"] != novel_writer_skill["id"], "内置 Skill 按用户隔离")
 ok(c.put(f"/api/agent/skills/{novel_writer_skill['id']}", json={
     "name": "hack", "instruction": "hack", "work_id": None,
@@ -386,6 +390,9 @@ _builtin_turn = db.get_agent_skills_for_turn(uidA, wid, [novel_writer_skill["id"
 ok(_builtin_turn and "WriteHTML 运行适配" in _builtin_turn[0]["instruction"]
    and any(item["id"] == novel_writer_skill["id"] for item in db.list_agent_skill_catalog(uidA, wid)),
    "内置 novel-writer 会进入 Agent 可发现目录并能在本轮激活")
+ok(director_skill["id"] not in {item["id"] for item in db.list_agent_skill_catalog(uidA, wid)}
+   and director_skill["id"] in {item["id"] for item in db.get_auto_agent_skills_for_turn(uidA, wid)},
+   "默认 Skill 自动加载，不重复出现在手动激活目录")
 ok(c.post("/api/agent/skills", json={"name": "", "instruction": "规则"}, headers=H(tokA)).status_code == 400, "Skill 空名称 400")
 ok(c.post("/api/agent/skills", json={"name": "坏范围", "instruction": "规则", "work_id": "x"}, headers=H(tokA)).status_code == 400, "Skill 非法范围 400")
 global_skill = c.post("/api/agent/skills", json={
@@ -399,7 +406,7 @@ _skills = c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokA)).json()
 ok({novel_writer_skill["id"], global_skill["id"], work_skill["id"]}.issubset({x["id"] for x in _skills}),
    "Skill 列表含内置、通用和作品专用 Skill")
 ok({x["id"] for x in c.get("/api/agent/skills", headers=H(tokA)).json()}
-   == {novel_writer_skill["id"], global_skill["id"]}, "无作品时只列内置和用户通用 Skill")
+   == {novel_writer_skill["id"], director_skill["id"], global_skill["id"]}, "无作品时只列内置和用户通用 Skill")
 ok(c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokB)).status_code == 404, "bob 看 alice 作品 Skill 404")
 ok(c.put(f"/api/agent/skills/{global_skill['id']}", json={
     "name": "hack", "instruction": "hack", "work_id": None,
@@ -2103,16 +2110,69 @@ ok(any(item.get("source_id") == _plan_chapter["id"] for item in _after_edit_cont
 _branch_child = c.post(f"/api/works/{wid}/story-plan", json={
     "title": "分支子计划", "parent_id": _range_plan["id"],
 }, headers=H(tokA)).json()
+_branch_child2 = c.post(f"/api/works/{wid}/story-plan", json={
+    "title": "已确定的子计划", "parent_id": _range_plan["id"], "status": "committed",
+}, headers=H(tokA)).json()
+_branch_grandchild = c.post(f"/api/works/{wid}/story-plan", json={
+    "title": "孙计划", "parent_id": _branch_child2["id"],
+}, headers=H(tokA)).json()
+ok(c.put(f"/api/story-plan/{_range_plan['id']}", json={
+    "status": "abandoned", "expected_revision": _range_plan["revision"],
+}, headers=H(tokA)).status_code == 400, "普通保存不能只放弃父计划")
+ok(main._tool_set_story_plan_status(uidA, memory_c2, {"work_id": wid}, {
+    "plan_id": _range_plan["id"], "status": "abandoned",
+}).get("error"), "Agent 状态工具不能绕过分支放弃")
+ok(main._tool_save_story_plan(uidA, memory_c2, {"work_id": wid}, {
+    "plan_id": _range_plan["id"], "title": _range_plan["title"], "status": "abandoned",
+}).get("error"), "Agent 保存工具不能绕过分支放弃")
 _archived = c.delete(f"/api/story-plan/{_range_plan['id']}", headers=H(tokA)).json()
-ok(_archived["changed"] == 2 and all(item["id"] not in {_range_plan["id"], _branch_child["id"]}
+ok(_archived["changed"] == 4 and all(item["id"] not in {
+    _range_plan["id"], _branch_child["id"], _branch_child2["id"], _branch_grandchild["id"]}
     for item in c.get(f"/api/works/{wid}/story-plan", headers=H(tokA)).json()),
-   "放弃父计划时整个分支从默认规划列表消失")
+   "放弃父计划时全部子树从默认规划列表消失")
+ok(main._tool_set_story_plan_status(uidA, memory_c2, {"work_id": wid}, {
+    "plan_id": _branch_child2["id"], "status": "planned",
+}).get("error"), "Agent 对废案的状态修改会返回可理解的错误")
+ok(c.post(f"/api/story-plan/{_branch_child2['id']}/restore", json={
+    "revision": 1, "expected_revision": c.get(f"/api/story-plan/{_branch_child2['id']}", headers=H(tokA)).json()["revision"],
+}, headers=H(tokA)).json()["status"] == "abandoned", "历史版本不能单独恢复废案状态")
 _restored = c.post(f"/api/story-plan/{_range_plan['id']}/restore-branch", json={
     "expected_revision": _archived["plan"]["revision"],
 }, headers=H(tokA)).json()
-ok(_restored["changed"] == 2 and _restored["plan"]["status"] == "planned"
-   and c.get(f"/api/story-plan/{_branch_child['id']}", headers=H(tokA)).json()["status"] == "planned",
-   "恢复分支保留原计划与子节点")
+ok(_restored["changed"] == 4 and _restored["plan"]["status"] == "planned"
+   and c.get(f"/api/story-plan/{_branch_child['id']}", headers=H(tokA)).json()["status"] == "planned"
+   and c.get(f"/api/story-plan/{_branch_child2['id']}", headers=H(tokA)).json()["status"] == "committed"
+   and c.get(f"/api/story-plan/{_branch_grandchild['id']}", headers=H(tokA)).json()["status"] == "planned",
+   "恢复分支保留全部子节点各自的原状态")
+_agent_archived = main._tool_abandon_story_plan(uidA, memory_c2, {"work_id": wid}, {
+    "plan_id": _range_plan["id"],
+})
+ok(_agent_archived.get("production_dirty") and
+   all(c.get(f"/api/story-plan/{plan_id}", headers=H(tokA)).json()["status"] == "abandoned"
+       for plan_id in (_range_plan["id"], _branch_child["id"], _branch_child2["id"], _branch_grandchild["id"])),
+   "Agent 放弃父计划会归档全部子分支")
+_agent_restored = c.post(f"/api/story-plan/{_range_plan['id']}/restore-branch", json={
+    "expected_revision": c.get(f"/api/story-plan/{_range_plan['id']}", headers=H(tokA)).json()["revision"],
+}, headers=H(tokA)).json()
+ok(_agent_restored["changed"] == 4 and
+   c.get(f"/api/story-plan/{_branch_child2['id']}", headers=H(tokA)).json()["status"] == "committed",
+   "Agent 放弃后恢复仍保留子节点原状态")
+_chapter_plans = c.get(f"/api/chapters/{memory_c2}/story-plans", headers=H(tokA)).json()
+ok(_plan_chapter["id"] in {item["id"] for item in _chapter_plans}
+   and _plan_book["id"] not in {item["id"] for item in _chapter_plans}
+   and any(item["realizations"] for item in _chapter_plans if item["id"] == _plan_chapter["id"]),
+   "章节规划接口只返回直接关联规划及其实现记录")
+_bad_volume = c.post(f"/api/works/{wid}/story-plan", json={
+    "node_type": "volume", "title": "测试归属", "parent_id": _plan_book["id"], "chapter_id": memory_c2,
+}, headers=H(tokA)).json()
+ok(_bad_volume["chapter_id"] is None, "卷纲不会残留章节直接归属")
+_temporary_chapter_plan = c.post(f"/api/works/{wid}/story-plan", json={
+    "node_type": "chapter", "title": "临时章节规划", "chapter_id": memory_c2,
+}, headers=H(tokA)).json()
+_changed_type = c.put(f"/api/story-plan/{_temporary_chapter_plan['id']}", json={
+    "node_type": "scene", "expected_revision": _temporary_chapter_plan["revision"],
+}, headers=H(tokA)).json()
+ok(_changed_type["chapter_id"] is None, "章节计划改为场景计划时清空旧章节归属")
 _move = c.post(f"/api/story-plan/{_plan_chapter['id']}/move", json={
     "direction": "down", "expected_revision": _realized_after_edit["revision"],
 }, headers=H(tokA))

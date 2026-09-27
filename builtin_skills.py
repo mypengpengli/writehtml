@@ -24,14 +24,17 @@ def _parse_skill_markdown(path):
         raise RuntimeError(f"内置 Skill frontmatter 无法解析：{path}: {exc}") from exc
     name = metadata.get("name")
     description = metadata.get("description")
+    auto_activate = metadata.get("auto_activate", False)
     instruction = markdown[end + 5:].strip()
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name) or len(name) > 64:
         raise RuntimeError(f"内置 Skill name 无效：{path}")
     if not isinstance(description, str) or not description.strip() or len(description.strip()) > 1024:
         raise RuntimeError(f"内置 Skill description 无效：{path}")
+    if not isinstance(auto_activate, bool):
+        raise RuntimeError(f"内置 Skill auto_activate 必须是布尔值：{path}")
     if not instruction or len(instruction) > 8000:
         raise RuntimeError(f"内置 Skill 正文必须为 1-8000 字：{path}")
-    return markdown, name, description.strip(), instruction
+    return markdown, name, description.strip(), instruction, auto_activate
 
 
 def _load_resources(folder):
@@ -64,7 +67,7 @@ def load_builtin_skills():
         skill_path = folder / "SKILL.md"
         if not skill_path.is_file():
             continue
-        markdown, name, description, instruction = _parse_skill_markdown(skill_path)
+        markdown, name, description, instruction, auto_activate = _parse_skill_markdown(skill_path)
         if name in names:
             raise RuntimeError(f"内置 Skill name 重复：{name}")
         names.add(name)
@@ -73,6 +76,7 @@ def load_builtin_skills():
             "name": name,
             "description": description,
             "instruction": instruction,
+            "auto_activate": auto_activate,
             "source_markdown": markdown,
             "resources": _load_resources(folder),
         })

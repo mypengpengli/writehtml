@@ -16,7 +16,7 @@
 - **创作生产画布**：独立工作区正式拆成「世界设定 / 剧情规划 / 章节状态」。世界设定管理人物、规则、地点、技能、道具和组织；剧情规划管理总纲、卷纲、阶段、章节、场景、支线与伏笔；章节状态展示“章前状态 → 正文场景 → 变化 → 章后状态”。AI 助手仍共用右侧同一会话。查看对象不会擅自改变 AI 目标，只有点「交给 AI」才作为本轮引用。
 - **拆书引擎**：支持 TXT、Markdown、Word、可复制文字的 PDF 和 EPUB。先自动切章，再按“逐章精读 / 骨架优先”逐章提取摘要、人物、地点、物品、组织和关系；每章完成即保存，可暂停续跑、单章重试或停止并保留已有成果。完成后可点「提炼整本资料」，跨章生成语言指纹、人物说话习惯、描写技法，并把去专名后的桥段机制加入灵感库。
 - **统一创作资料中心**：故事记忆继续作为已确认事实；语言指纹、参考工程、长期文档和灵感只作为可选创作辅助。每本作品可选择是否使用各类资料、设置语言指纹强度，并挂载最多 5 个只读参考工程，分别选择借鉴文风、桥段或世界观。Agent 会明确这些参考不是本书正史，不能照搬人物、地名、事件和独特表达。
-- **AI Skills**：默认内置只读的 `novel-writer` 中文网络小说写作 Skill；也可在「⋯」→「AI Skills」创建规则，或上传标准 `SKILL.md` / ZIP Skill 包（支持按需读取 `references/` 文本）。上传包只保存文本规则与资料，不执行脚本。用户 Skill 可设为所有作品通用或当前作品专用；Agent 会先看到元数据，任务匹配时再加载完整 Skill。规则会同时传给文字、选区和直发语音请求，也会传给 Agent 后续的续写/改写工具，但不会存入聊天历史。
+- **AI Skills**：内置的 `writing-director` 在作品会话中自动启用，只负责判断创作阶段和提供可跳过的下一步建议，不强加题材、文风或篇幅。`novel-writer` 是可手动选择的具体写作技法 Skill，不会自动套用。也可在「⋯」→「AI Skills」创建规则，或上传标准 `SKILL.md` / ZIP Skill 包（支持按需读取 `references/` 文本）。上传包只保存文本规则与资料，不执行脚本。用户 Skill 可设为所有作品通用或当前作品专用；Agent 会先看到元数据，任务匹配时再加载完整 Skill。规则不会存入聊天历史。
 - **找回**：从历史版本把旧草稿找回成正文。
 - **AI 助手（agent）**：🤖 常驻右侧侧栏，用自然语言让 AI 直接动手——改某段文字、续写、回退到历史版本、改标题/备注、加章、摘要、设定校验。可在同一个会话中列出章节并按章节 ID 连续创建、读取和写入多章，没有“每次只能写一章”的产品限制。每个覆盖操作前自动存版本快照，跨章节撤销也会回退实际被改的章节。
 - **多会话与上下文控制**：每个章节可以新建、切换、重命名、归档和删除多组 AI 会话。默认「继续」会读取并保存当前会话；「无历史」本轮不把旧聊天发给模型，但会把本轮结果留在当前会话；「临时一问」既不读取也不保存聊天记录。
@@ -42,11 +42,19 @@
 - **认知与保密**：客观真相保存在稳定设定中；读者已知、角色认知或误解、保密要求和读者侧状态可随章节保存版本。查看或续写旧章节时只加载当时的信息边界，避免后期揭露倒灌并提前泄底。
 - **证据**：AI 派生的变化默认保存对应正文片段，可从画布跳回来源位置；可在画布设置中关闭证据展示。
 
+### 写作导演
+
+画布顶部有可点击的轻量流程导航；右侧 AI 助手在空会话时显示下一步建议，聊天开始后收成可展开的小提示条。它读取当前作品、章节、人物、Story Plan 和 World State 等数据库状态，计算的是**写前准备度**，不是小说质量分。没有总纲、章纲或人物卡也可以直接写，按钮会提供“让 AI 补充 / 自己去对应界面 / 直接写”等路径。
+
+“AI 帮我推演”会让同一个 Pi Agent 实际使用现有 Sandbox 工具保存候选分支；候选只有作者采纳后才进入正式 Story Plan。点击导演的 AI 按钮会随请求携带经过服务端校验的结构化意图，避免只靠按钮文字猜动作。AI 修改资料后，导演卡会重新读取真实状态，不在数据库中另存一份可能过期的引导快照。作者说“先写再说”时只作简短提醒，不强制完成流程。
+
+「正文体检」和规划详情里的「规划体检」是**按需**调用当前文字模型的主观评价，展示维度、证据和建议；不会自动改正文或规划。正文体检与原有连续性复核是两条独立路径：前者看叙事表达，后者检查事实冲突。长于 18,000 字符的正文体检只发送开头和结尾各约 9,000 字符，界面会提示中间内容未送审。
+
 ### 剧情规划与推演
 
 正式剧情规划采用 `总纲 / 卷或阶段 / 章节 / 场景` 层级，也可建立支线和伏笔节点。每条计划有独立版本、状态、章节范围和上下文策略：
 
-- 计划生命周期只有 `planned`（规划中）、`committed`（作者已确定）和 `abandoned`（已放弃）。正文是否实现另存为 `pending / partial / realized / deviated`，不会反过来改写计划生命周期。
+- 计划生命周期只有 `planned`（规划中）、`committed`（作者已确定）和 `abandoned`（已放弃）。放弃父计划会连同子分支一起归档，恢复时还原原状态；普通保存和 Agent 状态工具都不能绕过这一过程。正文是否实现另存为 `pending / partial / realized / deviated`，不会反过来改写计划生命周期。
 - `auto`：按当前章节自动选择；`planning_only`：只在规划与推演时发送；`writing_range`：只在指定章节范围内发送；`never`：不发送 AI。
 - 写作时只发送当前章节计划、上级卷段的压缩方向，以及必要时少量下一章目标。远期章节、结局、沙盘候选和废案不会默认进入上下文。
 - 所有计划都带有“作者计划 / 尚未发生”标签，不能作为人物知识、读者已知事实或已经发生的事件。`World State` 分析完全不读取 Story Plan。
@@ -67,7 +75,7 @@ AI 写入正文、执行章节复核，或作者主动点「分析本章」时�
 
 ### Agent 工具
 
-AI 助手可直接使用 `list_story_cards`、`save_story_card`、`save_story_card_state`、`list_chapter_scenes`、`save_chapter_scene`、`analyze_world_state` 和兼容别名 `analyze_chapter_production`。Story Plan 另有 `list_story_plan`、`read_story_plan`、`save_story_plan`、`set_story_plan_status`、`get_writing_plan_context`、`review_story_plan_realization`。沙盘提供 `list_story_sandboxes`、`create_story_sandbox`、`read_story_sandbox`、`save_sandbox_node`、`delete_sandbox_node` 与 `adopt_sandbox_node`，因此 AI 助手可以真正建立和编辑候选树，而不只是口头建议。画布和正文共用当前 AI 会话与模型；“上下文”面板会显示每条计划的召回原因、版本、时间范围，以及未发送计划的排除原因。
+AI 助手可直接使用 `list_story_cards`、`save_story_card`、`save_story_card_state`、`list_chapter_scenes`、`save_chapter_scene`、`analyze_world_state` 和兼容别名 `analyze_chapter_production`。Story Plan 另有 `list_story_plan`、`read_story_plan`、`save_story_plan`、`set_story_plan_status`、`abandon_story_plan`、`get_writing_plan_context`、`review_story_plan_realization`；`inspect_writing_workflow` 可重新读取当前写作引导。沙盘提供 `list_story_sandboxes`、`create_story_sandbox`、`read_story_sandbox`、`save_sandbox_node`、`delete_sandbox_node` 与 `adopt_sandbox_node`，因此 AI 助手可以真正建立和编辑候选树，而不只是口头建议。画布和正文共用当前 AI 会话与模型；“上下文”面板会显示每条计划的召回原因、版本、时间范围，以及未发送计划的排除原因。
 
 ## 部署（Docker，推荐）
 

@@ -49,11 +49,21 @@ with sync_playwright() as playwright:
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.goto(BASE, wait_until="domcontentloaded")
     page.evaluate("token => localStorage.setItem('token', token)", token)
-    page.reload(wait_until="domcontentloaded")
+    page.reload(wait_until="networkidle")
+    page.locator("#workTree .work").first.wait_for()
+    page.evaluate("wid => selectWork(wid)", work["id"])
+    page.wait_for_load_state("networkidle")
     page.locator("#productionToggleBtn").click()
     page.locator("#productionPlanBtn").click()
+    expect(page.locator("#writingGuideFlow")).to_be_visible(timeout=10000)
+    assert "hidden" not in page.locator("#writingGuideCard").get_attribute("class")
     page.locator(".story-plan-route-main").first.wait_for()
-    assert page.locator(".story-plan-route-row").count() == 4
+    expect(page.locator(".story-plan-route-row")).to_have_count(4)
+    page.locator("#storyPlanArchiveBtn").click()
+    expect(page.locator("#storyPlanTree")).to_contain_text("暂无废案")
+    assert page.locator("#storyPlanHealth").is_hidden()
+    page.locator("#storyPlanArchiveBtn").click()
+    expect(page.locator(".story-plan-route-row")).to_have_count(4)
     assert not page.locator("#legacyNotesBanner").count()
     before = page.evaluate("currentChapterId")
     page.locator("#productionPlanLocate").select_option(str(chapter2["id"]))
@@ -65,6 +75,17 @@ with sync_playwright() as playwright:
     expect(page.locator("#agentSelection")).to_be_visible(timeout=10000)
     assert page.locator("#storyPlanNewType option").count() == 8
     page.locator(".story-plan-route-main").filter(has_text="第二章计划").click()
+    page.route("**/api/story-plan/*/quality-review", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps({
+            "kind": "plan", "item_id": 1, "title": "第二章计划", "source_version": 1,
+            "excerpted": False, "summary": "目标清楚", "dimensions": [{
+                "name": "主角目标", "score": 8, "evidence": "追查来信来源", "suggestion": "补充风险",
+            }],
+        }, ensure_ascii=False),
+    ))
+    page.get_by_role("button", name="规划体检", exact=True).click()
+    expect(page.locator("#writingQualityOverlay")).to_contain_text("追查来信来源")
+    page.locator("#writingQualityOverlay button[title='关闭体检']").click()
     page.locator(".story-plan-advanced summary").click()
     page.get_by_role("button", name="预览写作上下文", exact=True).click()
     expect(page.locator("#storyPlanContextPreview")).to_contain_text("写作上下文已选入")
@@ -74,6 +95,8 @@ with sync_playwright() as playwright:
     page.screenshot(path=str(OUT / "writehtml-state-1440.png"), full_page=True)
     page.set_viewport_size({"width": 1024, "height": 768})
     page.wait_for_timeout(300)
+    panes = page.evaluate("({ canvas: document.querySelector('.production-workspace').getBoundingClientRect().toJSON(), ai: document.querySelector('#aiSide').getBoundingClientRect().toJSON() })")
+    assert panes["canvas"]["right"] <= panes["ai"]["left"] + 2, panes
     page.screenshot(path=str(OUT / "writehtml-state-1024.png"), full_page=True)
     page.set_viewport_size({"width": 390, "height": 844})
     page.locator("#aiSide .ai-head-tools button[title='收起']").click()
@@ -86,8 +109,15 @@ with sync_playwright() as playwright:
     dimensions = page.evaluate("({ viewport: innerWidth, body: document.body.scrollWidth, inspector: document.querySelector('#productionInspector').getBoundingClientRect().toJSON() })")
     assert dimensions["body"] <= dimensions["viewport"] + 2, dimensions
     assert dimensions["inspector"]["left"] >= -2 and dimensions["inspector"]["right"] <= dimensions["viewport"] + 2, dimensions
+    page.locator("#productionInspector button[title='关闭详情']").click()
+    page.evaluate("openProductionAI()")
+    expect(page.locator("#writingGuideCard")).to_be_visible()
+    guide = page.evaluate("({ width: innerWidth, side: document.querySelector('#aiSide').getBoundingClientRect().toJSON(), card: document.querySelector('#writingGuideCard').getBoundingClientRect().toJSON() })")
+    assert guide["side"]["left"] >= -2 and guide["side"]["right"] <= guide["width"] + 2, guide
+    assert guide["card"]["right"] <= guide["width"] + 2, guide
+    page.screenshot(path=str(OUT / "writehtml-guide-390.png"), full_page=True)
     assert not errors, errors
     print(json.dumps({"screenshots": [str(OUT / name) for name in (
-        "writehtml-plan-1440.png", "writehtml-state-1440.png", "writehtml-state-1024.png", "writehtml-plan-390.png",
+        "writehtml-plan-1440.png", "writehtml-state-1440.png", "writehtml-state-1024.png", "writehtml-plan-390.png", "writehtml-guide-390.png",
     )], "dimensions": dimensions}, ensure_ascii=False))
     browser.close()

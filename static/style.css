@@ -436,6 +436,55 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .chat-input-row { display: flex; gap: 6px; padding: 10px; border-top: 1px solid var(--line); align-items: flex-end; background: var(--panel); }
 .chat-input-row textarea { flex: 1; resize: none; font-family: inherit; font-size: 14px; }
 
+.writing-guide-card { flex: 0 0 auto; min-width: 0; max-height: 46vh; overflow-y: auto; padding: 13px 14px; border-bottom: 1px solid var(--line); background: var(--side-bg); font-size: 12px; }
+.writing-guide-card p { margin: 8px 0 11px; color: var(--muted); line-height: 1.55; }
+.writing-guide-title, .writing-guide-title > span, .writing-guide-compact { display: flex; align-items: center; gap: 7px; }
+.writing-guide-title { justify-content: space-between; }
+.writing-guide-title svg { width: 16px; height: 16px; color: var(--accent-text); }
+.writing-guide-title b { font-size: 13px; }
+.writing-guide-title small { color: var(--muted); }
+.writing-guide-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.writing-guide-actions button, .writing-guide-compact button { min-height: 31px; padding: 4px 8px; font-size: 11px; }
+.writing-guide-card .guide-primary, .writing-guide-flow .guide-primary { border-color: var(--accent-strong); background: var(--accent-strong); color: var(--on-accent); font-weight: 600; }
+.writing-guide-card details { margin-top: 13px; padding-top: 9px; border-top: 1px solid var(--line); }
+.writing-guide-card summary { color: var(--muted); cursor: pointer; }
+.writing-guide-card ul { margin: 8px 0 0; padding: 0; list-style: none; }
+.writing-guide-card li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; }
+.writing-guide-card li span { color: var(--muted); text-align: right; }
+.writing-quality-dialog { max-width: 640px; max-height: min(82vh, 820px); }
+.writing-quality-body { overflow-y: auto; padding: 12px 16px 18px; font-size: 13px; }
+.writing-quality-note { margin: 0 0 8px; color: var(--muted); font-size: 11px; }
+.writing-quality-summary { margin: 0 0 12px; line-height: 1.6; }
+.writing-quality-list section { padding: 10px 0; border-top: 1px solid var(--line); }
+.writing-quality-list section > div { display: flex; justify-content: space-between; gap: 8px; }
+.writing-quality-list strong { color: var(--accent-text); font-variant-numeric: tabular-nums; }
+.writing-quality-list p { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 8px; margin: 5px 0 0; overflow-wrap: anywhere; }
+.writing-quality-list p span { color: var(--muted); }
+.writing-guide-card.compact { padding: 6px 10px; max-height: 42vh; }
+.writing-guide-compact > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.writing-guide-compact .ic { min-width: 30px; min-height: 30px; padding: 5px; }
+.writing-guide-compact .ic svg { width: 15px; height: 15px; }
+.writing-guide-expanded { display: none; }
+.writing-guide-card.expanded .writing-guide-expanded { display: block; padding: 3px 0 5px; }
+.writing-guide-flow { display: flex; flex: 0 0 auto; min-width: 0; align-items: center; gap: 9px; padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); font-size: 11px; }
+.writing-guide-flow-label { flex: 0 0 auto; color: var(--muted); font-weight: 600; }
+.writing-guide-flow-steps { display: flex; min-width: 0; gap: 1px; overflow-x: auto; scrollbar-width: thin; }
+.writing-guide-flow-steps button { flex: 0 0 auto; padding: 3px 7px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--muted); font-size: 11px; }
+.writing-guide-flow-steps button.active { border-bottom-color: var(--accent); color: var(--accent-text); font-weight: 700; }
+.writing-guide-flow-steps button svg { display: inline-block; width: 12px; height: 12px; margin-right: 2px; vertical-align: -2px; color: var(--accent-text); }
+.writing-guide-flow-next { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); text-align: right; }
+.writing-guide-flow .guide-primary { flex: 0 0 auto; padding: 3px 8px; font-size: 11px; white-space: nowrap; }
+.production-empty.guide-empty { min-height: 170px; gap: 9px; font-size: 12px; }
+.guide-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+.guide-empty-actions button { font-size: 11px; }
+@media (max-width: 900px) { .writing-guide-flow-next { display: none; } .writing-guide-flow-steps { flex: 1; } }
+@media (max-width: 700px) {
+  .writing-guide-flow { gap: 5px; padding: 5px 7px; }
+  .writing-guide-flow-label { display: none; }
+  .writing-guide-flow-steps button { padding-inline: 6px; }
+  .writing-guide-card.compact { padding: 7px 10px; }
+}
+
 /* AI 助手常驻侧栏（替换原探讨弹窗） */
 .ai-side {
   display: none; flex-direction: column; flex-shrink: 0; width: 380px;
@@ -1442,6 +1491,7 @@ body.inspiration-open #askOverlay { z-index: 92; }
 .production-brand small { color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .production-view-switch { display: inline-flex; border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; }
 .production-view-switch button { min-width: 58px; border: 0; border-right: 1px solid var(--line); border-radius: 0; padding: 6px 10px; font-size: 12px; }
+.production-view-switch button { white-space: nowrap; }
 .production-view-switch button:last-child { border-right: 0; }
 .production-view-switch button.active { background: var(--side-bg); color: var(--accent-text); font-weight: 650; box-shadow: inset 0 -2px 0 var(--accent); }
 #productionChapterSelect, #productionPlanLocate { min-width: 150px; max-width: 230px; padding-block: 6px; font-size: 12px; }
@@ -1641,6 +1691,7 @@ body.inspiration-open #askOverlay { z-index: 92; }
 .production-canvas-viewport { width: 100%; height: 100%; overflow: auto; background-color: var(--editor-workspace); background-image: radial-gradient(var(--editor-edge) 1px, transparent 1px); background-size: 20px 20px; }
 .chapter-plan-summary { position: sticky; z-index: 5; top: 0; left: 0; width: min(100%, 1420px); padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .chapter-plan-summary-head { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.chapter-plan-summary-head { flex-wrap: wrap; }
 .chapter-plan-summary-head small { flex: 1; color: var(--muted); }
 .chapter-plan-summary-head button { padding: 3px 8px; font-size: 11px; }
 .chapter-plan-summary-list { display: flex; gap: 8px; overflow-x: auto; padding-top: 8px; }
@@ -1739,6 +1790,25 @@ body.inspiration-open #askOverlay { z-index: 92; }
 .production-diff-row { align-items: flex-start; }
 .production-diff-row strong { color: var(--ink); font-weight: 650; }
 .production-empty.compact { min-height: 64px; padding: 10px; }
+@media (min-width: 1101px) and (max-width: 1599px) {
+  #app.production-open.ai-open .production-workspace { margin-right: 380px; }
+}
+@media (min-width: 951px) and (max-width: 1100px) {
+  #app.production-open.ai-open .production-workspace { margin-right: 380px; }
+  #app.production-open.ai-open .production-head { overflow-x: auto; }
+  #app.production-open.ai-open .production-brand > div,
+  #app.production-open.ai-open .production-view-switch,
+  #app.production-open.ai-open .production-head-actions .ic-label,
+  #app.production-open.ai-open .production-edit-body .ic-label { display: none; }
+  #app.production-open.ai-open #productionChapterSelect,
+  #app.production-open.ai-open #productionPlanLocate { min-width: 128px; max-width: 148px; }
+}
+@media (min-width: 701px) and (max-width: 950px) {
+  #app.production-open.ai-open .ai-backdrop { display: block; position: fixed; inset: 0; z-index: 54; background: var(--scrim); }
+}
+@media (min-width: 1101px) and (max-width: 1399px) {
+  .production-inspector { position: absolute; z-index: 16; top: 0; right: 0; bottom: 0; box-shadow: var(--shadow); }
+}
 .production-category-character { --category-color: #4f795e; }
 .production-category-rule { --category-color: #9a7a2e; }
 .production-category-location { --category-color: #378384; }

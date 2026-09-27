@@ -1611,6 +1611,7 @@ def init_db():
         _add_col(conn, "agent_skills", "source_kind", "TEXT DEFAULT 'manual'")
         _add_col(conn, "agent_skills", "source_markdown", "TEXT DEFAULT ''")
         _add_col(conn, "agent_skills", "builtin_key", "TEXT DEFAULT ''")
+        _add_col(conn, "agent_skills", "auto_activate", "INTEGER DEFAULT 0")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_user_builtin "
             "ON agent_skills(user_id,builtin_key) WHERE builtin_key<>''"
@@ -2721,32 +2722,57 @@ def list_story_plan_nodes(wid, user_id, include_abandoned=False):
             "WHERE " + " AND ".join(clauses) + " ORDER BY COALESCE(n.parent_id,0),n.ord,n.id",
             params,
         ).fetchall()
-        if not rows:
-            return []
-        links_by_plan = {}
-        for link in conn.execute(
-            "SELECT l.* FROM story_plan_links l JOIN story_plan_nodes n ON n.id=l.plan_node_id "
-            "WHERE n.work_id=? AND n.deleted_at IS NULL ORDER BY l.id", (wid,),
-        ):
-            links_by_plan.setdefault(link["plan_node_id"], []).append(dict(link))
-        realizations_by_plan = {}
-        for realization in conn.execute(
-            "SELECT r.*,c.title AS chapter_title,c.ord AS chapter_ord,c.content_hash AS current_content_hash,"
-            "c.content_revision AS current_content_revision,n.revision AS current_plan_revision "
-            "FROM story_plan_realizations r JOIN story_plan_nodes n ON n.id=r.plan_node_id "
-            "JOIN chapters c ON c.id=r.chapter_id AND c.deleted_at IS NULL "
-            "WHERE n.work_id=? AND n.deleted_at IS NULL ORDER BY c.ord,r.id DESC", (wid,),
-        ):
-            realizations_by_plan.setdefault(realization["plan_node_id"], []).append(dict(realization))
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["links"] = links_by_plan.get(item["id"], [])
-            plan_hash = _story_plan_content_hash(conn, row, item["links"])
-            item["realizations"] = [_realization_payload(r, plan_hash)
-                                    for r in realizations_by_plan.get(item["id"], [])]
-            result.append(item)
-        return result
+        return _story_plan_rows_payload(conn, rows, wid)
+
+
+def list_chapter_story_plans(chapter_id, user_id):
+    with get_conn() as conn:
+        chapter = conn.execute(
+            "SELECT c.work_id FROM chapters c JOIN works w ON w.id=c.work_id "
+            "WHERE c.id=? AND c.deleted_at IS NULL AND w.user_id=?",
+            (chapter_id, user_id),
+        ).fetchone()
+        if not chapter:
+            return None
+        rows = conn.execute(
+            "SELECT n.*,c.title AS chapter_title,c.ord AS chapter_ord "
+            "FROM story_plan_nodes n LEFT JOIN chapters c ON c.id=n.chapter_id AND c.deleted_at IS NULL "
+            "WHERE n.work_id=? AND n.chapter_id=? AND n.status<>'abandoned' AND n.deleted_at IS NULL "
+            "ORDER BY n.ord,n.id",
+            (chapter["work_id"], chapter_id),
+        ).fetchall()
+        return _story_plan_rows_payload(conn, rows, chapter["work_id"], chapter_id=chapter_id)
+
+
+def _story_plan_rows_payload(conn, rows, wid, chapter_id=None):
+    if not rows:
+        return []
+    restriction = " AND n.chapter_id=? AND n.status<>'abandoned'" if chapter_id is not None else ""
+    params = (wid, chapter_id) if chapter_id is not None else (wid,)
+    links_by_plan = {}
+    for link in conn.execute(
+        "SELECT l.* FROM story_plan_links l JOIN story_plan_nodes n ON n.id=l.plan_node_id "
+        f"WHERE n.work_id=? AND n.deleted_at IS NULL{restriction} ORDER BY l.id", params,
+    ):
+        links_by_plan.setdefault(link["plan_node_id"], []).append(dict(link))
+    realizations_by_plan = {}
+    for realization in conn.execute(
+        "SELECT r.*,c.title AS chapter_title,c.ord AS chapter_ord,c.content_hash AS current_content_hash,"
+        "c.content_revision AS current_content_revision,n.revision AS current_plan_revision "
+        "FROM story_plan_realizations r JOIN story_plan_nodes n ON n.id=r.plan_node_id "
+        "JOIN chapters c ON c.id=r.chapter_id AND c.deleted_at IS NULL "
+        f"WHERE n.work_id=? AND n.deleted_at IS NULL{restriction} ORDER BY c.ord,r.id DESC", params,
+    ):
+        realizations_by_plan.setdefault(realization["plan_node_id"], []).append(dict(realization))
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["links"] = links_by_plan.get(item["id"], [])
+        plan_hash = _story_plan_content_hash(conn, row, item["links"])
+        item["realizations"] = [_realization_payload(r, plan_hash)
+                                for r in realizations_by_plan.get(item["id"], [])]
+        result.append(item)
+    return result
 
 
 def get_story_plan_node(plan_id, user_id):
@@ -2761,7 +2787,7 @@ def create_story_plan_node(wid, user_id, values):
     policy = (values.get("context_policy") or "auto").strip()
     if node_type not in STORY_PLAN_NODE_TYPES:
         return {"invalid_node_type": True}
-    if status not in STORY_PLAN_STATUSES:
+    if status not in STORY_PLAN_STATUSES or status == "abandoned":
         return {"invalid_status": True}
     if policy not in STORY_PLAN_CONTEXT_POLICIES:
         return {"invalid_context_policy": True}
@@ -2780,6 +2806,14 @@ def create_story_plan_node(wid, user_id, values):
                                 ("scope_start_chapter_id", start_id), ("scope_end_chapter_id", end_id)):
             if values.get(field) not in (None, "") and resolved is None:
                 return {f"invalid_{field}": True}
+        if node_type == "book":
+            parent_id = None
+        if node_type != "chapter":
+            chapter_id = None
+        if parent_id is not None:
+            parent = _story_plan_row(conn, parent_id, work_id=wid)
+            if parent and parent["status"] == "abandoned":
+                return {"invalid_parent_id": True}
         scope_error = _story_plan_scope_error(conn, wid, policy, start_id, end_id)
         if scope_error:
             return {scope_error: True}
@@ -2862,6 +2896,8 @@ def update_story_plan_node(plan_id, user_id, values, expected_revision=None):
                 value = (values.get(field) or "").strip()
                 if value not in allowed:
                     return {f"invalid_{field}": True}
+                if field == "status" and value != current["status"] and "abandoned" in {value, current["status"]}:
+                    return {"invalid_status_transition": True}
                 updates[field] = value
         for field, target_type in (
             ("parent_id", "plan_node"), ("chapter_id", "chapter"),
@@ -2874,6 +2910,16 @@ def update_story_plan_node(plan_id, user_id, values, expected_revision=None):
                 )
                 if raw not in (None, "") and updates[field] is None:
                     return {f"invalid_{field}": True}
+        node_type = updates.get("node_type", current["node_type"])
+        if node_type == "book":
+            updates["parent_id"] = None
+        if node_type != "chapter":
+            updates["chapter_id"] = None
+        parent_id = updates.get("parent_id", current["parent_id"])
+        if parent_id is not None:
+            parent = _story_plan_row(conn, parent_id, work_id=current["work_id"])
+            if parent and parent["status"] == "abandoned" and current["status"] != "abandoned":
+                return {"invalid_parent_id": True}
         if updates.get("parent_id") == plan_id:
             return {"invalid_parent_id": True}
         if "parent_id" in updates and updates["parent_id"] is not None:
@@ -2962,7 +3008,7 @@ def restore_story_plan_version(plan_id, user_id, revision, expected_revision=Non
         except Exception:
             snapshot = {}
     allowed = set(_STORY_PLAN_TEXT_LIMITS) | {
-        "node_type", "status", "context_policy", "parent_id", "chapter_id",
+        "node_type", "context_policy", "parent_id", "chapter_id",
         "scope_start_chapter_id", "scope_end_chapter_id", "ord", "links",
     }
     return update_story_plan_node(
@@ -6072,7 +6118,7 @@ def _sync_builtin_agent_skills(conn, user_id=None):
     for uid in user_ids:
         for package in packages:
             row = conn.execute(
-                "SELECT id,name,description,instruction,source_kind,source_markdown,enabled "
+                "SELECT id,name,description,instruction,source_kind,source_markdown,enabled,auto_activate "
                 "FROM agent_skills WHERE user_id=? AND builtin_key=?",
                 (uid, package["builtin_key"]),
             ).fetchone()
@@ -6083,6 +6129,7 @@ def _sync_builtin_agent_skills(conn, user_id=None):
                 row["source_kind"] != "builtin",
                 row["source_markdown"] != package["source_markdown"],
                 not row["enabled"],
+                bool(row["auto_activate"]) != package["auto_activate"],
             ))
             if row:
                 skill_id = row["id"]
@@ -6096,9 +6143,9 @@ def _sync_builtin_agent_skills(conn, user_id=None):
                 if changed:
                     conn.execute(
                         "UPDATE agent_skills SET work_id=NULL,name=?,description=?,instruction=?,source_kind='builtin',"
-                        "source_markdown=?,enabled=1,updated_at=? WHERE id=?",
+                        "source_markdown=?,enabled=1,auto_activate=?,updated_at=? WHERE id=?",
                         (package["name"], package["description"], package["instruction"],
-                         package["source_markdown"], now, skill_id),
+                         package["source_markdown"], int(package["auto_activate"]), now, skill_id),
                     )
                 if resources_changed:
                     conn.execute("DELETE FROM agent_skill_resources WHERE skill_id=?", (skill_id,))
@@ -6112,9 +6159,9 @@ def _sync_builtin_agent_skills(conn, user_id=None):
             else:
                 cur = conn.execute(
                     "INSERT INTO agent_skills(user_id,work_id,name,description,instruction,source_kind,"
-                    "source_markdown,builtin_key,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "source_markdown,builtin_key,enabled,auto_activate,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (uid, None, package["name"], package["description"], package["instruction"], "builtin",
-                     package["source_markdown"], package["builtin_key"], 1, now, now),
+                     package["source_markdown"], package["builtin_key"], 1, int(package["auto_activate"]), now, now),
                 )
                 for resource in package["resources"]:
                     conn.execute(
@@ -6137,7 +6184,7 @@ def list_agent_skills(user_id, work_id=None):
             return None
         if work_id is None:
             rows = conn.execute(
-                "SELECT s.id, s.user_id, s.work_id, s.name, s.description, s.instruction, s.source_kind, s.enabled, s.created_at, s.updated_at, "
+                "SELECT s.id, s.user_id, s.work_id, s.name, s.description, s.instruction, s.source_kind, s.enabled, s.auto_activate, s.created_at, s.updated_at, "
                 "(SELECT COUNT(*) FROM agent_skill_resources r WHERE r.skill_id=s.id) AS resource_count "
                 "FROM agent_skills s WHERE s.user_id=? AND s.work_id IS NULL "
                 "ORDER BY CASE WHEN s.source_kind='builtin' THEN 0 ELSE 1 END, s.updated_at DESC, s.id DESC",
@@ -6145,7 +6192,7 @@ def list_agent_skills(user_id, work_id=None):
             )
         else:
             rows = conn.execute(
-                "SELECT s.id, s.user_id, s.work_id, s.name, s.description, s.instruction, s.source_kind, s.enabled, s.created_at, s.updated_at, "
+                "SELECT s.id, s.user_id, s.work_id, s.name, s.description, s.instruction, s.source_kind, s.enabled, s.auto_activate, s.created_at, s.updated_at, "
                 "(SELECT COUNT(*) FROM agent_skill_resources r WHERE r.skill_id=s.id) AS resource_count "
                 "FROM agent_skills s WHERE s.user_id=? AND (s.work_id IS NULL OR s.work_id=?) "
                 "ORDER BY CASE WHEN s.source_kind='builtin' THEN 0 ELSE 1 END, "
@@ -6238,20 +6285,32 @@ def get_agent_skills_for_turn(user_id, work_id, skill_ids):
     return [by_id[i] for i in ids if i in by_id]
 
 
+def get_auto_agent_skills_for_turn(user_id, work_id):
+    with get_conn() as conn:
+        if work_id is not None and not _work_owned(conn, work_id, user_id):
+            return []
+        rows = conn.execute(
+            "SELECT id,name,description,instruction FROM agent_skills WHERE user_id=? "
+            "AND source_kind='builtin' AND enabled=1 AND auto_activate=1 AND work_id IS NULL ORDER BY id",
+            (user_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def list_agent_skill_catalog(user_id, work_id, limit=30):
     """提供给 Agent 的轻量 Skill 目录，只含元数据，不提前塞入完整规则。"""
     with get_conn() as conn:
         if work_id is None:
             rows = conn.execute(
                 "SELECT id, name, description, source_kind FROM agent_skills "
-                "WHERE user_id=? AND enabled=1 AND work_id IS NULL "
+                "WHERE user_id=? AND enabled=1 AND auto_activate=0 AND work_id IS NULL "
                 "ORDER BY CASE WHEN source_kind='builtin' THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT ?",
                 (user_id, limit),
             )
         else:
             rows = conn.execute(
                 "SELECT id, name, description, source_kind FROM agent_skills "
-                "WHERE user_id=? AND enabled=1 AND (work_id IS NULL OR work_id=?) "
+                "WHERE user_id=? AND enabled=1 AND auto_activate=0 AND (work_id IS NULL OR work_id=?) "
                 "ORDER BY CASE WHEN source_kind='builtin' THEN 0 ELSE 1 END, "
                 "CASE WHEN work_id IS NULL THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT ?",
                 (user_id, work_id, limit),

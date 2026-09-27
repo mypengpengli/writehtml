@@ -102,6 +102,9 @@ let storyPlanChildrenIndex = new Map();
 let storyPlanCollapsed = new Set();
 let storyPlanSaveTimer = null;
 let storyPlanSaving = false;
+let writingGuide = null;
+let writingGuideRequest = 0;
+let writingGuideTimer = null;
 
 class SerialSaveQueue {
   constructor() { this.tail = Promise.resolve(); this.pending = 0; }
@@ -470,6 +473,7 @@ async function loadChapters() {
   }
   renderTree(); updateWC();
   await loadAgentSkills();
+  await loadWritingGuide();
 }
 
 async function selectChapter(cid) {
@@ -485,6 +489,7 @@ async function selectChapter(cid) {
   setAgentConversationMode("standard");
   await Promise.all([loadAgentSessions(), loadChapter()]);
   renderTree();
+  await loadWritingGuide();
   if (window.innerWidth <= 700) $("app").classList.remove("side-open");
 }
 
@@ -735,6 +740,7 @@ async function runEditorSaveLoop() {
         updateSaveStat("有新内容，继续保存…");
       }
       renderTree();
+      scheduleWritingGuideRefresh();
     } catch (e) {
       if (e.status === 409 && e.detail?.code === "chapter_revision_conflict") {
         const handled = await handleEditorConflict(snapshot, e.detail.server || {});
@@ -2447,7 +2453,7 @@ function restoreActiveSkills() {
 function persistActiveSkills() {
   localStorage.setItem(agentSkillStorageKey(), JSON.stringify([...activeAgentSkillIds]));
 }
-function enabledSkills() { return agentSkills.filter(s => Number(s.enabled)); }
+function enabledSkills() { return agentSkills.filter(s => Number(s.enabled) && !Number(s.auto_activate)); }
 function selectedSkills() {
   const active = activeAgentSkillIds;
   return enabledSkills().filter(s => active.has(s.id));
@@ -2511,12 +2517,14 @@ function closeSkillPicker() { $("skillPickerOverlay").classList.add("hidden"); }
 function renderSkillPickerList() {
   const host = $("skillPickerList");
   const skills = enabledSkills();
-  host.innerHTML = skills.length ? skills.map(s => `
+  const automatic = agentSkills.filter(s => Number(s.enabled) && Number(s.auto_activate));
+  host.innerHTML = automatic.map(s => `<div class="skill-pick-row"><span class="skill-pick-copy"><b>${esc(s.name)}</b><small>${esc(s.description || "")}</small></span><span class="skill-source builtin">系统内置 · 自动启用</span></div>`).join("")
+    + (skills.length ? skills.map(s => `
     <label class="skill-pick-row">
       <input type="checkbox" ${activeAgentSkillIds.has(s.id) ? "checked" : ""} onchange="toggleActiveSkill(${s.id})">
       <span class="skill-pick-copy"><b>${esc(s.name)}</b>${s.description ? `<small>${esc(s.description)}</small>` : ""}</span>
       <span class="skill-pick-tags"><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "builtin" ? '<span class="skill-source builtin">内置</span>' : (s.source_kind === "skill_md" ? '<span class="skill-source">MD</span>' : "")}</span>
-    </label>`).join("") : '<div class="empty">还没有可用的 Skill。点右上角设置图标新建。</div>';
+    </label>`).join("") : automatic.length ? "" : '<div class="empty">还没有可用的 Skill。点右上角设置图标新建。</div>');
 }
 
 let editingSkillId = null;
@@ -2560,7 +2568,7 @@ function renderSkillList() {
   host.innerHTML = agentSkills.length ? agentSkills.map(s => `
     <div class="skill-row${Number(s.enabled) ? "" : " disabled"}">
       <div class="skill-row-main">
-        <div class="skill-row-head"><b>${esc(s.name)}</b><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "builtin" ? '<span class="skill-source builtin">内置</span>' : (s.source_kind === "skill_md" ? '<span class="skill-source">SKILL.md</span>' : "")}${Number(s.resource_count) ? `<span class="skill-source">${Number(s.resource_count)} 资料</span>` : ""}${Number(s.enabled) ? "" : '<span class="skill-off">已停用</span>'}</div>
+        <div class="skill-row-head"><b>${esc(s.name)}</b><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "builtin" ? `<span class="skill-source builtin">${Number(s.auto_activate) ? "系统内置 · 自动启用" : "内置"}</span>` : (s.source_kind === "skill_md" ? '<span class="skill-source">SKILL.md</span>' : "")}${Number(s.resource_count) ? `<span class="skill-source">${Number(s.resource_count)} 资料</span>` : ""}${Number(s.enabled) ? "" : '<span class="skill-off">已停用</span>'}</div>
         ${s.description ? `<div class="skill-desc">${esc(s.description)}</div>` : ""}
         <div class="skill-rule">${esc(s.instruction)}</div>
       </div>
@@ -2722,7 +2730,14 @@ function toggleAISide() {
     if (agentSessionScopeKey !== agentScopeKey()) loadAgentSessions();
     $("agentInput").focus();
   }, 50);
-  else if ("speechSynthesis" in window) speechSynthesis.cancel(); // 收起侧栏时停止朗读
+  else {
+    if ("speechSynthesis" in window) speechSynthesis.cancel(); // 收起侧栏时停止朗读
+    const workspace = $("productionWorkspace");
+    if (productionAutoClosedResources && workspace?.getBoundingClientRect().width - 286 - 340 >= 480) {
+      workspace.classList.remove("resources-closed");
+      productionAutoClosedResources = false;
+    }
+  }
 }
 function renderAgentSources(sources) {
   if (!Array.isArray(sources)) return "";
@@ -2844,7 +2859,8 @@ function renderAgent() {
     return;
   }
   if (!agentMsgs.length && !agentBusy) {
-    el.innerHTML = '<div class="empty">当前会话还没有消息</div>';
+    el.innerHTML = writingGuide ? "" : '<div class="empty">当前会话还没有消息</div>';
+    renderWritingGuide();
     return;
   }
   let html = "";
@@ -2900,6 +2916,162 @@ function renderAgent() {
   }
   el.innerHTML = html;
   el.scrollTop = el.scrollHeight;
+  renderWritingGuide();
+}
+
+function writingGuideChapterId() {
+  if ($("app")?.classList.contains("production-open")) {
+    if (productionSection === "plan") return storyPlanLocateChapterId || currentChapterId;
+    if (productionSection === "state") return productionChapterId || currentChapterId;
+  }
+  return currentChapterId;
+}
+
+async function loadWritingGuide() {
+  const request = ++writingGuideRequest;
+  const workId = currentWorkId;
+  const chapterId = writingGuideChapterId();
+  if (!workId) { writingGuide = null; renderWritingGuide(); return; }
+  try {
+    const params = new URLSearchParams({ intent: "general" });
+    if (chapterId) params.set("chapter_id", chapterId);
+    const result = await api(`/api/works/${workId}/writing-guidance?${params}`, { method: "GET" });
+    if (request !== writingGuideRequest || currentWorkId !== workId || writingGuideChapterId() !== chapterId) return;
+    writingGuide = result;
+  } catch (e) {
+    if (request !== writingGuideRequest) return;
+    writingGuide = null;
+  }
+  renderWritingGuide();
+  if (!agentMsgs.length && !agentBusy && !agentConversationLoading) $("agentMsgs").innerHTML = writingGuide ? "" : '<div class="empty">当前会话还没有消息</div>';
+}
+
+function scheduleWritingGuideRefresh() {
+  clearTimeout(writingGuideTimer);
+  writingGuideTimer = setTimeout(() => { writingGuideTimer = null; loadWritingGuide(); }, 450);
+}
+
+function renderWritingGuide() {
+  const host = $("writingGuideCard");
+  const flow = $("writingGuideFlow");
+  if (!host || !flow) return;
+  host.classList.toggle("hidden", !writingGuide);
+  flow.classList.toggle("hidden", !writingGuide);
+  if (!writingGuide) return;
+  const compact = !!agentMsgs.length || agentBusy;
+  host.classList.toggle("compact", compact);
+  const actionButton = (action, slot, primary = false) => action ? `<button class="${primary ? "guide-primary" : ""}" onclick="executeWritingGuideAction('${slot}')">${esc(action.label)}</button>` : "";
+  host.innerHTML = compact
+    ? `<div class="writing-guide-compact"><span><b>下一步</b> ${esc(writingGuide.primary_action.label)}</span>${actionButton(writingGuide.primary_action, "primary", true)}<button class="ic" title="查看写作建议" onclick="this.closest('.writing-guide-card').classList.toggle('expanded')">${svg("chevD")}</button></div>
+       <div class="writing-guide-expanded"><p>${esc(writingGuide.message)}</p><div class="writing-guide-actions">${writingGuide.actions.map((item, index) => actionButton(item, String(index))).join("")}</div></div>`
+    : `<div class="writing-guide-title"><span>${svg("sparkles")}<b>写作导演</b></span><small>${esc(writingGuide.stage_label)} · 写前准备 ${esc(String(writingGuide.readiness.score))}</small></div>
+       <p>${esc(writingGuide.message)}</p><div class="writing-guide-actions">${actionButton(writingGuide.primary_action, "primary", true)}${writingGuide.actions.map((item, index) => actionButton(item, String(index))).join("")}</div>
+       <details><summary>查看写前准备情况 · ${esc(writingGuide.readiness.level)}</summary><ul>${writingGuide.checks.map(item => `<li><b>${esc(item.label)}</b><span>${esc(item.detail)}</span></li>`).join("")}</ul></details>`;
+  const steps = [
+    ["foundation", "基础", "canon"], ["story_planning", "规划", "plan"], ["chapter_planning", "本章", "plan"],
+    ["drafting", "正文", "editor"], ["state_sync", "状态", "state"], ["review", "复核", "state"],
+    ["next_chapter", "下一章", "editor"],
+  ];
+  const activeStage = writingGuide.stage === "simulation" ? "story_planning" : writingGuide.stage;
+  const readyChecks = new Set(writingGuide.checks.filter(item => item.status === "ready").map(item => item.key));
+  const completedStages = new Set();
+  if (writingGuide.facts.character_count || writingGuide.facts.work_notes_present) completedStages.add("foundation");
+  if (readyChecks.has("story_direction")) completedStages.add("story_planning");
+  if (readyChecks.has("chapter_plan")) completedStages.add("chapter_planning");
+  if (writingGuide.facts.chapter_chars) completedStages.add("drafting");
+  if (writingGuide.facts.production_analysis_status === "current") completedStages.add("state_sync");
+  if (completedStages.has("state_sync") && !writingGuide.facts.realization_pending && !writingGuide.facts.pending_changes && !writingGuide.facts.critical_alerts) completedStages.add("review");
+  flow.innerHTML = `<span class="writing-guide-flow-label">创作进度</span><div class="writing-guide-flow-steps">${steps.map(([stage, label, target]) =>
+    `<button class="${activeStage === stage ? "active" : ""}" onclick="jumpWritingGuideStage('${target}')" title="${label}${completedStages.has(stage) ? "已具备" : ""}">${completedStages.has(stage) ? svg("check") : ""}${label}</button>`).join("")}</div>
+    <span class="writing-guide-flow-next">${esc(writingGuide.message)}</span>${actionButton(writingGuide.primary_action, "primary", true)}`;
+}
+
+async function jumpWritingGuideStage(target) {
+  if (target === "editor") {
+    if ($("app").classList.contains("production-open")) await closeProductionCanvas();
+    return;
+  }
+  if (!["canon", "plan", "state"].includes(target)) return;
+  if (!$('app').classList.contains('production-open')) await openProductionCanvas();
+  if (target === "state" && writingGuide?.chapter_id) productionChapterId = writingGuide.chapter_id;
+  if (target === "plan" && writingGuide?.chapter_id) storyPlanLocateChapterId = writingGuide.chapter_id;
+  await setProductionSection(target);
+}
+
+const writingGuidePrompts = {
+  build_story_foundation: "请帮我根据目前的想法搭建最小的故事基础。",
+  create_book_plan: "请根据现有资料整理一个简洁的故事总纲并保存。",
+  complete_chapter_plan: "请帮我补齐当前章节计划中缺少的内容，保留已有规划。",
+  simulate_next: "请实际使用剧情沙盘推演下一步，保存几个候选分支让我选择。",
+  write_chapter: "请帮我写当前章节。",
+  continue_chapter: "请根据当前最新正文继续写本章。",
+  write_anyway: "我知道资料可能不全，请直接帮我写，不用先规划。",
+  review_plan_realization: "请对照本章正文核对章节计划的实现情况。",
+  review_chapter: "请检查本章的连续性，并给出具体的写作建议。",
+  go_next_chapter: "请帮我继续下一章，先核对当前作品和章节状态。",
+};
+
+async function executeWritingGuideAction(slot) {
+  if (!writingGuide) return;
+  const action = slot === "primary" ? writingGuide.primary_action : writingGuide.actions[+slot];
+  await dispatchWritingGuideAction(action);
+}
+
+async function runWritingGuideIntent(id, chapterId = null) {
+  if (!Object.hasOwn(writingGuidePrompts, id) || !currentWorkId) return;
+  await dispatchWritingGuideAction({ id, kind: "agent_intent", work_id: currentWorkId, chapter_id: chapterId || currentChapterId || null });
+}
+
+async function dispatchWritingGuideAction(action) {
+  if (!action || action.work_id !== currentWorkId) return;
+  if (action.kind === "navigate") {
+    const targets = { production_canon: "canon", production_plan: "plan", production_state: "state", editor: "editor" };
+    const target = targets[action.target];
+    if (target) await jumpWritingGuideStage(target);
+    return;
+  }
+  if (action.kind === "analyze_chapter") {
+    if (!action.chapter_id) return;
+    productionChapterId = action.chapter_id;
+    await analyzeProductionChapter();
+    scheduleWritingGuideRefresh();
+    return;
+  }
+  if (action.kind !== "agent_intent" || !Object.hasOwn(writingGuidePrompts, action.id) || agentBusy) return;
+  if (action.chapter_id && action.chapter_id !== currentChapterId) await selectChapter(action.chapter_id);
+  openProductionAI();
+  if ($("agentInput").value.trim() && !await askCard({
+    title: "替换未发送内容？", msg: "输入框里还有未发送的文字。执行此操作会用导演指令替换它。", okText: "替换并执行",
+  })) return;
+  $("agentInput").value = writingGuidePrompts[action.id];
+  await sendAgent(action);
+}
+
+function closeWritingQualityReview() {
+  $("writingQualityOverlay").classList.add("hidden");
+}
+
+async function runWritingQualityReview(kind, itemId) {
+  if (!Number.isInteger(+itemId) || +itemId <= 0 || !["chapter", "plan"].includes(kind)) return;
+  if (kind === "plan" && storyPlanSaveTimer && productionSelected?.item?.id === +itemId) {
+    clearTimeout(storyPlanSaveTimer);
+    storyPlanSaveTimer = null;
+    if (!await saveStoryPlanFromInspector(true)) return;
+  }
+  const overlay = $("writingQualityOverlay");
+  $("writingQualityTitle").textContent = kind === "plan" ? "规划体检" : "正文体检";
+  $("writingQualityBody").innerHTML = '<div class="agent-chat-loading"><span class="spinner"></span>正在体检…</div>';
+  overlay.classList.remove("hidden");
+  try {
+    const path = kind === "plan" ? `/api/story-plan/${itemId}/quality-review` : `/api/chapters/${itemId}/writing-quality-review`;
+    const result = await api(path, { body: { model: activeModelId } });
+    if (overlay.classList.contains("hidden")) return;
+    $("writingQualityBody").innerHTML = `<p class="writing-quality-note">${result.excerpted ? "本次只检查正文开头和结尾片段；中间内容未送审。" : "仅根据本次提交内容评价，不自动修改正文或规划。"}</p>
+      <p class="writing-quality-summary">${esc(result.summary || "体检完成")}</p>
+      <div class="writing-quality-list">${result.dimensions.map(row => `<section><div><b>${esc(row.name)}</b><strong>${esc(String(row.score))}/10</strong></div><p><span>依据</span>${esc(row.evidence || "未提供")}</p>${row.suggestion ? `<p><span>建议</span>${esc(row.suggestion)}</p>` : ""}</section>`).join("")}</div>`;
+  } catch (e) {
+    if (!overlay.classList.contains("hidden")) $("writingQualityBody").innerHTML = `<p class="msg">${esc(e.message)}</p>`;
+  }
 }
 async function applyAgentResult(r, selection, baseMessages = null) {
   if (selection) clearAgentSelection();
@@ -2961,6 +3133,7 @@ async function applyAgentResult(r, selection, baseMessages = null) {
   if (!$('characterStateOverlay').classList.contains('hidden') && characterStateChapterId === currentChapterId) {
     await loadCharacterState();
   }
+  await loadWritingGuide();
 }
 function speakLatestAgentTurn() {
   const uIdx = agentMsgs.map(m => m.role).lastIndexOf("user");
@@ -2976,7 +3149,7 @@ function speakLatestAgentTurn() {
   }
   speakAgentText(spoken);
 }
-async function sendAgent() {
+async function sendAgent(guideAction = null) {
   if (agentBusy) return;
   const el = $("agentInput");
   let text = el.value.trim();
@@ -3005,6 +3178,10 @@ async function sendAgent() {
   const body = {
     text, ...agentScopeBody(), session_id: currentAgentSessionId,
     conversation_mode: conversationMode,
+  };
+  if (guideAction?.kind === "agent_intent") body.guide_action = {
+    id: guideAction.id, work_id: guideAction.work_id,
+    chapter_id: guideAction.chapter_id ?? null, plan_id: guideAction.plan_id ?? null,
   };
   if (selection) body.selection = selection;
   if (activeAgentSkillIds.size) body.skill_ids = [...activeAgentSkillIds];
@@ -5153,6 +5330,7 @@ async function openProductionCanvas() {
 
 async function maybePromptProductionAnalysis() {
   if (productionSection !== "state" || !productionChapterId || !productionChapterData?.settings?.auto_analyze_on_leave) return true;
+  if (!["review", "final"].includes(productionChapterData.chapter?.workflow_status)) return true;
   const status = productionChapterData.chapter?.production_analysis_status;
   if (status === "current" || !(productionChapterData.chapter?.content || "").trim()) return true;
   const analyze = await askCard({
@@ -5208,6 +5386,7 @@ async function setProductionSection(section, opening = false) {
     productionMode = "overview";
     await loadProductionOverview();
   }
+  await loadWritingGuide();
 }
 
 async function changeProductionChapter(value) {
@@ -5224,6 +5403,7 @@ async function changeProductionChapter(value) {
   localStorage.setItem("productionSection", "state");
   syncProductionHeader();
   await loadProductionChapter();
+  await loadWritingGuide();
 }
 
 function locateStoryPlanChapter(value) {
@@ -5232,6 +5412,7 @@ function locateStoryPlanChapter(value) {
   renderStoryPlan();
   const row = $("storyPlanTree")?.querySelector(`[data-plan-chapter="${storyPlanLocateChapterId}"]`);
   row?.scrollIntoView({ block: "center", behavior: "smooth" });
+  scheduleWritingGuideRefresh();
 }
 
 function setProductionLoading(on) {
@@ -5273,10 +5454,10 @@ async function loadProductionChapter() {
   try {
     const [chapterData, plans] = await Promise.all([
       api(`/api/chapters/${productionChapterId}/production`, { method: "GET" }),
-      api(`/api/works/${currentWorkId}/story-plan`, { method: "GET" }),
+      api(`/api/chapters/${productionChapterId}/story-plans`, { method: "GET" }),
     ]);
     productionChapterData = chapterData;
-    productionChapterPlans = (plans || []).filter(item => item.chapter_id === productionChapterId);
+    productionChapterPlans = plans || [];
     const layoutDraftKey = `productionLayoutDraft:${currentUsername || "user"}:${currentWorkId}:${productionChapterId}`;
     try {
       const draft = JSON.parse(localStorage.getItem(layoutDraftKey) || "null");
@@ -5301,8 +5482,9 @@ function renderChapterPlanSummary() {
   const host = $("chapterPlanSummary");
   if (!host) return;
   const plans = productionChapterPlans || [];
-  host.innerHTML = `<div class="chapter-plan-summary-head"><b>本章计划</b><small>${plans.length ? `${plans.length} 条规划` : "暂无规划"}</small><button onclick="setProductionSection('plan')">查看规划</button></div>
-    ${plans.length ? `<div class="chapter-plan-summary-list">${plans.map(plan => `<div><b>${esc(plan.title)}</b><span>${esc(plan.goal || plan.expected_outcome || plan.summary || "未填写目标")}</span><small>${esc(storyPlanRealizationLabel(plan, productionChapterId))}</small><button onclick="reviewChapterPlan(${plan.id})">核对</button></div>`).join("")}</div>` : ""}`;
+  host.innerHTML = `<div class="chapter-plan-summary-head"><b>本章计划</b><small>${plans.length ? `${plans.length} 条规划` : "暂无规划"}</small><button onclick="setProductionSection('plan')">查看规划</button>${(productionChapterData?.chapter?.content || "").trim() ? `<button onclick="runWritingQualityReview('chapter',productionChapterId)">正文体检</button>` : ""}</div>
+    ${plans.length ? `<div class="chapter-plan-summary-list">${plans.map(plan => `<div><b>${esc(plan.title)}</b><span>${esc(plan.goal || plan.expected_outcome || plan.summary || "未填写目标")}</span><small>${esc(storyPlanRealizationLabel(plan, productionChapterId))}</small><button onclick="reviewChapterPlan(${plan.id})">核对</button></div>`).join("")}</div>`
+      : `<div class="guide-empty-actions"><button onclick="runWritingGuideIntent('complete_chapter_plan',productionChapterId)">AI 补本章计划</button><button onclick="runWritingGuideIntent('simulate_next',productionChapterId)">推演后续</button><button onclick="jumpWritingGuideStage('editor')">直接写</button></div>`}`;
 }
 
 async function reviewChapterPlan(planId) {
@@ -5348,6 +5530,7 @@ function renderProductionOverview() {
   const categories = ["character", "rule", "location", "skill", "item", "organization"];
   $("productionOverview").innerHTML = `
     <div class="production-overview-head"><h2>世界设定</h2><button onclick="openWorkNotes(${currentWorkId})" data-ic="book" data-label="创作总则"></button></div>
+    ${items.length ? "" : `<div class="production-empty guide-empty"><b>还没有基础设定</b><span>先确定主角和少量关键规则即可，不必一次设计完整世界。</span><div class="guide-empty-actions"><button onclick="runWritingGuideIntent('build_story_foundation')">AI 帮我搭基础</button><button onclick="openWiki()">新建人物</button><button onclick="setProductionSection('plan')">先规划剧情</button></div></div>`}
     <div class="production-stat-strip">${categories.map(category => `<button onclick="setProductionResourceCategory('${category}');$('productionResourceSearch')?.focus()"><b>${category === "character" ? items.filter(item => item.category === category).length : counts[category] || 0}</b><small>${productionCategoryLabels[category]}</small></button>`).join("")}</div>
     <div class="production-world-groups">${categories.map(category => {
       const group = items.filter(item => item.category === category);
@@ -5417,8 +5600,10 @@ const storyPlanPolicyLabels = { auto: "自动", planning_only: "仅规划", writ
 
 function rebuildStoryPlanIndexes() {
   storyPlanChildrenIndex = new Map();
-  storyPlanNodes.forEach(item => {
-    const parent = item.parent_id || null;
+  const visible = storyPlanNodes.filter(item => storyPlanShowArchive ? item.status === "abandoned" : item.status !== "abandoned");
+  const visibleIds = new Set(visible.map(item => item.id));
+  visible.forEach(item => {
+    const parent = visibleIds.has(item.parent_id) ? item.parent_id : null;
     if (!storyPlanChildrenIndex.has(parent)) storyPlanChildrenIndex.set(parent, []);
     storyPlanChildrenIndex.get(parent).push(item);
   });
@@ -5448,9 +5633,10 @@ function storyPlanChildren(parentId) {
 function storyPlanSearchMatches() {
   const query = ($("storyPlanSearch")?.value || "").trim().toLowerCase();
   if (!query) return null;
-  const byId = new Map(storyPlanNodes.map(item => [item.id, item]));
+  const byId = new Map(storyPlanNodes.filter(item => storyPlanShowArchive ? item.status === "abandoned" : item.status !== "abandoned")
+    .map(item => [item.id, item]));
   const visible = new Set();
-  storyPlanNodes.forEach(item => {
+  byId.forEach(item => {
     if (!`${item.title} ${item.summary} ${item.goal} ${item.conflict} ${item.expected_outcome} ${item.detail}`.toLowerCase().includes(query)) return;
     let current = item;
     while (current && !visible.has(current.id)) {
@@ -5498,8 +5684,7 @@ function storyPlanRouteRows(parentId = null, depth = 0, visited = new Set(), mat
     const nextVisited = new Set(visited); nextVisited.add(item.id);
     const children = storyPlanChildren(item.id);
     const expanded = !!matches || !storyPlanCollapsed.has(item.id);
-    const visible = storyPlanMatchesFilter(item) && (!matches || matches.has(item.id))
-      && (!storyPlanShowArchive || item.status === "abandoned");
+    const visible = storyPlanMatchesFilter(item) && (!matches || matches.has(item.id));
     const childHtml = expanded ? storyPlanRouteRows(item.id, depth + 1, nextVisited, matches) : "";
     const row = visible ? `<div class="story-plan-route-row ${item.chapter_id === storyPlanLocateChapterId ? "current" : ""}" style="--plan-depth:${Math.min(depth, 6)}">
       ${children.length ? `<button class="ic story-plan-route-toggle" onclick="toggleStoryPlanCollapsed(${item.id})" title="${expanded ? "收起" : "展开"}">${expanded ? "⌄" : "›"}</button>` : '<span class="story-plan-route-toggle"></span>'}
@@ -5513,18 +5698,21 @@ function storyPlanRouteRows(parentId = null, depth = 0, visited = new Set(), mat
 
 function renderStoryPlan() {
   const matches = storyPlanSearchMatches();
-  $("storyPlanCount").textContent = `${storyPlanNodes.filter(item => item.status !== "abandoned").length} 项`;
-  $("storyPlanTree").innerHTML = storyPlanTreeRows(null, 0, new Set(), matches) || `<div class="production-empty compact"><span>${matches ? "没有匹配的计划" : "尚无正式规划"}</span></div>`;
+  const visibleNodes = storyPlanNodes.filter(item => storyPlanShowArchive ? item.status === "abandoned" : item.status !== "abandoned");
+  $("storyPlanCount").textContent = `${visibleNodes.length} 项`;
+  $("storyPlanTree").innerHTML = storyPlanTreeRows(null, 0, new Set(), matches) || `<div class="production-empty compact"><span>${matches ? "没有匹配的计划" : storyPlanShowArchive ? "暂无废案" : "尚无正式规划"}</span></div>`;
   document.querySelectorAll("[data-plan-filter]").forEach(button =>
     button.classList.toggle("active", button.dataset.planFilter === storyPlanFilter));
   $("storyPlanRouteBtn")?.classList.toggle("active", storyPlanView === "route");
   $("storyPlanCardBtn")?.classList.toggle("active", storyPlanView === "cards");
   $("storyPlanArchiveBtn")?.classList.toggle("active", storyPlanShowArchive);
-  const items = storyPlanNodes.filter(item => storyPlanMatchesFilter(item) && (!matches || matches.has(item.id))
-    && (!storyPlanShowArchive || item.status === "abandoned"));
-  const covered = new Set(storyPlanNodes.filter(item => item.chapter_id).map(item => item.chapter_id));
-  const deviations = storyPlanNodes.filter(item => (item.realizations || []).some(row => row.source_current && row.status === "deviated")).length;
-  $("storyPlanHealth").innerHTML = `<button onclick="setStoryPlanFilter('volume')">${storyPlanNodes.filter(item => item.node_type === "volume" || item.node_type === "arc").length} 卷 / 阶段</button><button onclick="setStoryPlanFilter('chapter')">${covered.size} / ${chapters.length} 章已有计划</button><button onclick="setStoryPlanFilter('thread')">${storyPlanNodes.filter(item => ["subplot", "foreshadow"].includes(item.node_type)).length} 支线 / 伏笔</button><button onclick="setStoryPlanFilter('deviated')">${deviations} 项有效偏离</button>`;
+  $("storyPlanTreeNewBtn")?.classList.toggle("hidden", storyPlanShowArchive);
+  $("storyPlanNewType")?.classList.toggle("hidden", storyPlanShowArchive);
+  const items = visibleNodes.filter(item => storyPlanMatchesFilter(item) && (!matches || matches.has(item.id)));
+  const covered = new Set(visibleNodes.filter(item => item.chapter_id).map(item => item.chapter_id));
+  const deviations = visibleNodes.filter(item => (item.realizations || []).some(row => row.source_current && row.status === "deviated")).length;
+  $("storyPlanHealth").classList.toggle("hidden", storyPlanShowArchive);
+  if (!storyPlanShowArchive) $("storyPlanHealth").innerHTML = `<button onclick="setStoryPlanFilter('volume')">${visibleNodes.filter(item => item.node_type === "volume" || item.node_type === "arc").length} 卷 / 阶段</button><button onclick="setStoryPlanFilter('chapter')">${covered.size} / ${chapters.length} 章已有计划</button><button onclick="setStoryPlanFilter('thread')">${visibleNodes.filter(item => ["subplot", "foreshadow"].includes(item.node_type)).length} 支线 / 伏笔</button><button onclick="setStoryPlanFilter('deviated')">${deviations} 项有效偏离</button>`;
   const currentChapter = storyPlanLocateChapterId || productionChapterId;
   const cardHtml = item => {
     const body = item.context_summary || item.summary || item.goal || item.detail || "尚未填写内容";
@@ -5538,7 +5726,7 @@ function renderStoryPlan() {
   $("storyPlanBoard").innerHTML = items.length ? (storyPlanView === "cards"
     ? `<div class="story-plan-grid">${items.slice(0, 200).map(cardHtml).join("")}</div>${items.length > 200 ? `<p class="set-hint">只显示前 200 项，请使用搜索或分类缩小范围。</p>` : ""}`
     : `<div class="story-plan-route">${storyPlanRouteRows(null, 0, new Set(), matches)}</div>`)
-    : `<div class="production-empty">${svg("nodes")}<b>${storyPlanShowArchive ? "暂无废案" : "这个分类还没有规划"}</b><button onclick="newStoryPlanNode()">新建计划</button></div>`;
+    : `<div class="production-empty guide-empty">${svg("nodes")}<b>${storyPlanShowArchive ? "暂无废案" : visibleNodes.length ? "这个分类还没有规划" : "还没有故事方向"}</b>${storyPlanShowArchive ? "" : visibleNodes.length ? '<button onclick="newStoryPlanNode()">新建计划</button>' : `<div class="guide-empty-actions"><button onclick="runWritingGuideIntent('create_book_plan')">AI 整理总纲</button><button onclick="openOutlineSandbox()">先剧情推演</button><button onclick="jumpWritingGuideStage('editor')">直接写</button></div>`}</div>`;
   applyIcons();
 }
 
@@ -5550,6 +5738,10 @@ function setStoryPlanView(view) {
 
 async function toggleStoryPlanArchive() {
   storyPlanShowArchive = !storyPlanShowArchive;
+  if (productionSelected?.type === "story_plan" && !await closeProductionInspector()) {
+    storyPlanShowArchive = !storyPlanShowArchive;
+    return;
+  }
   await loadStoryPlan();
 }
 
@@ -5558,8 +5750,11 @@ function setStoryPlanFilter(filter) {
   renderStoryPlan();
 }
 
-function storyPlanParentOptions(value, selfId = null) {
-  return `<option value="">顶层</option>` + storyPlanNodes.filter(item => item.id !== selfId && item.status !== "abandoned")
+function storyPlanParentOptions(value, selfId = null, nodeType = "chapter", status = "planned") {
+  const allowed = { book: [], volume: ["book"], arc: ["book"], chapter: ["volume", "arc", "book"],
+    scene: ["chapter"], subplot: ["book", "volume", "arc", "chapter"], foreshadow: ["book", "volume", "arc", "chapter"] }[nodeType] || [];
+  return `<option value="">顶层</option>` + storyPlanNodes.filter(item => item.id !== selfId &&
+    ((allowed.includes(item.node_type) && item.status === status) || item.id === +value))
     .map(item => `<option value="${item.id}" ${item.id === +value ? "selected" : ""}>${esc(storyPlanTypeLabels[item.node_type])} · ${esc(item.title)}</option>`).join("");
 }
 
@@ -5618,7 +5813,7 @@ function storyPlanForm(item) {
     <details class="story-plan-advanced"><summary>更多设置</summary>
       <div class="production-form-grid">
         <label>类型<select id="storyPlanType" onchange="updateStoryPlanChapterField()">${Object.entries(storyPlanTypeLabels).map(([value,label]) => `<option value="${value}" ${item.node_type === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
-        <label>上级<select id="storyPlanParent">${storyPlanParentOptions(item.parent_id, item.id)}</select></label>
+        <label>上级<select id="storyPlanParent">${storyPlanParentOptions(item.parent_id, item.id, item.node_type, item.status)}</select></label>
       </div>
       <label>上下文策略<select id="storyPlanPolicy" onchange="syncStoryPlanWritingReference()">${Object.entries(storyPlanPolicyLabels).map(([value,label]) => `<option value="${value}" ${item.context_policy === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
       <div class="production-form-grid"><label>范围起点<select id="storyPlanRangeStart">${productionChapterSelectOptions(item.scope_start_chapter_id)}</select></label><label>范围终点<select id="storyPlanRangeEnd">${productionChapterSelectOptions(item.scope_end_chapter_id)}</select></label></div>
@@ -5630,10 +5825,10 @@ function storyPlanForm(item) {
     ${storyPlanRealizationHtml(item)}
     <div class="production-inspector-actions story-plan-actions">
       <button onclick="saveStoryPlanFromInspector()">${item.id ? "保存" : "创建规划"}</button>
-      ${item.id ? `<button onclick="handoffStoryPlanToAI(${item.id})">交给 AI</button><button onclick="openSandboxFromStoryPlan(${item.id})">从这里推演</button>
+      ${item.id ? `<button onclick="handoffStoryPlanToAI(${item.id})">交给 AI</button><button onclick="runWritingQualityReview('plan',${item.id})">规划体检</button><button onclick="openSandboxFromStoryPlan(${item.id})">从当前规划推演</button>${item.source_sandbox_id ? `<button onclick="viewStoryPlanSourceSandbox(${item.id})">查看来源沙盘</button>` : ""}
       <details class="story-plan-action-menu"><summary aria-label="更多规划操作" title="更多规划操作">${svg("more")}</summary><div class="story-plan-action-list">
         ${item.node_type === "chapter" ? `<button onclick="openOrCreatePlanChapter(${item.id})">${item.chapter_id ? "打开正文" : "创建对应章节"}</button>` : ""}
-        <button onclick="newStoryPlanNode(${item.id})">新建子计划</button>
+        ${item.status === "abandoned" ? "" : `<button onclick="newStoryPlanNode(${item.id})">新建子计划</button>`}
         ${item.status === "abandoned" ? `<button onclick="restoreStoryPlanBranch(${item.id})">恢复分支</button>` : `<button onclick="setStoryPlanStatus(${item.id},'${item.status === "committed" ? "planned" : "committed"}')">${item.status === "committed" ? "改回规划中" : "确定采用"}</button><button class="danger-link" onclick="abandonStoryPlan(${item.id})">放弃此规划</button>`}
       </div></details>` : '<button onclick="closeProductionInspector({discard:true})">取消</button>'}
     </div>
@@ -5677,7 +5872,15 @@ function syncStoryPlanWritingReference() {
 
 function updateStoryPlanChapterField() {
   const field = $("storyPlanChapter")?.closest("label");
-  if (field) field.classList.toggle("hidden", $("storyPlanType").value !== "chapter");
+  const type = $("storyPlanType").value;
+  if (field) field.classList.toggle("hidden", type !== "chapter");
+  if (type !== "chapter") $("storyPlanChapter").value = "";
+  const parent = $("storyPlanParent");
+  if (parent) {
+    const previous = parent.value;
+    parent.innerHTML = storyPlanParentOptions(null, productionSelected?.item?.id, type, productionSelected?.item?.status);
+    if ([...parent.options].some(option => option.value === previous)) parent.value = previous;
+  }
 }
 
 async function previewStoryPlanContext() {
@@ -5767,19 +5970,13 @@ async function openSandboxFromStoryPlan(planId) {
   try {
     if (currentSandbox && !await flushSandboxSave()) throw new Error("当前沙盘尚未保存，暂不能切换");
     const plan = await api(`/api/story-plan/${planId}`, { method: "GET" });
-    if (plan.source_sandbox_id) {
-      $("outlineOverlay").classList.remove("hidden");
-      sandboxList = await api(`/api/works/${currentWorkId}/sandboxes`, { method: "GET" });
-      await loadOutlineSandbox(plan.source_sandbox_id);
-      selectedSandboxNodeId = plan.source_node_id;
-      renderOutlineSandbox(); renderSandboxInspector();
-      return;
-    }
     const kind = plan.node_type === "volume" ? "volume" : plan.node_type === "chapter" ? "chapter" : "plot";
     const id = sandboxNodeId(kind);
     const chapter = chapters.find(item => item.id === plan.chapter_id);
     const previous = chapter ? chapters.filter(item => item.ord < chapter.ord).sort((a, b) => b.ord - a.ord)[0] : null;
-    const data = { nodes: [{ id, title: plan.title, summary: plan.summary || plan.goal || "",
+    const direction = [plan.summary, plan.goal && `目标：${plan.goal}`, plan.conflict && `冲突：${plan.conflict}`,
+      plan.expected_outcome && `预期结果：${plan.expected_outcome}`].filter(Boolean).join("\n").slice(0, 4000);
+    const data = { nodes: [{ id, title: plan.title, summary: direction,
       kind, direction: "主线", chapter_id: plan.chapter_id,
       context_chapter_id: chapter ? (previous?.id || null) : (storyPlanLocateChapterId || null),
       plan_node_id: plan.id, x: 220, y: 160 }], edges: [] };
@@ -5790,6 +5987,19 @@ async function openSandboxFromStoryPlan(planId) {
     selectedSandboxNodeId = id;
     $("outlineOverlay").classList.remove("hidden");
     renderSandboxList(); renderOutlineSandbox(); renderSandboxInspector();
+  } catch (e) { showToast(e.message, "err"); }
+}
+
+async function viewStoryPlanSourceSandbox(planId) {
+  try {
+    if (currentSandbox && !await flushSandboxSave()) throw new Error("当前沙盘尚未保存，暂不能切换");
+    const plan = await api(`/api/story-plan/${planId}`, { method: "GET" });
+    if (!plan.source_sandbox_id) return;
+    sandboxList = await api(`/api/works/${currentWorkId}/sandboxes`, { method: "GET" });
+    await loadOutlineSandbox(plan.source_sandbox_id);
+    selectedSandboxNodeId = plan.source_node_id;
+    $("outlineOverlay").classList.remove("hidden");
+    renderOutlineSandbox(); renderSandboxInspector();
   } catch (e) { showToast(e.message, "err"); }
 }
 
@@ -5806,6 +6016,7 @@ async function inspectStoryPlan(planId) {
 }
 
 async function newStoryPlanNode(parentId = null, requestedType = null) {
+  if (storyPlanShowArchive) { showToast("请先返回有效规划，再新建计划", "err"); return; }
   if (productionSelected && !await closeProductionInspector()) return;
   const parent = storyPlanNodes.find(row => row.id === parentId);
   const hasBook = storyPlanNodes.some(row => row.node_type === "book" && row.status !== "abandoned");
@@ -5827,8 +6038,10 @@ function readStoryPlanForm() {
   const links = [...document.querySelectorAll("[data-plan-link]:checked")].map(input => ({ target_type: input.dataset.planLink, target_id: +input.value }));
   return {
     title: $("storyPlanTitle").value.trim(), node_type: $("storyPlanType").value,
-    parent_id: +$("storyPlanParent").value || null, status: productionSelected.item.status,
-    context_policy: $("storyPlanPolicy").value, chapter_id: +$("storyPlanChapter").value || null,
+    parent_id: $("storyPlanType").value === "book" ? null : +$("storyPlanParent").value || null,
+    status: productionSelected.item.status,
+    context_policy: $("storyPlanPolicy").value,
+    chapter_id: $("storyPlanType").value === "chapter" ? +$("storyPlanChapter").value || null : null,
     scope_start_chapter_id: +$("storyPlanRangeStart").value || null,
     scope_end_chapter_id: +$("storyPlanRangeEnd").value || null,
     summary: $("storyPlanSummary").value, goal: $("storyPlanGoal").value,
@@ -5856,6 +6069,7 @@ function restoreStoryPlanDraft() {
   document.querySelectorAll("[data-plan-link]").forEach(input => { input.checked = false; });
   (draft.values.links || []).forEach(link => { const input = document.querySelector(`[data-plan-link="${link.target_type}"][value="${link.target_id}"]`); if (input) input.checked = true; });
   if (draft.values.detail) $("storyPlanDetail")?.closest("details")?.setAttribute("open", "");
+  updateStoryPlanChapterField();
   syncStoryPlanWritingReference();
   updateStoryPlanSelectedLinks();
   $("productionSaveStatus").textContent = "已恢复本机草稿";
@@ -5898,6 +6112,7 @@ async function saveStoryPlanFromInspector(quiet = false) {
       renderStoryPlan();
       if (!quiet || !planId) inspectStoryPlan(saved.id);
       if (!quiet) showToast(planId ? "剧情规划已保存" : "剧情规划已创建", "ok");
+      scheduleWritingGuideRefresh();
       return saved;
     } catch (e) {
       $("productionSaveStatus").textContent = "同步失败，草稿仍在本机";
@@ -6857,6 +7072,7 @@ async function analyzeProductionChapter() {
     productionChapterData = result.production;
     productionCards = productionChapterData.after?.cards || [];
     renderProductionResources(); renderProductionCanvas(); syncProductionHeader();
+    scheduleWritingGuideRefresh();
     showToast(`已整理 ${result.scene_count || 0} 个场景和 ${result.changes?.length || 0} 项变化`, "ok");
   } catch (e) { showToast("分析失败：" + e.message, "err"); }
   finally { busy(button, false, "分析本章"); applyIcons(); }
