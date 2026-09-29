@@ -1,0 +1,434 @@
+{
+  "sources": {
+    "de-ai-novel.zip": "40daaf309f748b94df09cc0846386db3077bd4c7cac09930dcdd00b5cf2c3c34",
+    ".codebuddy-plugin.zip": "cf16188f7e8b3138dba3593cd097d78153f0911fb50517fa14f016728cc14ce6"
+  },
+  "references": [
+    {
+      "skill": "de-ai-novel",
+      "path": "references/ai-taste-19.md",
+      "source": "de-ai-novel/references/ai-taste-19.md",
+      "sha256": "1de668bd26ae3d00e29c788b40db3c8bcf24166685b269a53e574f33c223473e"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/delivery-card.md",
+      "source": "de-ai-novel/references/delivery-card.md",
+      "sha256": "e4834074f48b2eccbaf8bd5c91fab3b08dcdc439040ca12334ad4e477849b65a"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/detection-rules.md",
+      "source": "de-ai-novel/references/detection-rules.md",
+      "sha256": "fa774d250e5c2526848d6578fea029a56a625c22b08143d43d2978edb5024a03"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/dialogue-layer.md",
+      "source": "de-ai-novel/references/dialogue-layer.md",
+      "sha256": "febd2b0d8ba64c8fce4323aaec19ebb47f14fcc7f585c41f3d936fc76d3202eb"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/generation-card-10.md",
+      "source": "de-ai-novel/references/generation-card-10.md",
+      "sha256": "52a9214088e4ab2a196fb72f9794d3d335dd6a45f2baa5da8d1e9ede34c465e5"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/mainline-tables.md",
+      "source": "de-ai-novel/references/mainline-tables.md",
+      "sha256": "5c5f601c36f7979ff6772218462a5c77332bff459c1971d082ac9160259e1e9a"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/narrative-craft.md",
+      "source": "de-ai-novel/references/narrative-craft.md",
+      "sha256": "d43c56b9c96244513f393e9206b4a486b8bbe930d410f1422c37ff80c1d95849"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/review-playbook.md",
+      "source": "de-ai-novel/references/review-playbook.md",
+      "sha256": "ef16377f90383b9e604daef3b00ba21ce015674d98ce99447051f4be1fd4d545"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/six-axis.md",
+      "source": "de-ai-novel/references/six-axis.md",
+      "sha256": "69bc071385179b1964bacdbef5a47b53cb4bbc4aca6ff413331a6fcbd537f8db"
+    },
+    {
+      "skill": "de-ai-novel",
+      "path": "references/style-layer-27.md",
+      "source": "de-ai-novel/references/style-layer-27.md",
+      "sha256": "9906569c7d63cd705a055e0b5b58303a496d52e00a025a1c6a0dfde5f69bd496"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/common-knowledge.md",
+      "source": "references/common-knowledge.md",
+      "sha256": "39d944e0cdee4cdc52598d174ab05103fdc314deb40f5354c3325939581c3254"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/ips-training-model.md",
+      "source": "references/ips-training-model.md",
+      "sha256": "c7396fe50bf62caafccfe39cf998cc103c0951b5ed57584d1ee9051ec465c30b"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M01_经典范例全文标注.md",
+      "source": "references/skill-modules/M01_经典范例全文标注.md",
+      "sha256": "78a19932448d7df1f897a6b684e6f5e27c72bab05ecbbea1b31fd95a4be99c86"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M02_31 条写作铁律.md",
+      "source": "references/skill-modules/M02_31 条写作铁律.md",
+      "sha256": "cbcfad7827672fff17a57036388c351f7b220c9c853af492ed82d9d655827b30"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M03_常见写作病句对照表.md",
+      "source": "references/skill-modules/M03_常见写作病句对照表.md",
+      "sha256": "93ceae6edbce5c7847df0a452434ba1f9d18d15cd01165af81903af74282f040"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M04_各平台适配指南.md",
+      "source": "references/skill-modules/M04_各平台适配指南.md",
+      "sha256": "c7c51f4b015f470a291382fdba388d4b615f3e1cc4f8885196e26ce2d33a8492"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M05_正文生成质检附加项：StyleCheck.md",
+      "source": "references/skill-modules/M05_正文生成质检附加项：StyleCheck.md",
+      "sha256": "23fc69e222991bcd76bc73edd4e6cbb0a379c8b406ead237ec1609257531600d"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M06_内容纯净度规范.md",
+      "source": "references/skill-modules/M06_内容纯净度规范.md",
+      "sha256": "547cc19450ed4a6e49a30792dd2de0f41c55ea4fb24825c363574c76f6a69d9c"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M07_对话自然度规范.md",
+      "source": "references/skill-modules/M07_对话自然度规范.md",
+      "sha256": "f0303e7e5244110661cc922c321370146e3a92a14012ff385850a2c8cb31e7a2"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M08_POV_视角管理规则.md",
+      "source": "references/skill-modules/M08_POV_视角管理规则.md",
+      "sha256": "e6409846c27e484fcc34c9da95120543b45f12bb6a72afe3ff9a9692c57e772f"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M09_场景结构模板（Scene-Sequel 引擎）.md",
+      "source": "references/skill-modules/M09_场景结构模板（Scene-Sequel 引擎）.md",
+      "sha256": "93aa732537087105c2a8d151b58dd4e7f81f9899f060cc9afb2b810a3430331d"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M10_装逼打脸的节奏公式.md",
+      "source": "references/skill-modules/M10_装逼打脸的节奏公式.md",
+      "sha256": "1f1f3c78dd0c2994a9146df4e15f8befc18dd20670ec79e708ba59d5ea7cc97a"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M11_爽点类型学.md",
+      "source": "references/skill-modules/M11_爽点类型学.md",
+      "sha256": "ded564f15dae630d26e64db600272e130e02f785dfb7c2325509217950b790a2"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M12_悬念制造方法.md",
+      "source": "references/skill-modules/M12_悬念制造方法.md",
+      "sha256": "913a92b0d297df47f21a8d3426bede30ed28ea0c70379e1e461e2adf9759bce8"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M13_环境描写功能分类.md",
+      "source": "references/skill-modules/M13_环境描写功能分类.md",
+      "sha256": "67f4d757830d5d2ee97e0d4527895ec4833f7872a9fdae833c5bc6898f509087"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M14_三维错位：用思想·话语·行动的落差刻画深度.md",
+      "source": "references/skill-modules/M14_三维错位：用思想·话语·行动的落差刻画深度.md",
+      "sha256": "53b5cefd15453d02d3cc99edd2cbfef87391e010ef7c318209af961c6b03354c"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M15_选材原则：用1-2个定义性细节代替堆砌.md",
+      "source": "references/skill-modules/M15_选材原则：用1-2个定义性细节代替堆砌.md",
+      "sha256": "8d02df6129c1ceddb589fcbd90256917fc38e6e1d1274c03cd6b563530b03af1"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M16_侧面描写：用他人口吻和外界反馈塑造人物.md",
+      "source": "references/skill-modules/M16_侧面描写：用他人口吻和外界反馈塑造人物.md",
+      "sha256": "819b0f2e3cfff8e8606a2787dbe55f1c4adc698199a82c4f321f8dc271fd7fc0"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M17_细节创新审计：在模板框架内做出差异化.md",
+      "source": "references/skill-modules/M17_细节创新审计：在模板框架内做出差异化.md",
+      "sha256": "784d429581af32ac0fe404a0bcfd932c0f42d431cb2cef3f27666597d683098e"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M18_碎片化铺陈：零存整取式人物登场.md",
+      "source": "references/skill-modules/M18_碎片化铺陈：零存整取式人物登场.md",
+      "sha256": "b3af4495f81b988d44cce249077f0eeb46d8f0f09403345df13ce9de94c55569"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M19_回忆交织：双时间线叙事技法.md",
+      "source": "references/skill-modules/M19_回忆交织：双时间线叙事技法.md",
+      "sha256": "78c272c1b1d65ccc1eae73deeaab2a927b00c71000ab2ec64b17efaa23709637"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M20_物品象征：让物件替人物说话.md",
+      "source": "references/skill-modules/M20_物品象征：让物件替人物说话.md",
+      "sha256": "0f5881cb28abcc2a1374dd55f6d63035c9866a73d9611bbdb6461887fdcb3cab"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M21_三项精准强化规则.md",
+      "source": "references/skill-modules/M21_三项精准强化规则.md",
+      "sha256": "99eb881fac87992daa0381ee5bacf7a6e62cb204792087c4431abb5a08568f46"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M22_时间跳跃处理：跳跃期的写法、状态与信息管理.md",
+      "source": "references/skill-modules/M22_时间跳跃处理：跳跃期的写法、状态与信息管理.md",
+      "sha256": "26779457ea35962c97fa9dbad2c72f065ca6144d15e6fe328b09edb38db5ea2c"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M23_连载商业优化：标题、卷间衔接与钩子多样性.md",
+      "source": "references/skill-modules/M23_连载商业优化：标题、卷间衔接与钩子多样性.md",
+      "sha256": "28ddd641d53772d274486216b22a10fb80a5c54426cde9afc8d43121a220f883"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M24_非线性成长：进两步退一步的人物弧线.md",
+      "source": "references/skill-modules/M24_非线性成长：进两步退一步的人物弧线.md",
+      "sha256": "5cf852d293511b34af4b5ced6502494c3f97527108b73b71302a6f945c4b5052"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M25_群像场景调度：≥4人同场的焦点管理.md",
+      "source": "references/skill-modules/M25_群像场景调度：≥4人同场的焦点管理.md",
+      "sha256": "48979fc5369bd7b8fbc21cf81e7dd8ea7387bbdfeb5ee02a4856376f76c5e74e"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M26_死亡角色的持续影响：死后仍是故事的一部分.md",
+      "source": "references/skill-modules/M26_死亡角色的持续影响：死后仍是故事的一部分.md",
+      "sha256": "963c6d566da590791ac6d630f1e67ca56193cc22ecd7854dcb8b0a7b39828506"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M27_上帝视角因果交代.md",
+      "source": "references/skill-modules/M27_上帝视角因果交代.md",
+      "sha256": "8956665da340de29fd9cd34af4a93d4717783d013de6ae87ac0115bda05103f1"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M28_情绪细节外化.md",
+      "source": "references/skill-modules/M28_情绪细节外化.md",
+      "sha256": "11d33474ed4105ea42a0d14deed77e1d1bf00ce0338d4a17b53302ea6f39de7a"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M29_冲突场景画面感.md",
+      "source": "references/skill-modules/M29_冲突场景画面感.md",
+      "sha256": "4d3336734270bcb750628066fbba42b7b71a5fcd1cc7258e6060a26250e5acfb"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/M30_破折号解释禁令.md",
+      "source": "references/skill-modules/M30_破折号解释禁令.md",
+      "sha256": "b6faf9a8ee6c83c91e50effedbc0896d7352dec3bb49fdc4f85ad3c77ab320df"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/skill-modules/module_index.md",
+      "source": "references/skill-modules/module_index.md",
+      "sha256": "eeabc52641cc7c6cbeb9da6bf0475ab2fc182f97c3744ff1abdc4c5e0e526e4c"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/source-workflow.md",
+      "source": "references/SKILL.md",
+      "sha256": "894da6b7551a7d3fb2df8de6216ff32a39695e3c4c6412d21ac502ef5108e016"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/决策触发_模板.md",
+      "source": "references/templates/决策触发_模板.md",
+      "sha256": "6526a044742b413e36a11366896d5290432967c560110c08bdf215c34670be29"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/团队记忆库.md",
+      "source": "references/templates/团队记忆库.md",
+      "sha256": "a318802b6b6feeb97ddce84d027092a1fbbc552220237884910e799a0eef0a44"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/复盘报告_完整模板.md",
+      "source": "references/templates/复盘报告_完整模板.md",
+      "sha256": "ff23039e8de7ac52724a5d084e92884fdc8983d2d2326bb8dfe4f166d3a7b815"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/注射包_完整模板.md",
+      "source": "references/templates/注射包_完整模板.md",
+      "sha256": "2885fc28213980d29a4f97d807884c86d04601cd788d6a21d3cecca46969b8c0"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/设定锚点登记册_模板.md",
+      "source": "references/templates/设定锚点登记册_模板.md",
+      "sha256": "5f78d92c408a5c687a55172cf51e0d438137c986cd1b5a3e6605c5410760d1ef"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/调用参数_六角色模板.md",
+      "source": "references/templates/调用参数_六角色模板.md",
+      "sha256": "5b6f9bea8b016afcc3c7d5e4e132e746bbb342acf465006f898693e4f36c0583"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/进化通知_模板.md",
+      "source": "references/templates/进化通知_模板.md",
+      "sha256": "641c56f499102077be3c2a5836fe7f28215a60226da0840a4a4280c14b30a930"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/项目状态.md",
+      "source": "references/templates/项目状态.md",
+      "sha256": "c4dd0ad7ae408b19979a40a1f9368c5c79091c98c52bfa8071086945de60b615"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/项目状态_完整模板.md",
+      "source": "references/templates/项目状态_完整模板.md",
+      "sha256": "ad006272bfc7c4aa4173afa4e03be94b912248c066a060338e5ee57f4100cfb0"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/项目看板_模板.md",
+      "source": "references/templates/项目看板_模板.md",
+      "sha256": "d108a84f95698f1194da2e4eda4142070e38c5a4eb6b661e0ed56cda1a11fd73"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/templates/项目记忆库_schema.md",
+      "source": "references/templates/项目记忆库_schema.md",
+      "sha256": "ac79eb326d82bc0de5bda75a2dadf90bafa2b2d3f5f4460527aa710a8374f910"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/urban-warfare-rules.md",
+      "source": "references/urban-warfare-rules.md",
+      "sha256": "4b3b540aedd929e6e08e040a2812c6d191c2b5727a4c52e4fe616615730bab2a"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/v2.9-工序分层与红线熔断手册.md",
+      "source": "references/v2.9-工序分层与红线熔断手册.md",
+      "sha256": "4892c12e219e0d5dcd17115476de7a1db83ab287203934123fa08c23169f2b3d"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/writing-methodology-guide.md",
+      "source": "references/writing-methodology-guide.md",
+      "sha256": "d8599729a908061062ca2db996cf943c4eda8a39335f8dfee0f5f9a8204376a8"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/writing-style-reference.md",
+      "source": "references/writing-style-reference.md",
+      "sha256": "740cac6454c464069cdf7df5f742a1c6312f2300ade947e43db1512db3242a80"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/团队学习更新区.md",
+      "source": "references/团队学习更新区.md",
+      "sha256": "f4603974fe3735a54029b1e43189f412806c079c046fac0453506cc5b8012d7f"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/活人感五维诊断卡.md",
+      "source": "references/活人感五维诊断卡.md",
+      "sha256": "995f931a43c4fa950228e780bc9fa4cb99585cacfd3fa584c53fb9a6c87441c7"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/版本changelog.md",
+      "source": "references/版本changelog.md",
+      "sha256": "990c2e2cb82e92caf95bd1230c3d3781d1a3146f527d5e1df955b8c87f1f7a49"
+    },
+    {
+      "skill": "novel-workshop",
+      "path": "references/source-coordinator.md",
+      "source": "agents/novel-workshop-team-lead.md",
+      "sha256": "3242cd854d6ff0c3e9c18969f46a8dd76766aa34adeb092c045f08ef0675e5ea"
+    },
+    {
+      "skill": "workshop-world-architect",
+      "path": "references/expert-methods.md",
+      "source": "agents/world-architect.md",
+      "sha256": "c3dde2b986c49e7136f55ea898d047d9f0dc8c8c6dee75ee1e5999a9a53f1022"
+    },
+    {
+      "skill": "workshop-character-designer",
+      "path": "references/expert-methods.md",
+      "source": "agents/character-designer.md",
+      "sha256": "2f566dbedc1253acbace768333fb0bd034395218b58475912add0ec30bd6ae7d"
+    },
+    {
+      "skill": "workshop-outline-planner",
+      "path": "references/expert-methods.md",
+      "source": "agents/outline-planner.md",
+      "sha256": "d84945771e4a7b10e63f29a652c772c155699f5e57344f606d53010568903954"
+    },
+    {
+      "skill": "workshop-plot-engine",
+      "path": "references/expert-methods.md",
+      "source": "agents/plot-engine.md",
+      "sha256": "e2cc4d5f833beb9b5559b859314648ad02f7572bf9b52f4b11089edb0d23e130"
+    },
+    {
+      "skill": "workshop-writing-executor",
+      "path": "references/expert-methods.md",
+      "source": "agents/writing-executor.md",
+      "sha256": "b8cd2f709b894831538c4ba78b328e8cacbddbf2a03acbeded6e83beac362d08"
+    },
+    {
+      "skill": "workshop-quality-editor",
+      "path": "references/expert-methods.md",
+      "source": "agents/quality-editor.md",
+      "sha256": "d8092ba323de02b2d4d43f0efd67e3880dd4fd9c72555615745ce90c04e27630"
+    },
+    {
+      "skill": "workshop-business-analyst",
+      "path": "references/expert-methods.md",
+      "source": "agents/business-analyst.md",
+      "sha256": "ad8f83b0a813cc3eb43b7b8e1daef6cb13726d7734b9d133ae806c6eacc5edd5"
+    },
+    {
+      "skill": "workshop-audit-officer",
+      "path": "references/expert-methods.md",
+      "source": "agents/audit-officer.md",
+      "sha256": "906dd7ac61dfa82d5d04b6bd47b3cc2e5b51d9637544e249d73d9112e8bd8aae"
+    }
+  ]
+}

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=writing-director-20260927">
+  <link rel="stylesheet" href="style.css?v=writing-packs-20260929">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -87,6 +87,7 @@
             <button data-ic="scissors" data-label="在光标处拆章" onclick="splitChapter();closeMoreMenu()"></button>
             <button data-ic="bookmark" data-label="存为版本" onclick="saveRevision();closeMoreMenu()"></button>
             <button data-ic="clock" data-label="历史版本" onclick="showRevisions();closeMoreMenu()"></button>
+            <button id="writingScanBtn" data-ic="eye" data-label="文字检查" onclick="runWritingScan();closeMoreMenu()"></button>
             <div class="menu-sep"></div>
             <div class="menu-label">导出</div>
             <button data-ic="download" data-label="本章 TXT" onclick="exportChap('txt');closeMoreMenu()"></button>
@@ -123,6 +124,7 @@
         <span id="selectionTools" class="tool-group selection-tools hidden">
           <span class="tool-hint">选区</span>
           <button class="ic" data-ic="bot" data-label="问 AI" onclick="quoteSelectionToAgent()" title="把选中文字交给右侧 AI 助手"></button>
+          <button class="ic" data-ic="eye" onclick="runWritingScan(true)" title="检查选中文字" aria-label="检查选中文字"></button>
           <button class="ic" data-ic="shrink" data-label="缩写" onclick="processSelection('缩写')" title="把选中的段落缩到约一半"></button>
           <select id="rwStyle" class="ic" title="改写风格">
             <option>更生动</option><option>更精炼</option><option>文艺风</option><option>口语化</option><option>悬疑感</option>
@@ -764,6 +766,7 @@
     <div class="overlay-card writing-quality-dialog">
       <div class="overlay-head"><span id="writingQualityTitle">写作体检</span><button class="ic" data-ic="x" onclick="closeWritingQualityReview()" title="关闭体检"></button></div>
       <div id="writingQualityBody" class="writing-quality-body"></div>
+      <div id="writingQualityActions" class="writing-scan-actions hidden"></div>
     </div>
   </div>
 
@@ -919,14 +922,14 @@
   <div id="skillsOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
       <div class="overlay-head">
-        <span>AI Skills</span>
+        <span>写作技能与专家</span>
         <span class="overlay-head-actions">
           <button class="ic" data-ic="upload" onclick="chooseSkillImport()" title="导入 SKILL.md 或 Skill ZIP 包"></button>
           <button class="ic" data-ic="x" onclick="closeSkills()"></button>
         </span>
       </div>
       <div class="set-form">
-        <p class="set-hint">内置 Skill 对所有作品可用且由系统维护。你也可以上传标准 `SKILL.md` 或包含它的 ZIP 包；Agent 会先识别匹配项，再按需加载完整规则和 references 文本。</p>
+        <input id="skillManagerSearch" type="search" placeholder="搜索技能、专家或用途" aria-label="搜索全部技能" oninput="renderSkillList()">
         <div class="skill-import-bar">
           <div><b>导入新 Skill</b><small>ZIP 中须且只能包含一个 SKILL.md；文本 references 会一并导入，脚本不会执行。</small></div>
           <span><select id="skillImportScope" class="ic" title="导入范围"><option value="global">所有作品可用</option><option value="work">仅当前作品</option></select><button class="ic" data-ic="upload" onclick="chooseSkillImport()">选择 ZIP / SKILL.md</button></span>
@@ -954,20 +957,33 @@
   <div id="skillPickerOverlay" class="overlay hidden">
     <div class="overlay-card">
       <div class="overlay-head">
-        <span>本轮 AI Skills</span>
+        <span>写作技能与专家</span>
         <span class="overlay-head-actions">
           <button class="ic" data-ic="settings" onclick="closeSkillPicker();openSkills()" title="管理 Skills"></button>
           <button class="ic" data-ic="x" onclick="closeSkillPicker()"></button>
         </span>
       </div>
       <div class="set-form">
-        <p class="set-hint">最多选择 4 个。它们只影响下一次发送，不会永久改变 Agent。</p>
+        <input id="skillPickerSearch" type="search" placeholder="搜索：人物、推演、润色…" aria-label="搜索可选技能" oninput="renderSkillPickerList()">
+        <div class="skill-selection-status"><span id="skillSelectionCount"></span><button class="ic" onclick="runWritingScan()" title="检查当前正文">文字检查</button></div>
         <div id="skillPickerList" class="skill-picker-list"></div>
         <div class="set-actions">
           <button class="ic" onclick="clearActiveSkills()">清除选择</button>
           <button onclick="closeSkillPicker()">完成</button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div id="skillResourceOverlay" class="overlay hidden" role="dialog" aria-modal="true" aria-label="技能资料">
+    <div class="overlay-card skill-resource-dialog">
+      <div class="overlay-head"><span id="skillResourceTitle">技能资料</span><button class="ic" data-ic="x" onclick="closeSkillResources()" title="关闭技能资料"></button></div>
+      <div class="skill-resource-toolbar">
+        <select id="skillResourcePath" aria-label="选择参考资料" onchange="loadSkillResourcePage(0)"></select>
+        <div class="skill-resource-search"><input id="skillResourceQuery" type="search" placeholder="搜索当前资料" aria-label="搜索当前资料" onkeydown="if(event.key==='Enter')loadSkillResourcePage(0,true)"><button class="ic" data-ic="search" onclick="loadSkillResourcePage(0,true)" title="查找资料内容"></button></div>
+      </div>
+      <pre id="skillResourceText" class="skill-resource-text"></pre>
+      <div class="skill-resource-footer"><span id="skillResourcePosition"></span><button id="skillResourcePrev" class="ic" data-ic="chevL" onclick="loadSkillResourcePage(Math.max(0,skillResourceOffset-6000))" title="上一段"></button><button id="skillResourceNext" class="ic" data-ic="chevR" onclick="loadSkillResourcePage(skillResourceNextOffset)" title="下一段"></button></div>
     </div>
   </div>
 
@@ -1130,6 +1146,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=writing-director-20260927"></script>
+  <script src="app.js?v=writing-packs-20260929"></script>
 </body>
 </html>

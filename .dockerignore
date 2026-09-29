@@ -9,3 +9,6 @@ data/
 .git
 .gitignore
 README.md
+.analysis/
+.smoke_tmp/
+*.zip

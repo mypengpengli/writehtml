@@ -298,7 +298,9 @@ function createWritingTool(spec) {
 }
 
 function installWritingToolLifecycle(session) {
-  const pendingSystemPrompts = [];
+  // Pi can rebuild its system prompt between tool turns. Keep transient material
+  // for this task, without copying it into the persisted conversation.
+  const activeSystemPrompts = new Set();
   const previousAfterToolCall = session.agent.afterToolCall;
   const previousPrepareNextTurn = session.agent.prepareNextTurnWithContext;
 
@@ -308,7 +310,7 @@ function installWritingToolLifecycle(session) {
       return previousAfterToolCall ? previousAfterToolCall(context, signal) : undefined;
     }
     if (typeof details._pi_system === "string" && details._pi_system) {
-      pendingSystemPrompts.push(details._pi_system);
+      activeSystemPrompts.add(details._pi_system);
     }
     const publicDetails = publicToolResult(details);
     return {
@@ -320,9 +322,10 @@ function installWritingToolLifecycle(session) {
 
   session.agent.prepareNextTurnWithContext = async (turn, signal) => {
     const prepared = previousPrepareNextTurn ? await previousPrepareNextTurn(turn, signal) : undefined;
-    if (!pendingSystemPrompts.length) return prepared;
-    const additions = pendingSystemPrompts.splice(0).join("\n\n");
     const context = prepared?.context || turn.context;
+    const additions = [...activeSystemPrompts]
+      .filter(prompt => !context.systemPrompt?.includes(prompt)).join("\n\n");
+    if (!additions) return prepared;
     return {
       ...(prepared || {}),
       context: {

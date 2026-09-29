@@ -45,6 +45,7 @@ let agentConversationRequest = 0;
 let agentSessionScopeKey = "";
 let agentSkills = [];
 let agentSkillsWorkId = undefined;
+let agentSkillsRequest = 0;
 let activeAgentSkillIds = new Set();
 let pendingAgentDocuments = [];
 let materialData = null;
@@ -2454,21 +2455,30 @@ function persistActiveSkills() {
   localStorage.setItem(agentSkillStorageKey(), JSON.stringify([...activeAgentSkillIds]));
 }
 function enabledSkills() { return agentSkills.filter(s => Number(s.enabled) && !Number(s.auto_activate)); }
+function skillLabel(skill) { return skill.display_name || skill.name; }
+function filterSkills(skills, query) {
+  const value = (query || "").trim().toLocaleLowerCase();
+  return skills.filter(skill => [skillLabel(skill), skill.name, skill.description].join(" ").toLocaleLowerCase().includes(value));
+}
 function selectedSkills() {
   const active = activeAgentSkillIds;
   return enabledSkills().filter(s => active.has(s.id));
 }
 async function loadAgentSkills() {
-  const changedWork = agentSkillsWorkId !== currentWorkId;
+  const request = ++agentSkillsRequest, workId = currentWorkId, username = currentUsername;
+  const changedWork = agentSkillsWorkId !== workId;
   try {
-    const q = currentWorkId ? `?work_id=${encodeURIComponent(currentWorkId)}` : "";
-    agentSkills = await api(`/api/agent/skills${q}`, { method: "GET" });
-    agentSkillsWorkId = currentWorkId;
+    const q = workId ? `?work_id=${encodeURIComponent(workId)}` : "";
+    const result = await api(`/api/agent/skills${q}`, { method: "GET" });
+    if (request !== agentSkillsRequest || workId !== currentWorkId || username !== currentUsername) return;
+    agentSkills = result;
+    agentSkillsWorkId = workId;
     if (changedWork) restoreActiveSkills();
     const allowed = new Set(enabledSkills().map(s => s.id));
     activeAgentSkillIds = new Set([...activeAgentSkillIds].filter(id => allowed.has(id)));
     persistActiveSkills();
   } catch (e) {
+    if (request !== agentSkillsRequest || workId !== currentWorkId || username !== currentUsername) return;
     agentSkills = [];
     if (changedWork) activeAgentSkillIds = new Set();
   }
@@ -2482,14 +2492,14 @@ function renderAgentSkills() {
   if (!skills.length) { host.innerHTML = ""; host.classList.add("hidden"); return; }
   host.innerHTML = skills.map(s => `
     <button class="agent-skill-chip" onclick="removeActiveSkill(${s.id})" title="取消本轮 Skill：${esc(s.name)}">
-      ${svg("sparkles")}<span>${esc(s.name)}</span>${svg("x")}
+      ${svg("sparkles")}<span>${esc(skillLabel(s))}</span>${svg("x")}
     </button>`).join("");
   host.classList.remove("hidden");
 }
 function toggleActiveSkill(skillId) {
   if (activeAgentSkillIds.has(skillId)) activeAgentSkillIds.delete(skillId);
   else {
-    if (activeAgentSkillIds.size >= 4) { showToast("一次最多选择 4 个 Skill", "err"); return; }
+    if (activeAgentSkillIds.size >= 4) { showToast("一次最多选择 4 个 Skill", "err"); renderSkillPickerList(); return; }
     activeAgentSkillIds.add(skillId);
   }
   persistActiveSkills();
@@ -2516,15 +2526,17 @@ async function openSkillPicker() {
 function closeSkillPicker() { $("skillPickerOverlay").classList.add("hidden"); }
 function renderSkillPickerList() {
   const host = $("skillPickerList");
-  const skills = enabledSkills();
-  const automatic = agentSkills.filter(s => Number(s.enabled) && Number(s.auto_activate));
-  host.innerHTML = automatic.map(s => `<div class="skill-pick-row"><span class="skill-pick-copy"><b>${esc(s.name)}</b><small>${esc(s.description || "")}</small></span><span class="skill-source builtin">系统内置 · 自动启用</span></div>`).join("")
+  const query = $("skillPickerSearch").value;
+  const skills = filterSkills(enabledSkills(), query);
+  const automatic = filterSkills(agentSkills.filter(s => Number(s.enabled) && Number(s.auto_activate)), query);
+  $("skillSelectionCount").textContent = `已选 ${activeAgentSkillIds.size} / 4`;
+  host.innerHTML = automatic.map(s => `<div class="skill-pick-row"><span class="skill-pick-copy"><b>${esc(skillLabel(s))}</b><small>${esc(s.description || "")}</small></span><span class="skill-source builtin">自动启用</span><button class="ic" onclick="openSkillResources(${s.id})" title="查看技能资料">${svg("book")}</button></div>`).join("")
     + (skills.length ? skills.map(s => `
-    <label class="skill-pick-row">
+    <div class="skill-pick-row"><label class="skill-pick-choice">
       <input type="checkbox" ${activeAgentSkillIds.has(s.id) ? "checked" : ""} onchange="toggleActiveSkill(${s.id})">
-      <span class="skill-pick-copy"><b>${esc(s.name)}</b>${s.description ? `<small>${esc(s.description)}</small>` : ""}</span>
-      <span class="skill-pick-tags"><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "builtin" ? '<span class="skill-source builtin">内置</span>' : (s.source_kind === "skill_md" ? '<span class="skill-source">MD</span>' : "")}</span>
-    </label>`).join("") : automatic.length ? "" : '<div class="empty">还没有可用的 Skill。点右上角设置图标新建。</div>');
+      <span class="skill-pick-copy"><b>${esc(skillLabel(s))}</b>${s.description ? `<small>${esc(s.description)}</small>` : ""}</span></label>
+      <button class="ic" onclick="openSkillResources(${s.id})" title="查看技能资料">${svg("book")}</button>
+    </div>`).join("") : automatic.length ? "" : '<div class="empty">没有匹配的技能</div>');
 }
 
 let editingSkillId = null;
@@ -2565,18 +2577,72 @@ async function importSkillFile() {
 }
 function renderSkillList() {
   const host = $("skillList");
-  host.innerHTML = agentSkills.length ? agentSkills.map(s => `
+  const visible = filterSkills(agentSkills, $("skillManagerSearch").value);
+  host.innerHTML = visible.length ? visible.map(s => `
     <div class="skill-row${Number(s.enabled) ? "" : " disabled"}">
       <div class="skill-row-main">
-        <div class="skill-row-head"><b>${esc(s.name)}</b><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "builtin" ? `<span class="skill-source builtin">${Number(s.auto_activate) ? "系统内置 · 自动启用" : "内置"}</span>` : (s.source_kind === "skill_md" ? '<span class="skill-source">SKILL.md</span>' : "")}${Number(s.resource_count) ? `<span class="skill-source">${Number(s.resource_count)} 资料</span>` : ""}${Number(s.enabled) ? "" : '<span class="skill-off">已停用</span>'}</div>
+        <div class="skill-row-head"><b>${esc(skillLabel(s))}</b><span class="skill-scope">${s.work_id == null ? "通用" : "本作品"}</span>${s.source_kind === "builtin" ? `<span class="skill-source builtin">${Number(s.auto_activate) ? "系统内置 · 自动启用" : "内置"}</span>` : (s.source_kind === "skill_md" ? '<span class="skill-source">SKILL.md</span>' : "")}${Number(s.resource_count) ? `<span class="skill-source">${Number(s.resource_count)} 资料</span>` : ""}${Number(s.enabled) ? "" : '<span class="skill-off">已停用</span>'}</div>
         ${s.description ? `<div class="skill-desc">${esc(s.description)}</div>` : ""}
         <div class="skill-rule">${esc(s.instruction)}</div>
       </div>
-      <div class="skill-row-actions">${s.source_kind === "builtin" ? '<span class="set-hint">系统维护</span>' : `
+      <div class="skill-row-actions"><button class="ic" onclick="openSkillResources(${s.id})" title="查看技能资料">${svg("book")}</button>${s.source_kind === "builtin" ? '' : `
         <button class="ic" onclick="startEditSkill(${s.id})" title="编辑 Skill">${svg("pen")}</button>
         <button class="ic" onclick="delSkill(${s.id})" title="删除 Skill">${svg("trash")}</button>`}
       </div>
-    </div>`).join("") : '<div class="empty">还没有 Skill。先为常用写作要求建一个模板。</div>';
+    </div>`).join("") : '<div class="empty">没有匹配的技能</div>';
+}
+
+let skillResourceId = null, skillResourceRequest = 0, skillResourceOffset = 0, skillResourceNextOffset = null;
+function closeSkillResources() {
+  skillResourceRequest++;
+  $("skillResourceOverlay").classList.add("hidden");
+}
+async function openSkillResources(skillId) {
+  const skill = agentSkills.find(item => item.id === skillId);
+  if (!skill) return;
+  const request = ++skillResourceRequest;
+  skillResourceId = skillId;
+  $("skillResourceTitle").textContent = skillLabel(skill);
+  $("skillResourceQuery").value = "";
+  $("skillResourcePath").innerHTML = '<option value="">技能说明</option>';
+  $("skillResourceText").textContent = skill.instruction || "";
+  $("skillResourcePosition").textContent = "";
+  $("skillResourcePrev").disabled = $("skillResourceNext").disabled = true;
+  $("skillResourceOverlay").classList.remove("hidden");
+  try {
+    const resources = await api(`/api/agent/skills/${skillId}/resources`, { method: "GET" });
+    if (request !== skillResourceRequest) return;
+    $("skillResourcePath").innerHTML += resources.map(item => `<option value="${esc(item.path)}">${esc(item.path.replace(/^references\//, ""))}</option>`).join("");
+    $("skillResourcePosition").textContent = `${resources.length} 份参考资料`;
+  } catch (e) {
+    if (request === skillResourceRequest) $("skillResourcePosition").textContent = e.message;
+  }
+}
+async function loadSkillResourcePage(offset = 0, search = false) {
+  if (offset == null) return;
+  const request = ++skillResourceRequest;
+  const path = $("skillResourcePath").value;
+  $("skillResourcePrev").disabled = $("skillResourceNext").disabled = true;
+  if (!path) {
+    $("skillResourceText").textContent = agentSkills.find(item => item.id === skillResourceId)?.instruction || "";
+    $("skillResourcePosition").textContent = "技能说明";
+    return;
+  }
+  $("skillResourcePosition").textContent = "读取中…";
+  try {
+    const params = new URLSearchParams({ path, offset: String(offset), query: search ? $("skillResourceQuery").value.trim() : "" });
+    const result = await api(`/api/agent/skills/${skillResourceId}/resource?${params}`, { method: "GET" });
+    if (request !== skillResourceRequest) return;
+    skillResourceOffset = result.offset;
+    skillResourceNextOffset = result.next_offset;
+    $("skillResourceText").textContent = result.matched ? result.content : "未找到匹配内容";
+    $("skillResourceText").scrollTop = 0;
+    $("skillResourcePosition").textContent = `${result.offset} / ${result.total_chars} 字符`;
+    $("skillResourcePrev").disabled = result.offset === 0;
+    $("skillResourceNext").disabled = result.next_offset == null;
+  } catch (e) {
+    if (request === skillResourceRequest) $("skillResourcePosition").textContent = e.message;
+  }
 }
 function resetSkillForm() {
   editingSkillId = null;
@@ -2821,6 +2887,7 @@ function renderAgentMarkdown(value) {
 }
 function agentToolMeta(name) {
   const value = String(name || "tool");
+  if (value === "scan_writing_text") return { tone: "read", icon: "eye", label: "文字检查" };
   if (value === "web_search" || /search|find/i.test(value)) return { tone: "search", icon: "search", label: "搜索" };
   if (/read|list|get|context|inspect/i.test(value)) return { tone: "read", icon: "eye", label: "读取" };
   if (/delete|remove|purge/i.test(value)) return { tone: "danger", icon: "trash", label: "删除" };
@@ -2980,7 +3047,8 @@ function renderWritingGuide() {
   if (readyChecks.has("chapter_plan")) completedStages.add("chapter_planning");
   if (writingGuide.facts.chapter_chars) completedStages.add("drafting");
   if (writingGuide.facts.production_analysis_status === "current") completedStages.add("state_sync");
-  if (completedStages.has("state_sync") && !writingGuide.facts.realization_pending && !writingGuide.facts.pending_changes && !writingGuide.facts.critical_alerts) completedStages.add("review");
+  if (completedStages.has("state_sync") && !writingGuide.facts.realization_pending && !writingGuide.facts.pending_changes
+      && !writingGuide.facts.critical_alerts && !writingGuide.facts.warning_alerts && !writingGuide.facts.downstream_impacts) completedStages.add("review");
   flow.innerHTML = `<span class="writing-guide-flow-label">创作进度</span><div class="writing-guide-flow-steps">${steps.map(([stage, label, target]) =>
     `<button class="${activeStage === stage ? "active" : ""}" onclick="jumpWritingGuideStage('${target}')" title="${label}${completedStages.has(stage) ? "已具备" : ""}">${completedStages.has(stage) ? svg("check") : ""}${label}</button>`).join("")}</div>
     <span class="writing-guide-flow-next">${esc(writingGuide.message)}</span>${actionButton(writingGuide.primary_action, "primary", true)}`;
@@ -3047,31 +3115,94 @@ async function dispatchWritingGuideAction(action) {
   await sendAgent(action);
 }
 
+let writingQualityRequest = 0, writingScanState = null;
 function closeWritingQualityReview() {
+  writingQualityRequest++;
   $("writingQualityOverlay").classList.add("hidden");
 }
 
 async function runWritingQualityReview(kind, itemId) {
   if (!Number.isInteger(+itemId) || +itemId <= 0 || !["chapter", "plan"].includes(kind)) return;
+  const request = ++writingQualityRequest;
+  if (kind === "chapter" && +itemId === currentChapterId && !await flushEditorSave()) return;
   if (kind === "plan" && storyPlanSaveTimer && productionSelected?.item?.id === +itemId) {
     clearTimeout(storyPlanSaveTimer);
     storyPlanSaveTimer = null;
     if (!await saveStoryPlanFromInspector(true)) return;
   }
+  if (request !== writingQualityRequest) return;
   const overlay = $("writingQualityOverlay");
   $("writingQualityTitle").textContent = kind === "plan" ? "规划体检" : "正文体检";
+  $("writingQualityActions").classList.add("hidden");
   $("writingQualityBody").innerHTML = '<div class="agent-chat-loading"><span class="spinner"></span>正在体检…</div>';
   overlay.classList.remove("hidden");
   try {
     const path = kind === "plan" ? `/api/story-plan/${itemId}/quality-review` : `/api/chapters/${itemId}/writing-quality-review`;
     const result = await api(path, { body: { model: activeModelId } });
-    if (overlay.classList.contains("hidden")) return;
+    if (request !== writingQualityRequest || overlay.classList.contains("hidden")) return;
     $("writingQualityBody").innerHTML = `<p class="writing-quality-note">${result.excerpted ? "本次只检查正文开头和结尾片段；中间内容未送审。" : "仅根据本次提交内容评价，不自动修改正文或规划。"}</p>
       <p class="writing-quality-summary">${esc(result.summary || "体检完成")}</p>
       <div class="writing-quality-list">${result.dimensions.map(row => `<section><div><b>${esc(row.name)}</b><strong>${esc(String(row.score))}/10</strong></div><p><span>依据</span>${esc(row.evidence || "未提供")}</p>${row.suggestion ? `<p><span>建议</span>${esc(row.suggestion)}</p>` : ""}</section>`).join("")}</div>`;
   } catch (e) {
-    if (!overlay.classList.contains("hidden")) $("writingQualityBody").innerHTML = `<p class="msg">${esc(e.message)}</p>`;
+    if (request === writingQualityRequest && !overlay.classList.contains("hidden")) $("writingQualityBody").innerHTML = `<p class="msg">${esc(e.message)}</p>`;
   }
+}
+
+async function runWritingScan(useSelection = false) {
+  const chapterId = currentChapterId, workId = currentWorkId;
+  if (!chapterId) { showToast("先打开一个正文章节", "err"); return; }
+  const selection = useSelection ? getContentSelection() : null;
+  if (useSelection && !selection) return;
+  if (!await flushEditorSave() || currentChapterId !== chapterId || currentWorkId !== workId) return;
+  closeSkillPicker(); closeSkills(); closeSkillResources();
+  writingScanState = { chapterId, workId, selection, body: selection ? { text: selection.text, excerpt: true } : {} };
+  await loadWritingScanPage(0);
+}
+async function loadWritingScanPage(offset) {
+  const state = writingScanState;
+  if (!state || state.workId !== currentWorkId) return;
+  const request = ++writingQualityRequest;
+  $("writingQualityTitle").textContent = state.selection ? "选区文字检查" : "本章文字检查";
+  $("writingQualityActions").classList.add("hidden");
+  $("writingQualityBody").innerHTML = '<div class="agent-chat-loading"><span class="spinner"></span>正在检查…</div>';
+  $("writingQualityOverlay").classList.remove("hidden");
+  try {
+    const result = await api(`/api/chapters/${state.chapterId}/writing-scan`, { body: { ...state.body, offset } });
+    if (request !== writingQualityRequest || state !== writingScanState || state.workId !== currentWorkId) return;
+    const outdated = !state.selection && state.chapterId === currentChapterId && (dirty || editorContentRevision !== result.source_version);
+    state.result = result;
+    $("writingQualityBody").innerHTML = `<div class="writing-scan-summary"><b>${result.total} 项待复核候选</b><span>本地检查 · 未修改正文</span></div>
+      ${outdated ? '<p class="msg">正文已变化，本次结果对应上一次保存版本。</p>' : ''}
+      <p class="writing-quality-note">${esc(result.notice)}</p>
+      <div class="writing-quality-list writing-scan-list">${result.findings.map(item => `<section><div><b>${esc(item.label)}</b><span>${state.selection ? "片段" : ""}第 ${item.line} 行${item.related_line ? `，对照第 ${item.related_line} 行` : ""}</span></div><blockquote>${esc(item.evidence)}</blockquote><p>${esc(item.suggestion)}</p></section>`).join("") || '<p>未命中当前规则。人物动机、事实连续性和文学质量仍可交给 AI 复核。</p>'}</div>`;
+    $("writingQualityBody").scrollTop = 0;
+    $("writingQualityActions").innerHTML = `<button onclick="handoffWritingScan()" ${agentBusy ? "disabled" : ""}>交给 AI 复核</button><button class="ic" onclick="runWritingScan()">重新检查本章</button>
+      <div class="writing-scan-paging"><span>${Math.min(result.total, offset + 1)}-${Math.min(result.total, offset + result.findings.length)} / ${result.total}</span>
+      <button class="ic" onclick="loadWritingScanPage(${Math.max(0, offset - 40)})" title="上一页" ${offset === 0 ? "disabled" : ""}>${svg("chevL")}</button>
+      <button class="ic" onclick="loadWritingScanPage(${result.next_offset ?? 0})" title="下一页" ${result.next_offset == null ? "disabled" : ""}>${svg("chevR")}</button></div>`;
+    $("writingQualityActions").classList.remove("hidden");
+  } catch (e) {
+    if (request === writingQualityRequest) $("writingQualityBody").innerHTML = `<p class="msg">${esc(e.message)}</p>`;
+  }
+}
+async function handoffWritingScan() {
+  const state = writingScanState;
+  if (agentBusy || !state?.result) return;
+  if (state.chapterId !== currentChapterId || state.workId !== currentWorkId) {
+    showToast("当前章节已切换，请在目标章节重新检查", "err"); return;
+  }
+  closeWritingQualityReview();
+  await loadAgentSkills();
+  if (state.chapterId !== currentChapterId || state.workId !== currentWorkId) return;
+  const skill = agentSkills.find(item => item.name === "de-ai-novel" && item.source_kind === "builtin");
+  if (skill && activeAgentSkillIds.size < 4) { activeAgentSkillIds.add(skill.id); persistActiveSkills(); renderAgentSkills(); }
+  agentSelection = state.selection;
+  renderAgentSelection();
+  const findings = state.result.findings.slice(0, 10).map(item => `- ${item.label}：${item.evidence}`).join("\n");
+  const prompt = `请使用小说修订方法复核${state.selection ? "选区" : "本章"}，先读取最新正文和相关设定。以下只是本地规则候选，不一定有错。请逐项给出依据与改法，暂不修改正文。\n${findings || "本次未命中机械规则，请结合语义检查。"}`;
+  $("agentInput").value = [$("agentInput").value.trim(), prompt].filter(Boolean).join("\n\n");
+  if (!$("app").classList.contains("ai-open")) toggleAISide();
+  $("agentInput").focus();
 }
 async function applyAgentResult(r, selection, baseMessages = null) {
   if (selection) clearAgentSelection();
@@ -7717,6 +7848,12 @@ function typewriterCenter() {
 /* ---------- 全局事件 ---------- */
 
 document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    const dialogs = [["skillResourceOverlay", closeSkillResources], ["writingQualityOverlay", closeWritingQualityReview],
+      ["skillPickerOverlay", closeSkillPicker], ["skillsOverlay", closeSkills]];
+    const open = dialogs.find(([id]) => !$(id).classList.contains("hidden"));
+    if (open) { e.preventDefault(); open[1](); return; }
+  }
   const inspirationOpen = !$("inspirationWorkspace")?.classList.contains("hidden");
   const productionOpen = $("app")?.classList.contains("production-open");
   if ((e.ctrlKey || e.metaKey) && e.key === "s") {

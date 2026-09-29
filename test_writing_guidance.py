@@ -92,6 +92,24 @@ still_pending = client.get(f"/api/works/{work_id}/writing-guidance?chapter_id={c
 expect(still_pending["primary_action"]["id"] == "review_plan_realization",
        "待核对记录不被误判为完成")
 
+entity = db.create_entity(work_id, uid, "林晚", "人物", "旅客", "谨慎")
+db.upsert_character_state_proposal(entity["id"], uid, chapter_id, {"location": "车站"}, "抵达车站")
+db.upsert_plot_state_proposal(work_id, uid, chapter_id, {"current_event": "寻找钥匙"})
+db.upsert_story_memory_proposal(work_id, uid, chapter_id, {
+    "memory_type": "event", "title": "遇到陌生人", "content": "钥匙在陌生人手中", "evidence": "陌生人手中",
+})
+pending_guide = writing_guidance.build_writing_guidance(uid, work_id, chapter_id)
+expect(pending_guide["primary_action"]["id"] == "open_chapter_state"
+       and all(pending_guide["facts"]["pending_by_type"][kind] == 1 for kind in ("characters", "plot", "memory")),
+       "人物、剧情和记忆提议均纳入导演待确认检查")
+with db.get_conn() as conn:
+    for table in ("entity_state_proposals", "plot_state_proposals", "story_memory_items"):
+        conn.execute(f"UPDATE {table} SET source_content_hash='old-content' WHERE chapter_id=?", (chapter_id,))
+stale_guide = writing_guidance.build_writing_guidance(uid, work_id, chapter_id)
+expect(stale_guide["facts"]["pending_changes"] == 0
+       and stale_guide["primary_action"]["id"] == "review_plan_realization",
+       "旧正文产生的失效提议不重复催促确认")
+
 expect(writing_guidance.infer_intent("别管规划，直接写第一章") == "write_chapter",
        "明确直接写能识别为写作意图")
 expect(writing_guidance.infer_intent("先写再说") == "write_chapter", "口语化跳过规划指令能识别")

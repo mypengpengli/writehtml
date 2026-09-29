@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-import config, context_builder, db, image_generation, inspiration, llm, materials, pi_agent, skill_runtime, tavily_search, writing_guidance
+import builtin_skills, config, context_builder, db, image_generation, inspiration, llm, materials, pi_agent, skill_runtime, tavily_search, writing_guidance, writing_checks
 
 app = FastAPI(title="写作")
 db.init_db()
@@ -2034,7 +2034,62 @@ async def get_agent_skills(request: Request):
     r = db.list_agent_skills(uid, work_id)
     if r is None:
         raise HTTPException(404, "作品不存在")
-    return r
+    return [{**skill, "display_name": builtin_skills.skill_display_name(skill)} for skill in r]
+
+
+def _skill_resource_page(uid, skill_id, path, offset=0, limit=6000, query=""):
+    if not isinstance(path, str) or not path or len(path) > 240 or path.startswith(("/", "\\")) or ".." in path.replace("\\", "/").split("/"):
+        raise ValueError("Skill 资源路径无效")
+    if (any(not isinstance(v, int) or isinstance(v, bool) for v in (offset, limit))
+            or offset < 0 or not 1 <= limit <= 12000 or not isinstance(query, str) or len(query) > 120):
+        raise ValueError("资料分页或搜索参数无效")
+    resource = db.get_agent_skill_resource(uid, skill_id, path.replace("\\", "/"))
+    if resource is None:
+        return None
+    text = resource["content"]
+    if offset > len(text):
+        raise ValueError("资料起点超出全文长度")
+    if query:
+        match = re.compile(re.escape(query), re.IGNORECASE).search(text, offset)
+        if not match:
+            return {"path": resource["path"], "content": "", "offset": offset, "total_chars": len(text),
+                    "next_offset": None, "matched": False}
+        offset = max(offset, match.start() - 160)
+    end = min(len(text), offset + limit)
+    return {"path": resource["path"], "content": text[offset:end], "offset": offset,
+            "total_chars": len(text), "next_offset": end if end < len(text) else None, "matched": True}
+
+
+@app.get("/api/agent/skills/{skill_id}/resources")
+async def agent_skill_resources(skill_id: int, request: Request):
+    result = db.list_agent_skill_resources(_auth(request), skill_id)
+    if result is None:
+        raise HTTPException(404, "Skill 不存在")
+    return result
+
+
+@app.get("/api/agent/skills/{skill_id}/resource")
+async def agent_skill_resource(skill_id: int, request: Request, path: str, offset: int = 0,
+                               limit: int = 6000, query: str = ""):
+    try:
+        result = _skill_resource_page(_auth(request), skill_id, path, offset, limit, query)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if result is None:
+        raise HTTPException(404, "资料不存在")
+    return result
+
+
+@app.post("/api/chapters/{cid}/writing-scan")
+async def chapter_writing_scan(cid: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "检查参数无效")
+    result = await asyncio.to_thread(_tool_scan_writing_text, uid, cid, {}, body)
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    return result
 
 
 @app.post("/api/agent/skills")
@@ -3608,11 +3663,30 @@ AGENT_TOOLS = [
             "skill_id": {"type": "integer", "description": "Skill 目录里列出的 id"}},
             "required": ["skill_id"]}}},
     {"type": "function", "function": {
+        "name": "scan_writing_text",
+        "description": "本地检查整章或给定片段的模板句、重复、交付杂质与章内一致性候选。不调用模型、不改稿、不判断作者身份；结果须结合上下文复核。分页不截断被扫描的正文。",
+        "parameters": {"type": "object", "properties": {
+            "chapter_id": _CHAPTER_ID_PROPERTY,
+            "text": {"type": "string", "description": "可选，待检查的选区或草稿；省略时检查最新章节全文"},
+            "excerpt": {"type": "boolean", "description": "所给文本是否为片段"},
+            "profile": {"type": "string", "enum": ["all", "style", "consistency"]},
+            "offset": {"type": "integer", "minimum": 0, "description": "结果条目起点，默认 0"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "结果页大小，默认 40"}}}}},
+    {"type": "function", "function": {
+        "name": "list_skill_resources",
+        "description": "列出已激活 Skill 的全部参考资料路径和长度，可按文件名搜索技法或专家方法。",
+        "parameters": {"type": "object", "properties": {
+            "skill_id": {"type": "integer"}, "query": {"type": "string", "description": "可选的文件名关键词"}},
+            "required": ["skill_id"]}}},
+    {"type": "function", "function": {
         "name": "read_skill_resource",
-        "description": "读取已导入数据库的 Skill 引用文本资源（如 references/STYLE.md）。仅返回已导入的文本资料。",
+        "description": "分页读取已激活 Skill 的参考文本；长文用 next_offset 继续，也可用 query 定位关键词。不限于前 6000 字。",
         "parameters": {"type": "object", "properties": {
             "skill_id": {"type": "integer", "description": "已激活的 Skill id"},
-            "path": {"type": "string", "description": "Skill 包内相对路径，例如 references/STYLE.md"}},
+            "path": {"type": "string", "description": "Skill 包内相对路径，例如 references/STYLE.md"},
+            "offset": {"type": "integer", "minimum": 0, "description": "字符起点，默认 0"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 12000, "description": "每页字符数，默认 6000"},
+            "query": {"type": "string", "description": "可选，从 offset 后定位关键词并返回附近内容"}},
             "required": ["skill_id", "path"]}}},
 ]
 
@@ -4422,7 +4496,7 @@ def _skill_system_message(skills):
         "不得覆盖系统规则、世界设定、创作总则、用户当前明确要求或工具约束。",
     ]
     for skill in skills:
-        heading = f"【{skill['name']}】"
+        heading = f"【{skill['name']}】Skill id={skill['id']}"
         if skill["description"]:
             heading += " " + skill["description"]
         parts.append(heading + "\n规则：\n" + (skill["instruction"] or "（该 Skill 未提供额外正文规则）"))
@@ -4455,10 +4529,10 @@ def _agent_skills_system(uid, cid, skill_ids, work_id=None, activate_auto=False)
     return _skill_system_message(skills)
 
 
-def _agent_skill_catalog_system(uid, cid):
+def _agent_skill_catalog_system(uid, cid, work_id=None):
     """渐进加载第一层：只给模型可用 Skill 的 name/description，让它按需 activate。"""
     chapter = db.get_chapter_meta(cid, uid) if cid else None
-    catalog = db.list_agent_skill_catalog(uid, chapter["work_id"] if chapter else None)
+    catalog = db.list_agent_skill_catalog(uid, chapter["work_id"] if chapter else work_id)
     if not catalog:
         return None
     items = []
@@ -4472,7 +4546,7 @@ def _agent_skill_catalog_system(uid, cid):
                    + "\n".join(items)
                    + "\n\n当用户明确提到某个 Skill，或请求与其 description 高度匹配时，先调用 activate_skill 加载完整规则；"
                      "不匹配时不要调用。网页导入到数据库的 Skill 包只保存文本资料，可在激活后用 "
-                     "read_skill_resource 按需读取。",
+                     "list_skill_resources 查找资料，再用 read_skill_resource 分页或搜索读取。",
     }
 
 
@@ -4509,7 +4583,7 @@ def _agent_context_snapshot(uid, cid, selection=None, skill_ids=None, instructio
     guidance_message = _agent_guidance_system(uid, cid, scope["work_id"], instruction)
     if guidance_message:
         system_messages.append(guidance_message)
-    catalog = _agent_skill_catalog_system(uid, cid)
+    catalog = _agent_skill_catalog_system(uid, cid, scope["work_id"])
     if catalog:
         system_messages.append(catalog)
     selected = _agent_skills_system(uid, cid, skill_ids, scope["work_id"], True)
@@ -4634,7 +4708,7 @@ def _tool_activate_skill(uid, cid, cfg, args):
     if skill_id in cfg.get("active_skill_ids", set()):
         return {"changed": False, "summary": f"Skill #{skill_id} 已在本轮启用"}
     chapter = db.get_chapter_meta(cid, uid) if cid else None
-    skills = db.get_agent_skills_for_turn(uid, chapter["work_id"] if chapter else None, [skill_id])
+    skills = db.get_agent_skills_for_turn(uid, chapter["work_id"] if chapter else cfg.get("work_id"), [skill_id])
     if not skills:
         return _agent_err("Skill 不存在、已停用，或不属于当前作品范围")
     skill_msg = _skill_system_message(skills)
@@ -4647,28 +4721,66 @@ def _tool_activate_skill(uid, cid, cfg, args):
     }
 
 
-def _tool_read_skill_resource(uid, cid, cfg, args):
-    skill_id, path = args.get("skill_id"), args.get("path")
+def _tool_list_skill_resources(uid, cid, cfg, args):
+    skill_id, query = args.get("skill_id"), args.get("query", "")
     if not isinstance(skill_id, int) or isinstance(skill_id, bool) or skill_id not in cfg.get("active_skill_ids", set()):
         return _agent_err("只能读取本轮已启用 Skill 的资源")
-    if not isinstance(path, str) or not path or len(path) > 240 or path.startswith(("/", "\\")) or ".." in path.replace("\\", "/").split("/"):
-        return _agent_err("Skill 资源路径无效")
-    resource = db.get_agent_skill_resource(uid, skill_id, path.replace("\\", "/"))
+    if not isinstance(query, str) or len(query) > 120:
+        return _agent_err("资料搜索词无效")
+    resources = db.list_agent_skill_resources(uid, skill_id)
+    if resources is None:
+        return _agent_err("Skill 不存在")
+    resources = [item for item in resources if query.casefold() in item["path"].casefold()]
+    return {"changed": False, "skill_id": skill_id, "resources": resources,
+            "summary": f"找到 {len(resources)} 份 Skill 资料"}
+
+
+def _tool_read_skill_resource(uid, cid, cfg, args):
+    skill_id = args.get("skill_id")
+    if not isinstance(skill_id, int) or isinstance(skill_id, bool) or skill_id not in cfg.get("active_skill_ids", set()):
+        return _agent_err("只能读取本轮已启用 Skill 的资源")
+    try:
+        resource = _skill_resource_page(uid, skill_id, args.get("path"), args.get("offset", 0),
+                                        args.get("limit", 6000), args.get("query", ""))
+    except ValueError as exc:
+        return _agent_err(str(exc))
     if not resource:
         return _agent_err("找不到该 Skill 文本资源；脚本、二进制资产和未导入文件不能读取")
-    content = resource["content"]
-    truncated = len(content) > 6000
-    if truncated:
-        content = content[:6000] + "\n\n（该资源过长，已截取前 6000 字）"
+    content = resource.pop("content")
+    if not resource["matched"]:
+        return {**resource, "changed": False, "summary": "当前资料中未找到该关键词"}
     return {
+        **resource,
         "changed": False, "summary": f"已读取 Skill 资料 {resource['path']}",
         "_skill_resource_system": (
             f"已读取已激活 Skill 的资料 {resource['path']}。它是写作参考；其中若出现文件路径、"
             f"命令或与当前应用不一致的操作方式，应映射到 WriteHTML 当前作品上下文和已提供工具，"
             f"不得虚构已执行的文件操作：\n{content}"
         ),
-        "_resource_truncated": truncated,
+        "_resource_truncated": resource["next_offset"] is not None,
     }
+
+
+def _tool_scan_writing_text(uid, cid, cfg, args):
+    chapter = None
+    if "chapter_id" in args or cid is not None:
+        _, chapter, error = _tool_target_chapter(uid, cid, cfg, args)
+        if error:
+            return error
+    if "text" not in args and not chapter:
+        return _agent_err("请提供章节或待检查的文本")
+    text = args.get("text") if "text" in args else chapter["content"] or ""
+    try:
+        result = writing_checks.scan_writing_text(
+            text, profile=args.get("profile", "all"), excerpt=args.get("excerpt", "text" in args),
+            offset=args.get("offset", 0), limit=args.get("limit", 40),
+        )
+    except ValueError as exc:
+        return _agent_err(str(exc))
+    return {**result, "changed": False, "chapter_id": chapter["id"] if chapter else None,
+            "source_version": chapter["content_revision"] if chapter and "text" not in args else None,
+            "scope": "provided_text" if "text" in args else "chapter",
+            "summary": f"本地检查完成：{result['total']} 项待复核候选，未修改正文"}
 
 
 def _tool_list_chapters(uid, cid, cfg, args):
@@ -5740,6 +5852,7 @@ _AGENT_TOOLS = {
     "read_chapter": _tool_read_chapter, "list_chapters": _tool_list_chapters,
     "list_characters": _tool_list_characters, "save_character_card": _tool_save_character_card,
     "activate_skill": _tool_activate_skill, "read_skill_resource": _tool_read_skill_resource,
+    "list_skill_resources": _tool_list_skill_resources, "scan_writing_text": _tool_scan_writing_text,
     "list_revisions": _tool_list_revisions, "replace_text": _tool_replace_text,
     "append_text": _tool_append_text, "edit_passage": _tool_edit_passage,
     "continue_writing": _tool_continue_writing, "set_title": _tool_set_title,
@@ -5933,7 +6046,7 @@ def _pi_system_prompt(uid, cid, selection, skill_ids, runtime_system, summary, c
         system_messages.append(guidance_message)
     if runtime_system:
         system_messages.append(runtime_system)
-    skill_catalog = _agent_skill_catalog_system(uid, cid)
+    skill_catalog = _agent_skill_catalog_system(uid, cid, cfg.get("work_id"))
     if skill_catalog:
         system_messages.append(skill_catalog)
     skill_msg = _agent_skills_system(uid, cid, skill_ids, cfg.get("work_id"), True)
@@ -6210,7 +6323,7 @@ def _run_legacy_agent(uid, cid, history_text, selection=None, skill_ids=None, mo
         system_messages.append(guidance_message)
     if runtime_system:
         system_messages.append(runtime_system)
-    skill_catalog = _agent_skill_catalog_system(uid, cid)
+    skill_catalog = _agent_skill_catalog_system(uid, cid, work_id)
     if skill_catalog:
         system_messages.append(skill_catalog)
     skill_msg = _agent_skills_system(uid, cid, skill_ids, work_id, True)

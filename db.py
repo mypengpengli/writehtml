@@ -6329,6 +6329,16 @@ def get_agent_skill_resource(user_id, skill_id, path):
         return dict(r) if r else None
 
 
+def list_agent_skill_resources(user_id, skill_id):
+    with get_conn() as conn:
+        if not _agent_skill_owned(conn, skill_id, user_id):
+            return None
+        return [dict(row) for row in conn.execute(
+            "SELECT path,length(content) AS chars FROM agent_skill_resources WHERE skill_id=? ORDER BY path",
+            (skill_id,),
+        )]
+
+
 # ---------- 章节 ----------
 
 def list_chapters(wid, user_id):

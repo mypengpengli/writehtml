@@ -623,7 +623,26 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
 .skill-pick-copy b { color: var(--accent-text); font-size: 14px; }
 .skill-pick-copy small { margin-top: 2px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .skill-pick-tags { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.skill-pick-choice { display: flex; align-items: center; gap: 9px; min-width: 0; flex: 1; cursor: pointer; }
+.skill-pick-copy small { white-space: normal; overflow-wrap: anywhere; }
+.skill-selection-status { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; }
+.skill-resource-dialog { width: min(860px, calc(100vw - 24px)); max-width: 860px; height: min(800px, 90dvh); max-height: 90dvh; display: flex; flex-direction: column; }
+.skill-resource-toolbar { padding: 12px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(160px, .6fr); gap: 8px; border-bottom: 1px solid var(--line); }
+.skill-resource-toolbar select, .skill-resource-toolbar input { width: 100%; min-width: 0; }
+.skill-resource-search { display: flex; gap: 4px; min-width: 0; }
+.skill-resource-text { flex: 1; min-height: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px; margin: 0; font-size: 14px; line-height: 1.8; color: var(--ink); background: var(--side-bg); }
+.skill-resource-footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--line); }
+.skill-resource-footer > span { margin-right: auto; color: var(--muted); font-size: 12px; }
+.writing-scan-summary, .writing-scan-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.writing-scan-summary > span, .writing-scan-paging > span { color: var(--muted); font-size: 12px; }
+.writing-quality-list.writing-scan-list p { display: block; }
+.writing-scan-list section > div { flex-wrap: wrap; }
+.writing-scan-paging { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.writing-quality-list blockquote { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--accent); background: var(--side-bg); overflow-wrap: anywhere; }
+.writing-scan-actions { flex: 0 0 auto; padding: 10px 16px; border-top: 1px solid var(--line); background: var(--panel); }
 @media (max-width: 700px) {
+  .skill-resource-toolbar { grid-template-columns: minmax(0, 1fr); }
+  .skill-resource-dialog { height: 90dvh; }
   .skill-list, .skill-picker-list { max-height: 38vh; }
   .skill-row-actions .ic { min-width: 40px; min-height: 40px; }
   .agent-session-card { width: 100%; max-width: none; max-height: 88vh; align-self: flex-end; border-radius: var(--r-lg) var(--r-lg) 0 0; }

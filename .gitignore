@@ -16,6 +16,8 @@ runtime-debug-*/
 
 # 本地参考工程分析副本（体积大，不随应用发布）
 .analysis/
+de-ai-novel.zip
+.codebuddy-plugin.zip
 
 # 系统
 .DS_Store

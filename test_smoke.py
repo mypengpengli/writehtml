@@ -406,7 +406,7 @@ _skills = c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokA)).json()
 ok({novel_writer_skill["id"], global_skill["id"], work_skill["id"]}.issubset({x["id"] for x in _skills}),
    "Skill 列表含内置、通用和作品专用 Skill")
 ok({x["id"] for x in c.get("/api/agent/skills", headers=H(tokA)).json()}
-   == {novel_writer_skill["id"], director_skill["id"], global_skill["id"]}, "无作品时只列内置和用户通用 Skill")
+   == {x["id"] for x in _alice_builtin_skills} | {global_skill["id"]}, "无作品时只列内置和用户通用 Skill")
 ok(c.get(f"/api/agent/skills?work_id={wid}", headers=H(tokB)).status_code == 404, "bob 看 alice 作品 Skill 404")
 ok(c.put(f"/api/agent/skills/{global_skill['id']}", json={
     "name": "hack", "instruction": "hack", "work_id": None,

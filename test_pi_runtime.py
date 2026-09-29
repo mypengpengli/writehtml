@@ -54,6 +54,7 @@ def sse_chunk(delta, finish_reason=None, response_id="pi-test"):
 class FakeOpenAI(BaseHTTPRequestHandler):
     requests = []
     skill_id = None
+    writing_skill_id = None
 
     def do_POST(self):
         size = int(self.headers.get("content-length", "0"))
@@ -69,7 +70,26 @@ class FakeOpenAI(BaseHTTPRequestHandler):
             and any(part.get("type") == "input_audio" for part in message["content"] if isinstance(part, dict))
             for message in payload.get("messages", []) if isinstance(message, dict)
         )
-        if has_audio:
+        if "WRITING_PACK_PROBE" in prompt_text:
+            steps = [
+                ("pack_activate", "activate_skill", {"skill_id": type(self).writing_skill_id}),
+                ("pack_list", "list_skill_resources", {"skill_id": type(self).writing_skill_id}),
+                ("pack_read", "read_skill_resource", {"skill_id": type(self).writing_skill_id,
+                    "path": "references/narrative-craft.md", "offset": 7000, "limit": 1500}),
+                ("pack_scan", "scan_writing_text", {"text": "他很紧张。\n【自检报告】内容完整。", "excerpt": True}),
+            ]
+            done = {message.get("tool_call_id") for message in payload.get("messages", [])
+                    if message.get("role") == "tool"}
+            pending = next((step for step in steps if step[0] not in done), None)
+            if pending:
+                call_id, name, arguments = pending
+                chunks = [sse_chunk({"role": "assistant", "tool_calls": [{
+                    "index": 0, "id": call_id, "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }]}), sse_chunk({}, "tool_calls")]
+            else:
+                chunks = [sse_chunk({"role": "assistant", "content": "Pi writing pack check completed."}), sse_chunk({}, "stop")]
+        elif has_audio:
             chunks = [sse_chunk({"role": "assistant", "content": "Pi received raw audio."}), sse_chunk({}, "stop")]
         elif "Run native Pi shell probe" in prompt_text and not has_native_bash_result:
             chunks = [
@@ -146,6 +166,27 @@ try:
         headers={"Authorization": "Bearer " + token},
     ).json()
     ok(any(message.get("role") == "tool" for message in fetched["messages"]), "history endpoint remains UI compatible")
+    writing_skill = next(item for item in db.list_agent_skills(uid) if item["name"] == "de-ai-novel")
+    FakeOpenAI.writing_skill_id = writing_skill["id"]
+    pack_chapter = db.create_chapter(work["id"], uid, "Writing pack chapter")
+    pack_response = client.post("/api/agent", json={
+        "text": "WRITING_PACK_PROBE", "chapter_id": pack_chapter["id"],
+    }, headers={"Authorization": "Bearer " + token})
+    ok(pack_response.status_code == 200 and pack_response.json()["reply"] == "Pi writing pack check completed.",
+       "Pi activates a real writing pack, lists references, reads a later page and scans text")
+    pack_results = [json.loads(item["content"]) for item in pack_response.json()["messages"] if item.get("role") == "tool"]
+    ok(not any(item.get("error") for item in pack_results)
+       and any(item.get("total", 0) > 0 and item.get("scope") == "provided_text" for item in pack_results),
+       "New writing tools return usable results through the native Pi bridge")
+    page_excerpt = db.get_agent_skill_resource(uid, writing_skill["id"], "references/narrative-craft.md")["content"][7020:7100]
+    final_prompt = "\n".join(main._pi_text(item.get("content")) for item in FakeOpenAI.requests[-1]["messages"])
+    ok(page_excerpt in final_prompt, "Pi sees reference content beyond the former 6000-character cutoff")
+    ok(final_prompt.count(page_excerpt) == 1, "Pi keeps each reference page once across later tool calls")
+    skill_text = db.get_agent_skills_for_turn(uid, work["id"], [writing_skill["id"]])[0]["instruction"]
+    ok(skill_text in final_prompt, "Dynamically activated Skill survives the complete tool chain")
+    pack_history = db.get_conversation(uid, pack_chapter["id"])
+    ok(page_excerpt not in "\n".join(main._pi_text(item.get("content")) for item in pack_history["messages"]),
+       "Reference pages stay out of persistent chat history")
     stream_chapter = db.create_chapter(work["id"], uid, "Streaming Pi chapter")
     stream_status, stream_headers, stream_events = post_stream_events(
         client, "/api/agent/stream",
