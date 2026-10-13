@@ -71,7 +71,7 @@ with sync_playwright() as playwright:
     page.locator(".story-plan-route-main").filter(has_text="第一卷：入城").click()
     page.locator("#storyPlanTitle").wait_for()
     assert page.locator("#agentSelection").is_hidden()
-    page.locator(".story-plan-form button", has_text="交给 AI").click()
+    page.locator("#productionInspectorFooter button", has_text="交给 AI").click()
     expect(page.locator("#agentSelection")).to_be_visible(timeout=10000)
     assert page.locator("#storyPlanNewType option").count() == 8
     page.locator(".story-plan-route-main").filter(has_text="第二章计划").click()

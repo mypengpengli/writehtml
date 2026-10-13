@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=writing-packs-20260929">
+  <link rel="stylesheet" href="style.css?v=workspace-20261013-3">
+  <link rel="stylesheet" href="workspace.css?v=workspace-20261013-3">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -59,6 +60,13 @@
         <span id="meName">目录</span>
         <button class="ic" data-ic="plus" data-label="作品" onclick="newWork()" title="新建作品"></button>
       </div>
+      <nav class="workspace-nav" aria-label="主要工作区">
+        <button class="active" data-workspace="editor" onclick="switchWorkspace('editor')" title="正文" data-ic="pen" data-label="正文"></button>
+        <button data-workspace="canvas" onclick="switchWorkspace('canvas')" title="创作画布" data-ic="nodes" data-label="画布"></button>
+        <button data-workspace="inspiration" onclick="switchWorkspace('inspiration')" title="灵感库" data-ic="bulb" data-label="灵感"></button>
+      </nav>
+      <label class="chapter-search"><span data-ic="search"></span><input id="chapterSearch" type="search" placeholder="搜索章节或输入章号" aria-label="搜索章节" oninput="renderTree()" onkeydown="if(event.key==='Enter')jumpToChapterSearch()"></label>
+      <label class="chapter-pending-filter"><input id="chapterPendingOnly" type="checkbox" onchange="renderTree()">仅看待处理章节</label>
       <div id="workTree" class="tree"></div>
     </aside>
     <div class="side-backdrop" onclick="toggleSidebar()"></div>
@@ -71,7 +79,8 @@
         <span id="saveStat" class="save-stat"></span>
         <select id="modelQuickSwitch" class="model-switch model-switch-top" onchange="switchActiveModel(this.value)" aria-label="切换当前 AI 模型" title="切换当前 AI 模型"></select>
         <button class="ic top-production" id="productionToggleBtn" data-ic="nodes" onclick="openProductionCanvas()" title="创作生产画布"></button>
-        <button class="ic top-workbench" id="storyToggleBtn" data-ic="panel" onclick="toggleStoryDrawer()" title="写作工作台"></button>
+        <button class="ic top-workbench" id="storyToggleBtn" data-ic="panel" onclick="toggleStoryDrawer()" title="本章资料"></button>
+        <button class="ic top-inspiration" data-ic="bulb" onclick="openInspirationLibrary()" title="灵感库"></button>
         <button class="ic top-ai" id="aiToggleBtn" data-ic="bot" data-label="AI 助手" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
         <div class="menu-wrap">
           <button class="ic" data-ic="more" onclick="toggleMoreMenu(event)" title="更多"></button>
@@ -99,14 +108,12 @@
             <button data-ic="archive" data-label="资料中心" onclick="openMaterialHub();closeMoreMenu()"></button>
             <button data-ic="bulb" data-label="灵感库" onclick="openInspirationLibrary();closeMoreMenu()"></button>
             <button data-ic="image" data-label="全书角色图库" onclick="openCharacterImageLibrary();closeMoreMenu()"></button>
-            <button data-ic="nodes" data-label="创作生产画布" onclick="openProductionCanvas();closeMoreMenu()"></button>
-            <button data-ic="branch" data-label="情节沙盘" onclick="openOutlineSandbox();closeMoreMenu()"></button>
             <button data-ic="book" data-label="拆书引擎" onclick="openDisassembly();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI Skills" onclick="openSkills();closeMoreMenu()"></button>
             <div class="menu-sep"></div>
             <div class="menu-label">作品与账户</div>
             <button data-ic="trash" data-label="回收站" onclick="openTrash();closeMoreMenu()"></button>
-            <button data-ic="users" data-label="人物/设定" onclick="openWiki();closeMoreMenu()"></button>
+            <button data-ic="users" data-label="人物与设定" onclick="openCanonWorkspace();closeMoreMenu()"></button>
             <button data-ic="sparkles" data-label="AI 工具" onclick="openAITools();closeMoreMenu()"></button>
             <button id="adminBtn" class="hidden" data-ic="shield" data-label="后台管理" onclick="openAdmin();closeMoreMenu()"></button>
             <button data-ic="settings" data-label="模型与联网" onclick="openSettings();closeMoreMenu()"></button>
@@ -205,7 +212,7 @@
             <button data-category="item" onclick="setProductionResourceCategory('item')">道具</button>
             <button data-category="organization" onclick="setProductionResourceCategory('organization')">组织</button>
           </div>
-          <label class="production-resource-search"><span data-ic="search"></span><input id="productionResourceSearch" placeholder="搜索设定…" oninput="renderProductionResources()"></label>
+          <label class="production-resource-search"><span data-ic="search"></span><input id="productionResourceSearch" placeholder="搜索设定…" oninput="renderProductionResources();if(productionSection==='canon')renderProductionOverview()"></label>
           <div id="productionResourceList" class="production-resource-list"></div>
         </aside>
 
@@ -240,6 +247,7 @@
                 <button data-plan-filter="volume" onclick="setStoryPlanFilter('volume')">卷 / 阶段</button>
                 <button data-plan-filter="chapter" onclick="setStoryPlanFilter('chapter')">章节</button>
                 <button data-plan-filter="thread" onclick="setStoryPlanFilter('thread')">支线 / 伏笔</button>
+                <button data-plan-filter="pending" onclick="setStoryPlanFilter('pending')">待处理</button>
               </div>
               <span>
                 <span class="story-plan-view-switch" role="group" aria-label="规划视图"><button id="storyPlanRouteBtn" class="active" onclick="setStoryPlanView('route')">路线</button><button id="storyPlanCardBtn" onclick="setStoryPlanView('cards')">卡片</button></span>
@@ -260,7 +268,10 @@
               <button class="ic" data-ic="x" onclick="closeProductionInspector()" title="关闭详情"></button>
             </span>
           </div>
+          <nav id="productionBreadcrumb" class="production-breadcrumb hidden" aria-label="规划路径"></nav>
+          <div id="productionInspectorTabs" class="inspector-tabs hidden" role="tablist" aria-label="对象资料"></div>
           <div id="productionInspectorBody" class="production-inspector-body"></div>
+          <div id="productionInspectorFooter" class="production-inspector-footer hidden"></div>
         </aside>
       </div>
     </section>
@@ -273,7 +284,6 @@
           <button class="ic" data-ic="sparkles" onclick="openSkillPicker()" title="选择本轮 AI Skill"></button>
           <button class="ic" data-ic="eye" onclick="openStoryDrawer('context')" title="查看本回合上下文"></button>
           <button class="ic" id="aiTtsBtn" data-ic="mute" onclick="toggleAiTts()" title="自动朗读"></button>
-          <button class="ic" data-ic="clock" onclick="openAgentSessions()" title="会话管理"></button>
           <button class="ic" data-ic="x" onclick="toggleAISide()" title="收起"></button>
         </span>
       </div>
@@ -310,7 +320,7 @@
       <div id="agentDocuments" class="agent-documents hidden" aria-label="本轮附件"></div>
       <div id="voiceTrace" class="voice-trace hidden" aria-live="polite"></div>
       <div class="chat-input-row">
-        <textarea id="agentInput" rows="2" placeholder="让 AI 帮你改稿、续写、回退版本…（Enter 发送，Shift+Enter 换行）"
+        <textarea id="agentInput" rows="2" placeholder="说说你想写什么或修改哪里…"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAgent()}"></textarea>
         <button class="ic" id="agentDocumentBtn" data-ic="paperclip" onclick="chooseAgentDocuments()" title="添加 TXT、Markdown、Word 或 PDF 作为本轮资料"></button>
         <button class="ic" id="agentMicBtn" data-ic="mic" onclick="toggleAgentMic()" title="语音输入"></button>
@@ -323,9 +333,9 @@
     </aside>
 
     <div class="story-backdrop" onclick="closeStoryDrawer()"></div>
-    <aside id="storyDrawer" class="story-drawer" aria-label="写作工作台">
+    <aside id="storyDrawer" class="story-drawer" aria-label="本章资料">
       <div class="story-head">
-        <span data-ic="panel" data-label="写作工作台"></span>
+        <span data-ic="panel" data-label="本章资料"></span>
         <span class="story-head-actions">
           <button class="ic" data-ic="refresh" onclick="refreshStoryDrawer()" title="刷新当前面板"></button>
           <button class="ic" data-ic="x" onclick="closeStoryDrawer()" title="关闭"></button>
@@ -1146,6 +1156,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=writing-packs-20260929"></script>
+  <script src="app.js?v=workspace-20261013-3"></script>
 </body>
 </html>

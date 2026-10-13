@@ -1244,6 +1244,11 @@ async def new_production_card(wid: int, request: Request):
     return _production_error(db.save_production_card(wid, _auth(request), await request.json()))
 
 
+@app.get("/api/production/cards/{card_id}")
+async def get_production_card_detail(card_id: int, request: Request):
+    return _production_error(db.get_production_card(card_id, _auth(request), _qparam_int(request, "chapter_id")))
+
+
 @app.put("/api/production/cards/{card_id}")
 async def update_production_card(card_id: int, request: Request):
     uid = _auth(request)

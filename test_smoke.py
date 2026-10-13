@@ -178,6 +178,10 @@ production_version = c.post(
     headers=H(tokA),
 ).json()
 ok(production_version["state"]["status"] == "首次显现", "设定卡章节状态版本可保存")
+card_detail = c.get(f"/api/production/cards/{production_card['id']}", headers=H(tokA)).json()
+ok(card_detail["versions"][0]["state"]["status"] == "首次显现", "设定详情可读取历史状态版本")
+ok(c.get(f"/api/production/cards/{production_card['id']}", headers=H(tokB)).status_code == 404,
+   "设定详情及历史版本按账号隔离")
 production_scene = c.post(
     f"/api/chapters/{cid}/production/scenes",
     json={"title": "开场", "summary": "建立人物与冲突", "goal": "提出问题",

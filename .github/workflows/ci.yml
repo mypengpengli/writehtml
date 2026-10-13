@@ -37,3 +37,8 @@ jobs:
           python test_writing_guidance.py
           python test_writing_packs.py
           python test_pi_runtime.py
+      - name: Workspace browser regression
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+          python test_workspace_ui.py

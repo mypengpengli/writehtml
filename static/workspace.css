@@ -1,0 +1,144 @@
+/* Shared workspace layout and reading scale. */
+:root { --workspace-ai-width: 380px; --workspace-story-width: 360px; --input-surface: #fafcfb; }
+:root[data-theme="dark"] { --input-surface: #2b332d; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --input-surface: #2b332d; } }
+.workspace-nav { display: flex; gap: 4px; padding: 8px; border-bottom: 1px solid var(--line); }
+.workspace-nav button { flex: 1; display: flex; justify-content: center; align-items: center; gap: 5px; font-size: 13px; padding: 7px 5px; }
+.workspace-nav svg { width: 16px; height: 16px; }
+.workspace-nav .active { background: var(--success-bg); color: var(--accent-text); border-color: var(--editor-focus); }
+.chapter-search { display: flex; align-items: center; gap: 6px; margin: 10px 10px 4px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.chapter-search svg { width: 16px; height: 16px; color: var(--muted); }
+.chapter-search input { min-width: 0; width: 100%; border: 0; padding: 7px 0; font-size: 13px; background: transparent; }
+.chapter-pending-filter { display: flex; align-items: center; gap: 5px; padding: 3px 12px 7px; font-size: 12px; color: var(--muted); }
+.chapter-pending-filter input { accent-color: var(--accent); }
+.c-number { flex: 0 0 24px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.c-title { font-size: 14px; }
+.chap-stage, .chap-analysis { font-size: 12px; }
+.chap { flex-wrap: wrap; }
+.chap .c-title { min-width: 70px; }
+.chap .c-wc { margin-left: auto; }
+.topbar { container-type: inline-size; }
+.title-input { min-width: 0; }
+.top-inspiration { color: #946819; }
+.ai-side { width: var(--workspace-ai-width); position: relative; z-index: 40; min-height: 0; }
+#app.ai-open .model-switch-top { display: none; }
+#app.sidebar-compact:not(.side-open) .sidebar { display: none; }
+@media (min-width: 701px) {
+  #app.sidebar-hidden .sidebar { display: none; }
+  #app.sidebar-compact.side-open .sidebar { display: flex; position: fixed; z-index: 48; left: 0; top: 56px; bottom: 0; width: 252px; box-shadow: var(--shadow); }
+  #app.sidebar-compact.side-open .side-backdrop { display: block; position: fixed; z-index: 47; inset: 56px 0 0; background: var(--scrim); }
+}
+#app.production-open .production-workspace, #app.production-open.ai-open .production-workspace { margin-right: 0; min-width: 0; }
+#app.production-open .ai-side { order: 3; }
+#app.story-open:not(.story-overlay) #storyDrawer { width: var(--workspace-story-width); flex-basis: var(--workspace-story-width); }
+#app.story-open.story-overlay #storyDrawer { position: fixed; z-index: 46; left: var(--story-left, 0px); right: auto; top: 56px; bottom: 0; width: min(var(--workspace-story-width), var(--story-space, 100vw)); height: auto; flex: none; border-right: 1px solid var(--line); box-shadow: var(--shadow); }
+#app.story-overlay .story-backdrop { display: block; position: fixed; z-index: 45; top: 56px; bottom: 0; left: var(--story-left, 0px); width: var(--story-space, 100vw); background: var(--scrim); }
+#app.focus #storyDrawer, #app.focus .ai-side { display: none; }
+.agent-model-row, .agent-session-row { flex-shrink: 0; }
+.chat-input-row { display: grid; grid-template-columns: 36px 36px minmax(0, 1fr); gap: 8px; align-items: center; }
+.chat-input-row textarea { grid-column: 1 / -1; width: 100%; min-height: 76px; max-height: 160px; resize: vertical; font-size: 14px; background: var(--input-surface); }
+.chat-input-row #sendBtn { justify-self: end; min-width: 72px; }
+.agent-tool-group { width: 100%; margin: 6px 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--side-bg); font-size: 13px; }
+.agent-tool-group summary { cursor: pointer; color: var(--muted); }
+.agent-tool-group[open] > .cm.action { max-width: 100%; margin: 7px 0 0; }
+.chat-msgs .cm.assistant { background: var(--panel); border-color: var(--line); border-left-color: var(--chat-ai-line); color: var(--ink); }
+.writing-guide-card p, .writing-guide-card small, .writing-guide-flow { font-size: 12px; }
+.writing-guide-actions button { font-size: 13px; }
+.production-resource-tabs button, .production-resource-copy small, .production-resource-row > small,
+.production-pane-head small, .production-inspector-meta, .story-plan-tree-row small,
+.story-plan-route-status, .story-plan-type, .story-plan-card-meta, .production-stat-strip small,
+.production-world-groups h3 small, .production-world-groups section > div > button small,
+.production-node-title small, .production-evidence, .production-inspector-note,
+.production-character-picker small, .story-plan-health, .story-plan-health button { font-size: 12px; }
+.production-node-row small, .production-node-row span, .production-state-field small,
+.production-inspector-section h3, .production-inspector-form label > span,
+.production-chapter-meta, .story-plan-card-head, .chapter-plan-summary-head,
+.chapter-plan-summary-list, .writing-guide-flow-steps button { font-size: 12px; }
+.production-resource-copy b, .story-plan-tree-row b, .story-plan-route-main b,
+.production-world-groups section > div > button b, .production-node-title b,
+.production-character-picker b, .production-pane-head b { font-size: 14px; }
+.story-plan-route-main small, .story-plan-route-main span, .story-plan-card p { font-size: 13px; }
+.story-plan-route-main b { min-width: 80px; }
+.production-inspector-form > label, .production-form-grid label,
+.production-inspector-section label, .story-plan-advanced > label { font-size: 13px; }
+.production-inspector-form input, .production-inspector-form textarea, .production-inspector-form select { font-size: 14px; background: var(--input-surface); }
+.production-inspector-form textarea[readonly] { background: var(--side-bg); }
+.production-resource-row { min-height: 70px; }
+.production-world-groups h3 { font-size: 15px; }
+.production-world-groups h3 > button { margin-left: auto; }
+.production-world-groups section > h3 { display: flex; align-items: center; }
+.production-world-groups section > div { gap: 8px 16px; }
+.production-world-groups section > div > button { padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.production-world-groups section > div > button small { white-space: normal; }
+.production-empty-categories { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 0; }
+.production-empty-categories button { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.production-empty-categories svg { width: 16px; height: 16px; }
+.production-overview .production-empty.compact { min-height: 0; }
+.production-inspector { overflow: hidden; }
+.production-inspector-body { flex: 1; min-height: 0; padding-bottom: 16px; }
+.production-inspector-footer { flex: 0 0 auto; padding: 9px 12px; border-top: 1px solid var(--line); background: var(--panel); }
+.production-inspector-footer .production-inspector-actions { margin: 0; padding: 7px 0 0; border: 0; flex-wrap: wrap; }
+.production-inspector-footer .story-plan-actions { flex-wrap: wrap; }
+.production-inspector-footer button { min-height: 36px; font-size: 13px; }
+.production-inspector-footer .danger-link { color: var(--danger); background: transparent; border-color: var(--line); }
+.inspector-save-status { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--muted); font-size: 12px; }
+.inspector-save-status .save-error { color: var(--danger); }
+.inspector-tabs { display: flex; flex: 0 0 auto; border-bottom: 1px solid var(--line); background: var(--side-bg); }
+.inspector-tabs button { flex: 1; font-size: 13px; border: 0; border-radius: 0; border-bottom: 2px solid transparent; background: transparent; }
+.inspector-tabs button.active { color: var(--accent-text); border-bottom-color: var(--accent); background: var(--panel); }
+[data-inspector-panel] { display: flex; flex-direction: column; gap: 8px; }
+[data-inspector-panel] > label, .inspector-advanced > label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.inspector-advanced { padding-top: 8px; border-top: 1px solid var(--line); }
+.inspector-advanced summary { font-size: 13px; color: var(--accent-text); cursor: pointer; }
+.inspector-advanced > *:not(summary) { margin-top: 9px; }
+.inspector-reading { padding: 10px 0; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.inspector-reading h3 { font-size: 14px; margin: 0 0 6px; }
+.production-history-row { border-bottom: 1px solid var(--line); padding: 10px 0; font-size: 13px; }
+.production-history-row small { color: var(--muted); font-size: 12px; }
+.production-history-row pre { font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
+.production-breadcrumb { display: flex; flex: 0 0 auto; align-items: center; overflow-x: auto; gap: 3px; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+.production-breadcrumb button { border: 0; background: transparent; font-size: 12px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.production-workspace.inspector-overlay .production-inspector { position: absolute; z-index: 20; top: 0; right: 0; bottom: 0; width: min(380px, 100%); box-shadow: var(--shadow); }
+.production-workspace.inspector-inline .production-inspector { position: relative; inset: auto; width: 360px; flex-basis: 360px; box-shadow: none; }
+.production-save-status { font-size: 12px; }
+.production-workspace.workspace-narrow .production-head { flex-wrap: wrap; overflow: visible; }
+.production-workspace.workspace-narrow .production-brand { display: none; }
+#app.production-open.ai-open .production-workspace.workspace-narrow .production-view-switch { display: inline-flex; }
+.production-workspace.workspace-narrow .production-edit-body { display: none; }
+.production-workspace.workspace-narrow .production-head-actions .ic-label { display: none; }
+@container (max-width: 780px) { .topbar .wc { display: none; } }
+@media (min-width: 701px) and (max-width: 1100px) { .top-ai .ic-label { display: none; } }
+@media (max-width: 700px) {
+  #app .ai-side { position: fixed; z-index: 55; width: 100vw; top: var(--vp-top, 0px); height: var(--vp-h, 100dvh); }
+  #app.story-open #storyDrawer { position: fixed; z-index: 56; inset: var(--vp-top, 0px) 0 auto; width: 100vw; height: var(--vp-h, 100dvh); border: 0; }
+  #app .sidebar { display: flex; }
+  .topbar .model-switch-top { display: none; }
+  .topbar .top-inspiration { display: none; }
+  .chat-input-row { grid-template-columns: 44px 44px minmax(0, 1fr); }
+  .chat-input-row textarea { min-height: 70px; }
+  .production-head { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; gap: 4px; overflow: visible; }
+  .production-brand { display: none; }
+  .production-view-switch { grid-column: 2; min-width: 0; display: flex; }
+  .production-view-switch button { flex: 1; min-width: 0; padding: 7px 3px; font-size: 12px; }
+  .production-head-actions { display: contents; }
+  .production-head-actions > button { display: none; }
+  .production-head-actions > button[title="打开 AI 助手"] { display: inline-flex; grid-column: 3; grid-row: 1; }
+  .production-head-actions > button[title="设定资源库"] { display: inline-flex; grid-column: 1; grid-row: 2; }
+  .production-head-actions > button[title="画布设置"] { display: inline-flex; grid-column: 3; grid-row: 2; }
+  #productionChapterSelect, #productionPlanLocate { grid-column: 2; grid-row: 2; min-width: 0; max-width: none; width: 100%; }
+  .production-save-status { grid-column: 2; grid-row: 3; display: none; }
+  .writing-guide-flow { min-height: 34px; padding: 4px 8px; }
+  .writing-guide-flow-steps { display: none; }
+  .writing-guide-flow .writing-guide-flow-next { display: block; min-width: 0; flex: 1; text-align: left; }
+  .production-workspace.inspector-overlay .production-inspector { width: 100%; }
+  .production-inspector-footer { padding-bottom: calc(9px + env(safe-area-inset-bottom)); }
+  .production-inspector-footer button, .inspector-tabs button { min-height: 44px; }
+  .production-inspector-footer .story-plan-actions > button { flex: 1 1 40%; }
+  .story-plan-toolbar > span { flex-wrap: wrap; justify-content: flex-start; }
+  .story-plan-route-main b { white-space: normal; overflow-wrap: anywhere; }
+  .story-plan-route-main small { min-width: 26px; }
+  .production-stat-strip { gap: 1px; }
+  .production-stat-strip small { font-size: 12px; }
+  .production-resource-tabs button { padding: 9px 8px; min-height: 44px; }
+  .production-pane-head small { font-size: 12px; }
+}

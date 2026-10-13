@@ -907,11 +907,11 @@ button.ic { display: inline-flex; align-items: center; gap: 4px; }
   .sandbox-inspector { flex: 0 0 auto; border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
 }
 @media (min-width: 1600px) {
-  #app.ai-open .ai-side { position: relative; z-index: 55; }
+  body:has(#outlineOverlay:not(.hidden)) #app.ai-open .ai-side { position: relative; z-index: 55; }
   #app.ai-open ~ #outlineOverlay:not(.hidden) { right: 380px; }
 }
 @media (min-width: 701px) and (max-width: 1599px) {
-  #app.ai-open .ai-side { position: fixed; z-index: 55; top: 0; right: 0; bottom: 0; display: flex; width: min(380px, 100vw); box-shadow: var(--shadow); }
+  body:has(#outlineOverlay:not(.hidden)) #app.ai-open .ai-side { position: fixed; z-index: 55; top: 0; right: 0; bottom: 0; display: flex; width: min(380px, 100vw); box-shadow: var(--shadow); }
 }
 
 /* 拆书引擎 */
