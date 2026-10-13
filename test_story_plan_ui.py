@@ -1,6 +1,7 @@
 """Local browser regression for the Story Plan workspace (requires a running server)."""
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -19,7 +20,7 @@ def post(request, path, token, data):
 
 
 with sync_playwright() as playwright:
-    browser = playwright.chromium.launch(channel="chrome", headless=True)
+    browser = playwright.chromium.launch(channel=os.environ.get('BROWSER_CHANNEL', 'chrome') or None, headless=True)
     context = browser.new_context(viewport={"width": 1440, "height": 900}, device_scale_factor=1)
     login = context.request.post(BASE + "/api/login", data={
         "username": "admin", "password": "UiTestPass123!",

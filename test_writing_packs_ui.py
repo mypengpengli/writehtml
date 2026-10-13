@@ -1,5 +1,6 @@
 """Local UI regression for writing Skills, long references and diagnostic handoff."""
 import json
+import os
 import re
 from pathlib import Path
 import sys
@@ -11,7 +12,7 @@ from playwright.sync_api import expect, sync_playwright
 base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9138"
 screenshots = []
 with sync_playwright() as playwright:
-    browser = playwright.chromium.launch(channel="chrome", headless=True)
+    browser = playwright.chromium.launch(channel=os.environ.get('BROWSER_CHANNEL', 'chrome') or None, headless=True)
     context = browser.new_context(viewport={"width": 1440, "height": 900})
     response = context.request.post(base + "/api/login", data={"username": "admin", "password": "UiTestPass123!"})
     assert response.ok, response.text()

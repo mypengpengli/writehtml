@@ -7020,6 +7020,11 @@ function installInspectorChrome() {
 
 async function selectInspectorTab(tab) {
   inspectorTab = tab;
+  if (['card','character'].includes(productionSelected?.type)) {
+    const category = productionSelected.type === 'character' ? '人物' : productionCategoryLabels[productionSelected.item.category];
+    const chapter = chapters.find(item => item.id === productionChapterId);
+    $('productionInspectorMeta').textContent = `${category} · ${tab === 'history' ? '历史记录' : tab === 'base' ? '全书基础' : `${productionSelected.point === 'before' ? '章前' : '章后'} · ${chapter ? `第${chapter.ord}章《${chapter.title}》` : '未选择章节'}`}`;
+  }
   $('productionInspectorBody').querySelectorAll('[data-inspector-panel]').forEach(panel => panel.classList.toggle('hidden', panel.dataset.inspectorPanel !== tab));
   $('productionInspectorTabs').querySelectorAll('button').forEach(button => {
     const active = button.dataset.inspectorTab === tab;

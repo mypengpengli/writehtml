@@ -137,6 +137,9 @@ try:
         assert not errors, errors
         browser.close()
     print('Workspace UI checks passed. Screenshots:', output)
+    for regression in ('test_story_plan_ui.py', 'test_writing_packs_ui.py'):
+        subprocess.run([sys.executable, regression, base], cwd=root,
+                       env={**os.environ, 'BROWSER_CHANNEL': ''}, check=True)
 finally:
     server.terminate()
     server.wait(timeout=15)
