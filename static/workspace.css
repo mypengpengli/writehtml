@@ -44,7 +44,6 @@
 .chat-msgs .cm.assistant { background: var(--panel); border-color: var(--line); border-left-color: var(--chat-ai-line); color: var(--ink); }
 .writing-guide-card p, .writing-guide-card small, .writing-guide-flow { font-size: 12px; }
 .writing-guide-actions button { font-size: 13px; }
-.production-resource-tabs button, .production-resource-copy small, .production-resource-row > small,
 .production-pane-head small, .production-inspector-meta, .story-plan-tree-row small,
 .story-plan-route-status, .story-plan-type, .story-plan-card-meta, .production-stat-strip small,
 .production-world-groups h3 small, .production-world-groups section > div > button small,
@@ -54,7 +53,7 @@
 .production-inspector-section h3, .production-inspector-form label > span,
 .production-chapter-meta, .story-plan-card-head, .chapter-plan-summary-head,
 .chapter-plan-summary-list, .writing-guide-flow-steps button { font-size: 12px; }
-.production-resource-copy b, .story-plan-tree-row b, .story-plan-route-main b,
+.story-plan-tree-row b, .story-plan-route-main b,
 .production-world-groups section > div > button b, .production-node-title b,
 .production-character-picker b, .production-pane-head b { font-size: 14px; }
 .story-plan-route-main small, .story-plan-route-main span, .story-plan-card p { font-size: 13px; }
@@ -63,7 +62,23 @@
 .production-inspector-section label, .story-plan-advanced > label { font-size: 13px; }
 .production-inspector-form input, .production-inspector-form textarea, .production-inspector-form select { font-size: 14px; background: var(--input-surface); }
 .production-inspector-form textarea[readonly] { background: var(--side-bg); }
-.production-resource-row { min-height: 70px; }
+.production-resource-tree-all, .production-resource-folder-row { display: flex; min-height: 36px; align-items: center; gap: 2px; border-radius: 4px; }
+.production-resource-tree-all { width: 100%; padding: 7px 8px; border: 0; background: transparent; text-align: left; font-size: 13px; gap: 7px; }
+.production-resource-tree-all small, .production-resource-folder-select small { margin-left: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.production-resource-tree-all svg, .production-resource-folder-select svg { width: 16px; height: 16px; flex-shrink: 0; color: var(--category-color, var(--muted)); }
+.production-resource-folder-row:hover, .production-resource-tree-all:hover { background: var(--side-bg); }
+.production-resource-folder-row.active, .production-resource-tree-all.active { background: var(--success-bg); color: var(--accent-text); }
+.production-resource-tree-folder { min-width: 0; outline: none; }
+.production-resource-tree-folder:focus-visible > .production-resource-folder-row,
+.production-resource-list button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.production-resource-folder-select { display: flex; align-items: center; flex: 1; min-width: 0; gap: 7px; padding: 7px 2px; border: 0; background: transparent; text-align: left; font-size: 13px; }
+.production-resource-folder-select span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.production-resource-tree-toggle, .production-resource-tree-add { display: flex; align-items: center; justify-content: center; width: 28px; height: 32px; flex-shrink: 0; padding: 5px; border: 0; background: transparent; color: var(--muted); }
+.production-resource-tree-toggle svg, .production-resource-tree-add svg { width: 16px; height: 16px; }
+.production-resource-tree-toggle:disabled { opacity: 1; cursor: default; }
+.production-resource-tree-add:hover { background: var(--panel); color: var(--accent-text); }
+.production-resource-tree-children { margin: 0 0 3px 19px; padding-left: 10px; border-left: 1px solid var(--line); }
+.production-resource-tree-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
 .production-world-groups h3 { font-size: 15px; }
 .production-world-groups h3 > button { margin-left: auto; }
 .production-world-groups section > h3 { display: flex; align-items: center; }
@@ -139,6 +154,8 @@
   .story-plan-route-main small { min-width: 26px; }
   .production-stat-strip { gap: 1px; }
   .production-stat-strip small { font-size: 12px; }
-  .production-resource-tabs button { padding: 9px 8px; min-height: 44px; }
+  .production-resource-tree-all, .production-resource-folder-row, .production-resource-row { min-height: 44px; }
+  .production-resource-tree-toggle, .production-resource-tree-add { width: 36px; height: 44px; }
+  .production-resource-folder-select { min-height: 44px; }
   .production-pane-head small { font-size: 12px; }
 }

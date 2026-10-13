@@ -87,6 +87,7 @@ let productionChapterData = null;
 let productionChapterPlans = [];
 let productionCards = [];
 let productionResourceCategory = "all";
+const productionResourceTreeStates = new Map();
 let productionSelected = null;
 let productionAutoClosedResources = false;
 let productionLayoutTimer = null;
@@ -5801,10 +5802,61 @@ function toggleProductionResources(force) {
 
 function setProductionResourceCategory(category) {
   productionResourceCategory = category;
-  document.querySelectorAll("#productionResourceTabs button").forEach(button =>
-    button.classList.toggle("active", button.dataset.category === category));
+  if (category !== 'all') setProductionResourceFolder(category, false, false);
   renderProductionResources();
   if (productionSection === 'canon') renderProductionOverview();
+}
+
+function productionResourceTreeState() {
+  const key = `productionResourceTree:${currentUsername}:${currentWorkId}`;
+  if (!productionResourceTreeStates.has(key)) {
+    let saved = [];
+    try { saved = JSON.parse(localStorage.getItem(key) || '[]'); } catch (_) {}
+    const collapsed = new Set(Array.isArray(saved) ? saved.filter(category => category in productionCategoryLabels) : []);
+    productionResourceTreeStates.set(key, { key, collapsed });
+  }
+  return productionResourceTreeStates.get(key);
+}
+
+function setProductionResourceFolder(category, collapsed, render = true) {
+  const state = productionResourceTreeState();
+  if (collapsed) state.collapsed.add(category); else state.collapsed.delete(category);
+  try { localStorage.setItem(state.key, JSON.stringify([...state.collapsed])); } catch (_) {}
+  if (render) renderProductionResources();
+}
+
+function focusProductionResourceTreeItem(event) {
+  if (!event.target.matches('[role="treeitem"]')) return;
+  $('productionResourceList').querySelectorAll('[role="treeitem"]').forEach(item => {
+    item.tabIndex = item === event.target ? 0 : -1;
+  });
+}
+
+function handleProductionResourceTreeKey(event) {
+  const item = event.target;
+  if (!item.matches('[role="treeitem"]')) return;
+  const host = $('productionResourceList');
+  const visible = [...host.querySelectorAll('[role="treeitem"]')].filter(node => !node.closest('.production-resource-tree-children.hidden'));
+  const index = visible.indexOf(item);
+  const category = item.dataset.folder;
+  const expanded = item.getAttribute('aria-expanded') === 'true';
+  let target;
+  if (event.key === 'ArrowDown') target = visible[Math.min(index + 1, visible.length - 1)];
+  else if (event.key === 'ArrowUp') target = visible[Math.max(index - 1, 0)];
+  else if (event.key === 'Home') target = visible[0];
+  else if (event.key === 'End') target = visible[visible.length - 1];
+  else if (event.key === 'ArrowRight' && category) {
+    if (!expanded) setProductionResourceFolder(category, false);
+    else target = item.querySelector('[role="group"] [role="treeitem"]');
+  } else if (event.key === 'ArrowLeft') {
+    if (category && expanded && !$('productionResourceSearch').value.trim()) setProductionResourceFolder(category, true);
+    else target = item.parentElement.closest('[role="treeitem"]') || visible[0];
+  } else if ((event.key === 'Enter' || event.key === ' ') && category) {
+    setProductionResourceCategory(category);
+  } else return;
+  event.preventDefault();
+  event.stopPropagation();
+  target?.focus();
 }
 
 function productionResourceItems() {
@@ -5821,20 +5873,40 @@ function productionResourceItems() {
 function renderProductionResources() {
   const host = $("productionResourceList");
   if (!host) return;
+  const scroll = host.scrollTop;
+  const focusKey = host.contains(document.activeElement) ? document.activeElement.closest('[role="treeitem"]')?.dataset.treeKey : null;
   const query = ($("productionResourceSearch")?.value || "").trim().toLowerCase();
-  const items = productionResourceItems().filter(item => {
-    if (productionResourceCategory !== "all" && item.category !== productionResourceCategory) return false;
-    return !query || `${item.name} ${item.resource_summary}`.toLowerCase().includes(query);
-  });
-  $("productionResourceCount").textContent = `${items.length} 项`;
-  host.innerHTML = items.length ? items.map(item => {
-    const active = productionSelected?.type === item.resource_type && productionSelected?.item?.id === item.id;
-    return `<button class="production-resource-row production-category-${item.category} ${active ? "active" : ""}" onclick="${item.resource_type === "character" ? `inspectProductionCharacter(${item.id})` : `inspectProductionCard(${item.id})`}">
-      <span class="production-resource-mark"></span>
-      <span class="production-resource-copy"><b>${esc(item.name)}</b><small>${esc(item.resource_summary)}</small></span>
-      <small>${esc(productionCategoryLabels[item.category] || item.category)}</small>
-    </button>`;
-  }).join("") : `<div class="production-empty">${svg("search")}<span>没有匹配的资源</span></div>`;
+  const allItems = productionResourceItems();
+  const items = allItems.filter(item => !query || `${item.name} ${item.resource_summary}`.toLowerCase().includes(query));
+  const { collapsed } = productionResourceTreeState();
+  const resourceSelected = ['character', 'card'].includes(productionSelected?.type);
+  $("productionResourceCount").textContent = query ? `${items.length} / ${allItems.length} 项` : `${allItems.length} 项`;
+  host.innerHTML = `<button class="production-resource-tree-all ${productionResourceCategory === 'all' ? 'active' : ''}" role="treeitem" aria-level="1" aria-selected="${productionResourceCategory === 'all' && !resourceSelected}" data-tree-key="all" tabindex="-1" onclick="setProductionResourceCategory('all')">${svg('book')}<span>全部资源</span><small>${allItems.length}</small></button>` +
+    Object.entries(productionCategoryLabels).map(([category, label]) => {
+      const group = items.filter(item => item.category === category);
+      if (query && !group.length) return '';
+      const total = allItems.filter(item => item.category === category).length;
+      const open = !!query || !collapsed.has(category);
+      const selected = productionResourceCategory === category;
+      return `<div class="production-resource-tree-folder production-category-${category}" role="treeitem" aria-level="1" aria-label="${label}" aria-expanded="${open}" aria-selected="${selected && !resourceSelected}" data-folder="${category}" data-tree-key="${category}" tabindex="-1">
+        <div class="production-resource-folder-row ${selected ? 'active' : ''}">
+          <button class="production-resource-tree-toggle" tabindex="-1" title="${query ? '搜索时自动展开' : `${open ? '收起' : '展开'}${label}`}" aria-label="${open ? '收起' : '展开'}${label}" ${query ? 'disabled' : ''} onclick="setProductionResourceFolder('${category}',${open})">${svg(open ? 'chevD' : 'chevR')}</button>
+          <button class="production-resource-folder-select" tabindex="-1" onclick="setProductionResourceCategory('${category}')">${svg(productionCategoryIcons[category])}<span>${label}</span><small>${query ? `${group.length}/${total}` : total}</small></button>
+          <button class="production-resource-tree-add" title="新建${label}" aria-label="新建${label}" onclick="newProductionResource('${category}')">${svg('plus')}</button>
+        </div>
+        <div class="production-resource-tree-children ${open ? '' : 'hidden'}" role="group">${group.map(item => {
+          const active = productionSelected?.type === item.resource_type && productionSelected?.item?.id === item.id;
+          return `<button class="production-resource-row ${active ? 'active' : ''}" role="treeitem" aria-level="2" aria-selected="${active}" data-tree-key="${item.resource_type}:${item.id}" tabindex="-1" title="${esc(`${item.name}\n${item.resource_summary}`)}" onclick="${item.resource_type === 'character' ? `inspectProductionCharacter(${item.id})` : `inspectProductionCard(${item.id})`}">${svg('note')}<span>${esc(item.name)}</span></button>`;
+        }).join('') || `<div class="production-resource-tree-empty">暂无${label}</div>`}</div>
+      </div>`;
+    }).join('') + (query && !items.length ? `<div class="production-empty">${svg('search')}<span>没有匹配的资源</span></div>` : '');
+  const treeItems = [...host.querySelectorAll('[role="treeitem"]')].filter(item => !item.closest('.production-resource-tree-children.hidden'));
+  const focus = treeItems.find(item => item.dataset.treeKey === focusKey);
+  const selected = treeItems.find(item => item.getAttribute('aria-selected') === 'true' && item.getAttribute('aria-level') === '2') ||
+    treeItems.find(item => item.getAttribute('aria-selected') === 'true');
+  (focus || selected || treeItems[0]).tabIndex = 0;
+  if (focus) focus.focus({ preventScroll: true });
+  host.scrollTop = scroll;
 }
 
 const storyPlanTypeLabels = {
@@ -7104,6 +7176,7 @@ async function inspectProductionCard(cardId, point = "after") {
   stashProductionInspectorDraft();
   clearTimeout(productionInspectorSaveTimer);
   productionSelected = { type: "card", item, point };
+  setProductionResourceFolder(item.category, false, false);
   renderProductionResources();
   const truth = item.truth || {};
   const state = item.current_state?.state || {};
@@ -7306,6 +7379,7 @@ async function inspectProductionCharacter(entityId, point = "after") {
   stashProductionInspectorDraft();
   clearTimeout(productionInspectorSaveTimer);
   productionSelected = { type: "character", item, point };
+  setProductionResourceFolder('character', false, false);
   renderProductionResources();
   const state = item.current_state || {};
   openProductionInspector(item.name, `人物 · ${point === "before" ? "章前" : "章后"}`, `
