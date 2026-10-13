@@ -6964,6 +6964,7 @@ function syncProductionInspectorHeaderActions() {
 }
 
 function openProductionInspector(title, meta, html) {
+  inspectorHistoryRequest++;
   $("productionInspectorTitle").textContent = title;
   const chapter = chapters.find(item => item.id === productionChapterId);
   $("productionInspectorMeta").textContent = [meta, productionSelected?.type === 'story_plan' ? '' : chapter && productionSection === 'state' ? `第${chapter.ord}章` : '全书设定'].filter(Boolean).join(' · ');
@@ -7090,8 +7091,16 @@ async function inspectProductionCard(cardId, point = "after") {
   if (productionSelected && (productionSelected.type !== 'card' || productionSelected.item?.id !== cardId || productionSelected.point !== point)) {
     if (!await closeProductionInspector()) return;
   }
-  const item = productionCardById(cardId, point);
+  let item = productionCardById(cardId, point);
   if (!item) return;
+  if (productionSection !== 'state' && productionChapterId) {
+    const request = ++inspectorHistoryRequest;
+    const chapterId = productionChapterId;
+    try {
+      item = await api(`/api/production/cards/${cardId}?chapter_id=${chapterId}`, { method: 'GET' });
+      if (request !== inspectorHistoryRequest || chapterId !== productionChapterId) return;
+    } catch (e) { if (request === inspectorHistoryRequest) showToast(e.message, 'err'); return; }
+  }
   stashProductionInspectorDraft();
   clearTimeout(productionInspectorSaveTimer);
   productionSelected = { type: "card", item, point };
