@@ -6885,7 +6885,12 @@ function restoreProductionInspectorDraft() {
     Object.entries(draft.values).forEach(([id, value]) => {
       const input = $(id);
       if (!input) return;
-      if ((input.type === 'checkbox' ? input.checked !== !!value : input.value !== String(value ?? ''))) changed = true;
+      let equal = input.type === 'checkbox' ? input.checked === !!value : input.value === String(value ?? '');
+      if (['productionCardState','productionCardAttributes'].includes(id)) {
+        const canonical = text => JSON.stringify(Object.entries(parseProductionPairs(text)).sort(([a], [b]) => a.localeCompare(b)));
+        equal = canonical(input.value) === canonical(String(value ?? ''));
+      }
+      if (!equal) changed = true;
       if (input.type === "checkbox") input.checked = !!value;
       else input.value = value == null ? "" : value;
     });
