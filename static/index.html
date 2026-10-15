@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=resource-tree-images-20261015">
-  <link rel="stylesheet" href="workspace.css?v=resource-tree-images-20261015">
+  <link rel="stylesheet" href="style.css?v=canvas-navigation-20261015-1">
+  <link rel="stylesheet" href="workspace.css?v=canvas-navigation-20261015-1">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -180,7 +180,7 @@
         <span id="productionSaveStatus" class="production-save-status"></span>
         <div class="production-head-actions">
           <button class="production-edit-body" data-ic="pen" data-label="编辑正文" onclick="closeProductionCanvas()" title="编辑正文"></button>
-          <button class="ic" data-ic="archive" onclick="toggleProductionResources()" title="设定资源库"></button>
+          <button id="productionResourcesToggle" class="production-resource-toggle" data-ic="panel" data-label="展开目录" onclick="toggleProductionResources()" title="设定资源库" aria-controls="productionResources" aria-expanded="true" aria-label="收起资源目录"></button>
           <button class="ic" data-ic="download" onclick="downloadCreativePackage()" title="导出创作素材包"></button>
           <button id="productionAnalyzeBtn" data-ic="sparkles" data-label="分析本章" onclick="analyzeProductionChapter()"></button>
           <button class="ic" data-ic="bot" onclick="openProductionAI()" title="打开 AI 助手"></button>
@@ -1151,7 +1151,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=resource-tree-images-20261015"></script>
-  <script src="resource-images.js?v=resource-tree-images-20261015"></script>
+  <script src="app.js?v=canvas-navigation-20261015-1"></script>
+  <script src="resource-images.js?v=canvas-navigation-20261015-1"></script>
 </body>
 </html>

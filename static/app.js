@@ -5529,6 +5529,7 @@ function syncProductionHeader() {
   $("productionAnalyzeBtn")?.classList.toggle("hidden", productionSection !== "state");
   $("productionAnalyzeBtn").disabled = productionSection !== "state" || !productionChapterId;
   $("productionSettingsBar")?.classList.add("hidden");
+  syncProductionResourceToggle();
 }
 
 async function openProductionCanvas() {
@@ -5545,14 +5546,13 @@ async function openProductionCanvas() {
   setProductionLoading(true);
   syncWorkspaceLayout();
   const workspace = $("productionWorkspace");
-  workspace.classList.toggle("resources-closed", window.innerWidth < 1100);
+  resetProductionResourceVisibility();
   productionChapterId = currentChapterId || chapters[chapters.length - 1]?.id || null;
   if (!['canon', 'plan', 'state'].includes(productionSection)) productionSection = "canon";
   syncProductionHeader();
   await setProductionSection(productionSection, true);
   const memory = canvasViewMemory.get(currentWorkId);
   if (memory?.chapterId === currentChapterId && memory.section === productionSection) {
-    workspace.classList.toggle('resources-closed', memory.resourcesClosed);
     if (memory.selected?.id && !productionSelected) {
       const target = memory.selected;
       if (target.type === 'story_plan') await inspectStoryPlan(target.id);
@@ -5563,6 +5563,7 @@ async function openProductionCanvas() {
     }
     restoreCanvasScroll(memory.scroll);
   }
+  adjustProductionInspectorLayout();
   document.querySelectorAll('[data-workspace]').forEach(button => button.classList.toggle('active', button.dataset.workspace === 'canvas'));
 }
 
@@ -5582,7 +5583,7 @@ async function maybePromptProductionAnalysis() {
 async function closeProductionCanvas() {
   const workspace = $('productionWorkspace');
   canvasViewMemory.set(currentWorkId, { chapterId: currentChapterId, section: productionSection,
-    resourcesClosed: workspace.classList.contains('resources-closed'), scroll: captureCanvasScroll(),
+    scroll: captureCanvasScroll(),
     selected: productionSelected ? { type: productionSelected.type, id: productionSelected.item?.id, point: productionSelected.point, tab: inspectorTab } : null });
   await flushProductionLayoutSave();
   if (!await closeProductionInspector()) return;
@@ -5623,8 +5624,8 @@ async function setProductionSection(section, opening = false) {
   if (!opening && productionSection === 'state' && section !== 'state') await maybePromptProductionAnalysis();
   await flushProductionLayoutSave();
   if (!await closeProductionInspector()) return;
+  if (opening || productionSection !== section) resetProductionResourceVisibility();
   productionSection = section;
-  if (window.innerWidth < 1100) $("productionWorkspace")?.classList.add("resources-closed");
   localStorage.setItem("productionSection", section);
   const planMode = section === "plan";
   $("productionResources")?.classList.toggle("hidden", planMode);
@@ -5823,7 +5824,26 @@ function toggleProductionResources(force) {
   const workspace = $("productionWorkspace");
   const open = force == null ? workspace.classList.contains("resources-closed") : !!force;
   workspace.classList.toggle("resources-closed", !open);
+  productionAutoClosedResources = false;
   if (open && window.innerWidth <= 700) workspace.classList.remove('inspector-open');
+  syncProductionResourceToggle();
+}
+
+function resetProductionResourceVisibility() {
+  const narrow = window.innerWidth < 1100;
+  productionAutoClosedResources = narrow;
+  $("productionWorkspace").classList.toggle('resources-closed', narrow);
+  syncProductionResourceToggle();
+}
+
+function syncProductionResourceToggle() {
+  const button = $('productionResourcesToggle');
+  if (!button) return;
+  const closed = $('productionWorkspace').classList.contains('resources-closed');
+  button.setAttribute('aria-expanded', String(!closed));
+  button.setAttribute('aria-controls', productionSection === 'plan' ? 'storyPlanTreePane' : 'productionResources');
+  button.setAttribute('aria-label', `${closed ? '展开' : '收起'}${productionSection === 'plan' ? '规划目录' : '资源目录'}`);
+  button.classList.toggle('resources-collapsed', closed);
 }
 
 function setProductionResourceCategory(category) {
@@ -6933,6 +6953,7 @@ function adjustProductionInspectorLayout() {
   if (!workspace.classList.contains('inspector-open')) {
     workspace.classList.remove('inspector-overlay', 'inspector-inline');
     if(productionAutoClosedResources&&window.innerWidth>=1100){workspace.classList.remove('resources-closed');productionAutoClosedResources=false;}
+    syncProductionResourceToggle();
     return;
   }
   const available = workspace.getBoundingClientRect().width;
@@ -6945,6 +6966,7 @@ function adjustProductionInspectorLayout() {
   const overlay = window.innerWidth <= 700 || available - 360 < 480;
   workspace.classList.toggle('inspector-overlay', overlay);
   workspace.classList.toggle('inspector-inline', !overlay);
+  syncProductionResourceToggle();
 }
 
 window.addEventListener("resize", () => {
@@ -7059,6 +7081,7 @@ async function closeProductionInspector(options = {}) {
   $('productionBreadcrumb').classList.add('hidden');
   syncProductionInspectorHeaderActions();
   if (productionSection === "plan") renderStoryPlan(); else renderProductionResources();
+  syncProductionResourceToggle();
   return true;
 }
 

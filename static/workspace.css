@@ -51,6 +51,8 @@ body:has(#resourceImageOverlay:not(.hidden)) #askOverlay { z-index: 95; }
 .resource-image-more summary { cursor: pointer; font-size: 13px; padding: 7px 4px; color: var(--muted); }
 .resource-image-more > div { position: absolute; right: 0; bottom: 100%; display: flex; flex-direction: column; min-width: 100px; padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; z-index: 2; }
 .resource-image-more > div button { text-align: left; border: 0; }
+.production-resource-toggle .ic-label { display: none; }
+@media (min-width: 1101px) { .production-resource-toggle.resources-collapsed .ic-label { display: inline; } }
 @media (max-width: 700px) { .production-resource-image-row { min-height: 44px; } }
 :root { --workspace-ai-width: 380px; --workspace-story-width: 360px; --input-surface: #fafcfb; }
 :root[data-theme="dark"] { --input-surface: #2b332d; }
