@@ -3334,7 +3334,7 @@ async function applyAgentResult(r, selection, baseMessages = null) {
     else renderSandboxList();
   }
   await notifyStoryUpdates(r);
-  if(imagesDirty){clearEntityImageCache();if(inspectorTab==='images'&&productionSelected)await renderResourceImageInspector();if($('resourceImageOverlay')&&!$('resourceImageOverlay').classList.contains('hidden')&&!resourceImageDirty)await loadResourceImageGallery();}
+  if(imagesDirty){await refreshResourceImageSurfaces();if($('resourceImageOverlay')&&!$('resourceImageOverlay').classList.contains('hidden')&&!resourceImageDirty)await loadResourceImageGallery();}
   if (!$('characterStateOverlay').classList.contains('hidden') && characterStateChapterId === currentChapterId) {
     await loadCharacterState();
   }
@@ -4177,20 +4177,29 @@ async function generateEntityImage() {
   $("entityImageMsg").textContent = "";
   busy(button, true, "生成中");
   try {
-    const result = await api(`/api/entities/${entityImageEntityId}/image/generate`, {
-      body: { prompt: $("entityImagePrompt").value.trim(), style: $("entityImageStyle").value.trim(),
+    const eid=entityImageEntityId,wid=currentWorkId,requestToken=token;
+    const candidate = await api(`/api/works/${wid}/resource-images/generate`, {
+      body: {target_type:'character',target_id:eid,prompt:[$("entityImagePrompt").value.trim(),$("entityImageStyle").value.trim()].filter(Boolean).join('\n').slice(0,6000),
         size: $("entityImageSize").value, chapter_id: characterStateChapterId || currentChapterId },
     });
-    const entity = entitiesCache.find(item => item.id === entityImageEntityId);
-    if (entity) Object.assign(entity, result);
-    if (characterStateData?.entity?.id === entityImageEntityId) Object.assign(characterStateData.entity, result);
-    await entityImageUrl(entityImageEntityId, true);
+    if(token!==requestToken||currentWorkId!==wid||entityImageEntityId!==eid)return;
+    await loadEntityImageHistory();
+    if(candidate.legacy_image_id)await openImageAssetLightbox(candidate.legacy_image_id);
+    const selected=await askCard({title:'选用新图替换当前主图？',msg:'旧图会保留。取消则只保存新图，不替换。',okText:'确认选用'});
+    if(token!==requestToken||currentWorkId!==wid||entityImageEntityId!==eid)return;
+    if(selected)await api(`/api/resource-images/${candidate.id}/select`,{body:{}});
+    closeImageLightbox();
+    const entity = entitiesCache.find(item => item.id === eid);
+    if(selected&&entity)entity.has_image=true;
+    if(selected&&characterStateData?.entity?.id===eid)characterStateData.entity.has_image=true;
+    if(selected)await entityImageUrl(eid, true);
     renderEntityImagePreview(entity || characterStateData?.entity);
     await loadEntityImageHistory();
     if (!$("wikiOverlay").classList.contains("hidden")) renderWikiList();
     if (!$("characterStateOverlay").classList.contains("hidden") && characterStateData) renderCharacterState(characterStateData);
-    $("entityImageMsg").textContent = "角色图已生成，旧图仍保留在下方历史图库";
-    showToast("角色图已生成并加入图库", "ok");
+    if(productionResourceImagesWorkId===wid){await loadProductionResourceImages();renderProductionResources();}
+    $("entityImageMsg").textContent = selected?"已选用新图，旧图仍保留":"新图已保存，当前主图未改变";
+    showToast("角色图已生成并保留", "ok");
   } catch (e) { $("entityImageMsg").textContent = e.message; }
   finally { busy(button, false, "生成角色图"); }
 }
@@ -5676,6 +5685,7 @@ async function loadProductionResources(chapterId = productionChapterId) {
   const [cards] = await Promise.all([
     api(`/api/works/${currentWorkId}/production/cards${query}`, { method: "GET" }),
     loadWikiEntities(),
+    loadProductionResourceImages(),
   ]);
   productionCards = Array.isArray(cards) ? cards : [];
   renderProductionResources();
@@ -5855,6 +5865,7 @@ function handleProductionResourceTreeKey(event) {
   const visible = [...host.querySelectorAll('[role="treeitem"]')].filter(node => !node.closest('.production-resource-tree-children.hidden'));
   const index = visible.indexOf(item);
   const category = item.dataset.folder;
+  const resourceKey = item.dataset.resourceKey;
   const expanded = item.getAttribute('aria-expanded') === 'true';
   let target;
   if (event.key === 'ArrowDown') target = visible[Math.min(index + 1, visible.length - 1)];
@@ -5864,8 +5875,13 @@ function handleProductionResourceTreeKey(event) {
   else if (event.key === 'ArrowRight' && category) {
     if (!expanded) setProductionResourceFolder(category, false);
     else target = item.querySelector('[role="group"] [role="treeitem"]');
+  } else if (event.key === 'ArrowRight' && resourceKey && item.hasAttribute('aria-expanded')) {
+    if(!expanded){const [type,id]=resourceKey.split(':');toggleResourceImageBranch(type,+id);}
+    else target=item.closest('.production-resource-object').querySelector('[role="group"] [role="treeitem"]');
   } else if (event.key === 'ArrowLeft') {
-    if (category && expanded && !$('productionResourceSearch').value.trim()) setProductionResourceFolder(category, true);
+    if(resourceKey&&expanded&&!$('productionResourceSearch').value.trim()){const [type,id]=resourceKey.split(':');toggleResourceImageBranch(type,+id);}
+    else if(item.dataset.imageOwner)target=host.querySelector(`[data-resource-key="${item.dataset.imageOwner}"]`);
+    else if (category && expanded && !$('productionResourceSearch').value.trim()) setProductionResourceFolder(category, true);
     else target = item.parentElement.closest('[role="treeitem"]') || visible[0];
   } else if ((event.key === 'Enter' || event.key === ' ') && category) {
     setProductionResourceCategory(category);
@@ -5893,7 +5909,7 @@ function renderProductionResources() {
   const focusKey = host.contains(document.activeElement) ? document.activeElement.closest('[role="treeitem"]')?.dataset.treeKey : null;
   const query = ($("productionResourceSearch")?.value || "").trim().toLowerCase();
   const allItems = productionResourceItems();
-  const items = allItems.filter(item => !query || `${item.name} ${item.resource_summary}`.toLowerCase().includes(query));
+  const items = allItems.filter(item => !query || `${item.name} ${item.resource_summary} ${imagesForProductionResource(item.resource_type,item.id).map(image=>image.label+' '+image.description).join(' ')}`.toLowerCase().includes(query));
   const { collapsed } = productionResourceTreeState();
   const resourceSelected = ['character', 'card'].includes(productionSelected?.type);
   $("productionResourceCount").textContent = query ? `${items.length} / ${allItems.length} 项` : `${allItems.length} 项`;
@@ -5912,7 +5928,7 @@ function renderProductionResources() {
         </div>
         <div class="production-resource-tree-children ${open ? '' : 'hidden'}" role="group">${group.map(item => {
           const active = productionSelected?.type === item.resource_type && productionSelected?.item?.id === item.id;
-          return `<button class="production-resource-row ${active ? 'active' : ''}" role="treeitem" aria-level="2" aria-selected="${active}" data-tree-key="${item.resource_type}:${item.id}" tabindex="-1" title="${esc(`${item.name}\n${item.resource_summary}`)}" onclick="${item.resource_type === 'character' ? `inspectProductionCharacter(${item.id})` : `inspectProductionCard(${item.id})`}">${svg('note')}<span>${esc(item.name)}</span></button>`;
+          return productionResourceImageTree(item,active,query);
         }).join('') || `<div class="production-resource-tree-empty">暂无${label}</div>`}</div>
       </div>`;
     }).join('') + (query && !items.length ? `<div class="production-empty">${svg('search')}<span>没有匹配的资源</span></div>` : '');
@@ -6916,10 +6932,13 @@ function adjustProductionInspectorLayout() {
   if (!workspace) return;
   if (!workspace.classList.contains('inspector-open')) {
     workspace.classList.remove('inspector-overlay', 'inspector-inline');
+    if(productionAutoClosedResources&&window.innerWidth>=1100){workspace.classList.remove('resources-closed');productionAutoClosedResources=false;}
     return;
   }
   const available = workspace.getBoundingClientRect().width;
-  if (available - 286 - 360 < 480 && !workspace.classList.contains("resources-closed")) {
+  const minimumCanvas = ['character','card'].includes(productionSelected?.type) ? 300 : 480;
+  if(productionAutoClosedResources&&window.innerWidth>=1100&&available-286-360>=minimumCanvas){workspace.classList.remove('resources-closed');productionAutoClosedResources=false;}
+  if (available - 286 - 360 < minimumCanvas && !workspace.classList.contains("resources-closed")) {
     productionAutoClosedResources = true;
     workspace.classList.add("resources-closed");
   }
@@ -7003,6 +7022,8 @@ document.addEventListener("visibilitychange", () => {
 
 async function closeProductionInspector(options = {}) {
   const { flush = true, discard = false } = options;
+  if(!discard&&!await guardResourceImageDraft())return false;
+  detachResourceImageEditor();
   const selection = productionSelected;
   const shouldFlush = !!productionInspectorSaveTimer && !!productionSelected?.item?.id;
   const shouldFlushPlan = !!storyPlanSaveTimer && productionSelected?.type === "story_plan" && !!productionSelected?.item?.id;
@@ -7046,7 +7067,7 @@ function syncProductionInspectorHeaderActions() {
   if (!button) return;
   const item = productionSelected?.item;
   const type = productionSelected?.type;
-  const deletable = !!item?.id && ["card", "scene"].includes(type);
+  const deletable = inspectorTab!=='images' && !!item?.id && ["card", "scene"].includes(type);
   button.classList.toggle("hidden", !deletable);
   if (deletable) button.title = type === "card" ? "删除当前设定" : "删除当前场景";
 }
@@ -7114,7 +7135,10 @@ function installInspectorChrome() {
 }
 
 async function selectInspectorTab(tab) {
+  if(tab!=='images'&&!await guardResourceImageDraft())return;
   inspectorTab = tab;
+  syncProductionInspectorHeaderActions();
+  $('productionInspectorFooter').classList.toggle('hidden',tab==='images');
   if (['card','character'].includes(productionSelected?.type)) {
     const category = productionSelected.type === 'character' ? '人物' : productionCategoryLabels[productionSelected.item.category];
     const chapter = chapters.find(item => item.id === productionChapterId);
@@ -7178,6 +7202,8 @@ function productionSceneSelectOptions(value) {
 }
 
 async function inspectProductionCard(cardId, point = "after") {
+  if(!await guardResourceImageDraft())return;
+  detachResourceImageEditor();
   if (productionSelected && (productionSelected.type !== 'card' || productionSelected.item?.id !== cardId || productionSelected.point !== point)) {
     if (!await closeProductionInspector()) return;
   }
@@ -7388,6 +7414,8 @@ async function archiveProductionCard(cardId) {
 }
 
 async function inspectProductionCharacter(entityId, point = "after") {
+  if(!await guardResourceImageDraft())return;
+  detachResourceImageEditor();
   if (productionSelected && (productionSelected.type !== 'character' || productionSelected.item?.id !== entityId)) {
     if (!await closeProductionInspector()) return;
   }

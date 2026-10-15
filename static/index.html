@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=word-assets-20261015-2">
-  <link rel="stylesheet" href="workspace.css?v=word-assets-20261015-2">
+  <link rel="stylesheet" href="style.css?v=resource-tree-images-20261015">
+  <link rel="stylesheet" href="workspace.css?v=resource-tree-images-20261015">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -181,7 +181,6 @@
         <div class="production-head-actions">
           <button class="production-edit-body" data-ic="pen" data-label="编辑正文" onclick="closeProductionCanvas()" title="编辑正文"></button>
           <button class="ic" data-ic="archive" onclick="toggleProductionResources()" title="设定资源库"></button>
-          <button class="ic" data-ic="image" onclick="openResourceImageGallery()" title="全书图片素材"></button>
           <button class="ic" data-ic="download" onclick="downloadCreativePackage()" title="导出创作素材包"></button>
           <button id="productionAnalyzeBtn" data-ic="sparkles" data-label="分析本章" onclick="analyzeProductionChapter()"></button>
           <button class="ic" data-ic="bot" onclick="openProductionAI()" title="打开 AI 助手"></button>
@@ -194,7 +193,7 @@
         <label><input id="productionEvidenceEnabled" type="checkbox" onchange="saveProductionSettings()"> 保存 AI 分析证据</label>
         <label><input id="productionAutoAnalyze" type="checkbox" onchange="saveProductionSettings()"> 离开未分析章节时提醒</label>
         <button onclick="editProductionCustomFields()">自定义字段</button>
-        <button onclick="openResourceImageGallery()">图片素材</button>
+        <button onclick="openResourceImageGallery()">待归类图片与全书图库</button>
         <button onclick="downloadCreativePackage()">导出创作素材包</button>
         <span>正文仍自动保存；手动分析、AI 写作完成或章节复核后才整理画布，不会逐字调用模型。</span>
       </div>
@@ -1152,7 +1151,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=word-assets-20261015-2"></script>
-  <script src="resource-images.js?v=word-assets-20261015-2"></script>
+  <script src="app.js?v=resource-tree-images-20261015"></script>
+  <script src="resource-images.js?v=resource-tree-images-20261015"></script>
 </body>
 </html>

@@ -170,6 +170,7 @@ try:
         expect(page.locator('#resourceImageMessage')).to_have_text('已保存')
         page.get_by_role('button', name='设为主图', exact=True).click()
         expect(page.locator('#resourceImageEditor')).not_to_contain_text('设为主图')
+        page.locator('#resourceImageEditor .resource-image-more summary').click()
         page.locator('#resourceImageEditor').get_by_role('button', name='复制', exact=True).click()
         expect(page.locator('#resourceImageOwner')).to_have_value('')
         page.locator('#resourceImageOwner').select_option(f'character:{entity["id"]}')
@@ -195,10 +196,82 @@ try:
             manifest = json.loads(package.read('manifest.json'))
             assert len(manifest['images']) == 3
             assert any(image['parent_image_ref'] == f'image:{image_id}' for image in manifest['images'])
+        assert page.locator('.production-head-actions button[title="全书图片素材"]').count()==0
+        tree.get_by_role('button',name='展开林晚的图片',exact=True).click()
+        expect(tree.locator('.production-resource-image-row')).to_have_count(2)
+        image_row=tree.locator(f'[data-tree-key="image:{image_id}"]')
+        image_row.click()
+        expect(page.locator('#resourceImageOverlay')).to_be_hidden()
+        expect(page.locator('[data-inspector-panel="images"] #resourceImageEditor')).to_be_visible()
+        expect(page.locator('#resourceImageLabel')).to_have_value('林晚·冬季制服')
+        page.locator('#resourceImageDescription').fill('冬季制服，深红外套')
+        tree.locator(f'[data-tree-key="card:{card["id"]}"]').click()
+        expect(page.locator('#askTitle')).to_have_text('图片信息尚未保存')
+        page.locator('#askOverlay').get_by_role('button',name='取消',exact=True).click()
+        expect(page.locator('#resourceImageDescription')).to_have_value('冬季制服，深红外套')
+        page.locator('#resourceImageEditor').get_by_role('button',name='保存修改',exact=True).click()
+        expect(page.locator('#resourceImageMessage')).to_have_text('已保存')
+        page.locator('.agent-document-chip').get_by_role('button',name='查看图片',exact=True).click()
+        page.locator(f'#resourceImageGrid [data-resource-image-id="{image_id}"]').click()
+        page.locator('#resourceImageEditor').get_by_role('button',name='保存修改',exact=True).click()
+        expect(page.locator('#resourceImageOverlay #resourceImageEditor')).to_be_visible()
+        page.get_by_role('button',name='关闭图片素材库',exact=True).click()
+        image_row.click()
+        expect(page.locator('[data-inspector-panel="images"] #resourceImageEditor')).to_be_visible()
+
+        # Mock only the paid provider step; candidate ownership/selection uses real authenticated APIs.
+        attempts=[]
+        def generate_candidate(route):
+            payload=route.request.post_data_json
+            attempts.append(payload)
+            if len(attempts)==1:
+                route.fulfill(status=502,json={'detail':'测试生成失败'})
+                return
+            auth={'Authorization':route.request.headers['authorization']}
+            response=context.request.post(f'{base}/api/works/{work["id"]}/resource-images?target_type=character&target_id={entity["id"]}',
+                headers={**auth,'X-File-Name':'generated.png'},data=picture.getvalue())
+            assert response.ok,response.text()
+            candidate=response.json()
+            response=context.request.put(f'{base}/api/resource-images/{candidate["id"]}',headers=auth,
+                data={'parent_image_id':payload['parent_image_id'],'variant_kind':payload['variant_kind'],'description':payload['prompt']})
+            assert response.ok,response.text()
+            route.fulfill(status=200,json=response.json())
+        page.route('**/resource-images/generate',generate_candidate)
+        page.locator('#resourceImageEditor').get_by_role('button',name='重新生成',exact=True).click()
+        expect(page.locator('#resourceGeneratePrompt')).to_have_value('冬季制服，深红外套')
+        page.locator('#resourceGeneratePrompt').fill('夏季外套')
+        page.locator('#resourceGenerateVariant').select_option('outfit')
+        page.locator('#resourceGenerateBtn').click()
+        expect(page.locator('#resourceImageMessage')).to_contain_text('生成失败')
+        expect(page.locator('#resourceGenerateBtn')).to_be_enabled()
+        page.locator('#resourceGenerateBtn').click()
+        expect(page.locator('#askTitle')).to_have_text('选用这张新图作为主图？')
+        page.locator('#askOverlay').get_by_role('button',name='取消',exact=True).click()
+        expect(page.locator('#resourceImageMessage')).to_contain_text('尚未替换主图')
+        assert attempts[-1]['parent_image_id']==image_id
+        with db.get_conn() as connection:
+            assert connection.execute('SELECT selected FROM resource_images WHERE id=?',(image_id,)).fetchone()[0]==1
+        page.locator('#resourceImageEditor').get_by_role('button',name='设为主图',exact=True).click()
+        expect(page.locator('#askTitle')).to_have_text('替换当前主图？')
+        page.locator('#askOk').click()
+        expect(page.locator('#resourceImageEditor')).not_to_contain_text('设为主图')
+        page.unroute('**/resource-images/generate',generate_candidate)
+        for width in (1440,1024,390):
+            page.set_viewport_size({'width':width,'height':844})
+            if width==390:
+                page.locator('#aiSide button[title="收起"]').click()
+            expect(page.locator('[data-inspector-panel="images"] #resourceImageEditor')).to_be_visible()
+            assert page.evaluate('document.body.scrollWidth <= innerWidth')
+            bounds=page.locator('#resourceImageEditor').bounding_box()
+            assert bounds['x']>=0 and bounds['x']+bounds['width']<=width+1
+            page.screenshot(path=str(output/f'inline-resource-image-{width}.png'),animations='disabled')
+        page.locator('#productionInspector button[title="关闭详情"]').click()
+        page.set_viewport_size({'width':1440,'height':900})
+        page.locator('#productionWorkspace button[title="打开 AI 助手"]').click()
         tree.locator(f'[data-tree-key="card:{card["id"]}"]').click()
         expect(page.locator('#productionCardName')).to_be_visible()
         page.locator('#productionInspectorTabs').get_by_role('tab', name='图片', exact=True).click()
-        expect(page.locator('[data-inspector-panel="images"]')).to_contain_text('管理图片')
+        expect(page.locator('[data-inspector-panel="images"]')).to_contain_text('生成图片')
         page.locator('#productionInspectorTabs').get_by_role('tab', name='基础设定', exact=True).click()
         expect(page.locator('#productionCardScope')).to_be_hidden()
         page.locator('#productionCardName').fill('潮汐规则修订')

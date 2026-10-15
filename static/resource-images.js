@@ -2,12 +2,57 @@
 let resourceImageItems = [], resourceImageTargets = [], resourceImageTarget = null;
 let resourceImageDocument = null, resourceImageSelected = null, resourceImageDirty = false;
 let resourceImageWorkId = null, resourceImageRequest = 0;
+let resourceImageInline = false, productionResourceImages = [], productionResourceImagesWorkId = null;
+const resourceImageExpanded = new Set();
+let resourceImageGeneration = null, resourceImageGenerating = false;
 const resourceImageUrls = new Map();
 const resourceImageFetches = new Map();
 let resourceImageCacheVersion = 0;
 const resourceImageVariants = {base:'基础',outfit:'服装',form:'形态',state:'状态',damaged:'损毁',season:'季节',logo:'标识',other:'其他'};
 function clearResourceImageCache(){++resourceImageCacheVersion;resourceImageUrls.forEach(url=>URL.revokeObjectURL(url));resourceImageUrls.clear();resourceImageFetches.clear();}
-function resetResourceImageGallery(){++resourceImageRequest;resourceImageItems=[];resourceImageTargets=[];resourceImageSelected=null;resourceImageDirty=false;$('resourceImageOverlay')?.classList.add('hidden');if($('resourceImageGrid'))$('resourceImageGrid').replaceChildren();if($('resourceImageEditor'))$('resourceImageEditor').replaceChildren();}
+function resetResourceImageGallery(){detachResourceImageEditor();++resourceImageRequest;resourceImageItems=[];resourceImageTargets=[];resourceImageSelected=null;resourceImageDirty=false;productionResourceImages=[];productionResourceImagesWorkId=null;resourceImageExpanded.clear();$('resourceImageOverlay')?.classList.add('hidden');if($('resourceImageGrid'))$('resourceImageGrid').replaceChildren();if($('resourceImageEditor'))$('resourceImageEditor').replaceChildren();}
+
+async function loadProductionResourceImages(){
+  const wid=currentWorkId, requestToken=token;
+  const data=await api(`/api/works/${wid}/resource-images`,{method:'GET'});
+  if(currentWorkId!==wid||token!==requestToken)return;
+  productionResourceImages=data.items||[];productionResourceImagesWorkId=wid;
+}
+function imagesForProductionResource(type,id){return productionResourceImagesWorkId===currentWorkId?productionResourceImages.filter(image=>image.target_type===type&&image.target_id===id):[];}
+function resourceImageTreeKey(type,id){return `${currentWorkId}:${type}:${id}`;}
+function toggleResourceImageBranch(type,id){const key=resourceImageTreeKey(type,id);if(resourceImageExpanded.has(key))resourceImageExpanded.delete(key);else resourceImageExpanded.add(key);renderProductionResources();}
+function productionResourceImageTree(item,active,query){
+  const images=imagesForProductionResource(item.resource_type,item.id),key=resourceImageTreeKey(item.resource_type,item.id);
+  const open=resourceImageExpanded.has(key)||!!query;
+  const inspect=item.resource_type==='character'?`inspectProductionCharacter(${item.id})`:`inspectProductionCard(${item.id})`;
+  return `<div class="production-resource-object"><div class="production-resource-object-row">
+    <button class="production-resource-tree-toggle" ${images.length?'':'disabled'} title="${open?'收起':'展开'}图片" aria-label="${open?'收起':'展开'}${esc(item.name)}的图片" onclick="toggleResourceImageBranch('${item.resource_type}',${item.id})">${svg(open?'chevD':'chevR')}</button>
+    <button class="production-resource-row ${active?'active':''}" role="treeitem" aria-level="2" aria-selected="${active}" ${images.length?`aria-expanded="${open}"`:''} data-resource-key="${item.resource_type}:${item.id}" data-tree-key="${item.resource_type}:${item.id}" tabindex="-1" title="${esc(`${item.name}\n${item.resource_summary}`)}" onclick="${inspect}">${svg('note')}<span>${esc(item.name)}</span>${images.length?`<small>${images.length}</small>`:''}</button></div>
+    ${images.length?`<div class="production-resource-tree-children resource-image-tree-children ${open?'':'hidden'}" role="group">${images.map(image=>`<button class="production-resource-image-row ${resourceImageInline&&resourceImageSelected?.id===image.id?'active':''}" role="treeitem" aria-level="3" aria-selected="${resourceImageInline&&resourceImageSelected?.id===image.id}" data-image-owner="${item.resource_type}:${item.id}" data-tree-key="image:${image.id}" tabindex="-1" title="${esc(image.label+' · '+resourceImageVariants[image.variant_kind])}" onclick="openProductionResourceImage('${item.resource_type}',${item.id},${image.id})">${svg('image')}<span>${esc(image.label)}</span>${image.selected?'<small>主图</small>':''}</button>`).join('')}</div>`:''}</div>`;
+}
+async function openProductionResourceImage(type,id,imageId=null){
+  if(!await guardResourceImageDraft())return;
+  if(productionSelected?.type!==type||productionSelected.item?.id!==id){
+    if(type==='character')await inspectProductionCharacter(id);else await inspectProductionCard(id);
+  }
+  if(productionSelected?.type!==type||productionSelected.item?.id!==id)return;
+  await selectInspectorTab('images');
+  if(imageId)await selectResourceImage(imageId);
+  resourceImageExpanded.add(resourceImageTreeKey(type,id));renderProductionResources();
+}
+async function guardResourceImageDraft(){
+  if(resourceImageInline&&resourceImageDirty){
+    if(!await askCard({title:'图片信息尚未保存',msg:'返回图片保存，或放弃此次修改。原图不会删除。',okText:'放弃修改'}))return false;
+    resourceImageDirty=false;
+  }
+  return true;
+}
+function detachResourceImageEditor(){
+  if(!resourceImageInline)return;
+  const overlay=$('resourceImageOverlay');
+  if(overlay){overlay.querySelector('.resource-image-body').append($('resourceImageEditor'));overlay.querySelector('.overlay-card').append($('resourceImageMessage'));}
+  resourceImageInline=false;resourceImageSelected=null;resourceImageGeneration=null;++resourceImageRequest;
+}
 
 function ensureResourceImageGallery() {
   if ($('resourceImageOverlay')) return;
@@ -52,7 +97,7 @@ async function hydrateResourceImages(host) {
 
 function resourceImageTile(image, inspect = false) {
   const target = image.target_name || '待归类';
-  return `<button class="resource-image-tile ${image.selected?'selected':''} ${resourceImageSelected?.id===image.id?'current':''}" data-resource-image-id="${image.id}" onclick="${inspect ? `openResourceImageGalleryFromInspector(${image.id})` : `selectResourceImage(${image.id})`}" title="${esc(`${target} · ${image.label}`)}">
+  return `<button class="resource-image-tile ${image.selected?'selected':''} ${resourceImageSelected?.id===image.id?'current':''}" data-resource-image-id="${image.id}" onclick="selectResourceImage(${image.id})" title="${esc(`${target} · ${image.label}`)}">
     <span class="resource-image-thumb"><img data-resource-image="${image.id}" alt="${esc(image.label)}">${image.selected?'<small>主图</small>':''}</span>
     <b>${esc(image.label)}</b><small>${esc(target)} · ${esc(resourceImageVariants[image.variant_kind] || '其他')}</small>
   </button>`;
@@ -62,6 +107,7 @@ async function openResourceImageGallery(targetType = null, targetId = null, docu
   if (!currentWorkId) { showToast('请先选择作品','err'); return; }
   if(resourceImageDirty&&!await askCard({title:'放弃未保存的图片信息？',okText:'放弃修改'}))return;
   ensureResourceImageGallery();
+  detachResourceImageEditor();
   resourceImageTarget = targetType ? {type:targetType,id:targetId} : null;
   resourceImageDocument = documentId;
   resourceImageWorkId = currentWorkId;
@@ -92,6 +138,11 @@ async function loadResourceImageGallery() {
 }
 
 function renderResourceImageGallery() {
+  if(resourceImageInline){
+    const grid=$('productionInspectorBody').querySelector('.resource-image-grid');
+    if(grid){grid.innerHTML=resourceImageItems.map(item=>resourceImageTile(item)).join('')||'<div class="empty">暂无图片</div>';hydrateResourceImages(grid);}
+    return;
+  }
   const query=$('resourceImageSearch').value.trim().toLowerCase(), filter=$('resourceImageFilter').value;
   const items=resourceImageItems.filter(item=>(filter==='all'||filter==='unbound'&&!item.target_type||item.category===filter)&&`${item.label} ${item.target_name} ${item.description}`.toLowerCase().includes(query));
   $('resourceImageCount').textContent=`${items.length} 张`;
@@ -106,19 +157,20 @@ async function selectResourceImage(imageId) {
   const item=resourceImageItems.find(image=>image.id===imageId); if(!item)return;
   resourceImageSelected=item; resourceImageDirty=false;
   renderResourceImageGallery();
+  if(resourceImageInline)renderProductionResources();
   const options=resourceImageTargets.map(target=>`<option value="${target.type}:${target.id}" ${item.target_type===target.type&&item.target_id===target.id?'selected':''}>${esc(target.category+' · '+target.name)}</option>`).join('');
   const parentOptions=resourceImageItems.filter(image=>image.id!==item.id&&image.target_type===item.target_type&&image.target_id===item.target_id).map(image=>`<option value="${image.id}" ${image.id===item.parent_image_id?'selected':''}>${esc(image.label)} #${image.id}</option>`).join('');
   const editor=$('resourceImageEditor'); editor.classList.remove('hidden');
-  editor.innerHTML=`<div class="resource-image-editor-head"><b>图片 #${item.id}</b><button class="ic" title="收起图片详情" aria-label="收起图片详情" onclick="closeResourceImageEditor()">${svg('x')}</button></div>
+  editor.innerHTML=`<div class="resource-image-editor-head"><b>${esc(item.label)}</b><button class="ic" title="返回图片列表" aria-label="返回图片列表" onclick="closeResourceImageEditor()">${svg('chevL')}</button></div>
     <button class="resource-image-large" onclick="viewResourceImage(${item.id})" title="查看原图"><img data-resource-image="${item.id}" alt="${esc(item.label)}"></button>
-    <div class="resource-image-form" oninput="resourceImageDraftChanged()"><label>归属<select id="resourceImageOwner" ${item.target_type?'disabled':''} onchange="updateResourceImageParentOptions()"><option value="">待归类</option>${options}</select></label>
+    <div class="resource-image-form" oninput="resourceImageDraftChanged()">${resourceImageInline?`<input id="resourceImageOwner" type="hidden" value="${item.target_type}:${item.target_id}">`:`<label>归属<select id="resourceImageOwner" ${item.target_type?'disabled':''} onchange="updateResourceImageParentOptions()"><option value="">待归类</option>${options}</select></label>`}
     <label>名称<input id="resourceImageLabel" maxlength="200" value="${esc(item.label)}"></label>
     <label>衍生类型<select id="resourceImageVariant">${Object.entries(resourceImageVariants).map(([kind,label])=>`<option value="${kind}" ${item.variant_kind===kind?'selected':''}>${label}</option>`).join('')}</select></label>
     <label>衍生自<select id="resourceImageParent"><option value="">未指定原图</option>${parentOptions}</select></label>
     <label>关联章节<select id="resourceImageChapter"><option value="">全书参考，未指定时点</option>${chapters.map(chapter=>`<option value="${chapter.id}" ${item.chapter_id===chapter.id?'selected':''}>第${chapter.ord}章 ${esc(chapter.title)}</option>`).join('')}</select></label>
     <label>说明<textarea id="resourceImageDescription" rows="3" maxlength="4000">${esc(item.description)}</textarea></label></div>
     ${item.source_name?`<details class="resource-image-source"><summary>来源 · ${esc(item.source_name)}</summary><pre>${esc(item.source_context)}</pre></details>`:''}
-    <div class="resource-image-editor-actions"><button onclick="saveResourceImageMetadata()">保存绑定</button>${item.target_type&&!item.selected?'<button onclick="setResourceImagePrimary()">设为主图</button>':''}<button onclick="duplicateResourceImage()">复制</button><button class="danger-lite" onclick="removeResourceImage()">删除</button></div>`;
+    <div class="resource-image-editor-actions"><button onclick="saveResourceImageMetadata()">${item.target_type?'保存修改':'保存绑定'}</button>${item.target_type&&!item.selected?'<button onclick="setResourceImagePrimary()">设为主图</button>':''}${item.target_type?'<button onclick="showResourceImageGenerator(true)">重新生成</button>':''}<details class="resource-image-more"><summary title="更多图片操作">更多</summary><div><button onclick="duplicateResourceImage()">${svg('copy')}复制</button><button class="danger-lite" onclick="removeResourceImage()">${svg('trash')}删除</button></div></details></div>`;
   $('resourceImageMessage').textContent=item.target_type?'已保存':'待归类';
   hydrateResourceImages(editor);
 }
@@ -146,12 +198,17 @@ async function saveResourceImageMetadata() {
 
 async function setResourceImagePrimary() {
   if(resourceImageDirty){showToast('请先保存图片信息','err');return;}
+  const previous=resourceImageItems.find(image=>image.selected&&image.target_type===resourceImageSelected?.target_type&&image.target_id===resourceImageSelected?.target_id);
+  if(previous&&previous.id!==resourceImageSelected.id&&!await askCard({title:'替换当前主图？',msg:`将使用「${resourceImageSelected.label}」。原主图「${previous.label}」保留，不会删除。`,okText:'确认替换'}))return;
   try{await api(`/api/resource-images/${resourceImageSelected.id}/select`,{body:{}});const id=resourceImageSelected.id;await loadResourceImageGallery();await selectResourceImage(id);await refreshResourceImageSurfaces();}
   catch(e){showToast(e.message,'err');}
 }
 async function duplicateResourceImage() {
   if(resourceImageDirty){showToast('请先保存图片信息','err');return;}
-  try{const copy=await api(`/api/resource-images/${resourceImageSelected.id}/copy`,{body:{}});resourceImageTarget=null;resourceImageDocument=null;resourceImageDirty=false;await loadResourceImageGallery();await selectResourceImage(copy.id);}
+  try{const original=resourceImageSelected,copy=await api(`/api/resource-images/${original.id}/copy`,{body:{}});
+    if(resourceImageInline){await api(`/api/resource-images/${copy.id}`,{method:'PUT',body:{target_type:original.target_type,target_id:original.target_id,parent_image_id:original.id,variant_kind:original.variant_kind}});}
+    else{resourceImageTarget=null;resourceImageDocument=null;}
+    resourceImageDirty=false;await loadResourceImageGallery();await selectResourceImage(copy.id);await refreshResourceImageSurfaces();}
   catch(e){showToast(e.message,'err');}
 }
 async function removeResourceImage() {
@@ -160,8 +217,8 @@ async function removeResourceImage() {
   try{await api(`/api/resource-images/${image.id}`,{method:'DELETE'});resourceImageDirty=false;resourceImageSelected=null;$('resourceImageEditor').classList.add('hidden');if(resourceImageUrls.has(image.id))URL.revokeObjectURL(resourceImageUrls.get(image.id));resourceImageUrls.delete(image.id);await loadResourceImageGallery();await refreshResourceImageSurfaces();}
   catch(e){showToast(e.message,'err');}
 }
-async function closeResourceImageEditor(){if(resourceImageDirty&&!await askCard({title:'放弃未保存的图片信息？',okText:'放弃修改'}))return;resourceImageDirty=false;resourceImageSelected=null;$('resourceImageEditor').classList.add('hidden');}
-async function closeResourceImageGallery(){if(resourceImageDirty&&!await askCard({title:'放弃未保存的图片信息？',okText:'放弃修改'}))return;resourceImageDirty=false;++resourceImageRequest;$('resourceImageOverlay').classList.add('hidden');}
+async function closeResourceImageEditor(){if(resourceImageDirty&&!await askCard({title:'放弃未保存的图片信息？',okText:'放弃修改'}))return;resourceImageDirty=false;resourceImageSelected=null;$('resourceImageEditor').classList.add('hidden');if(resourceImageInline)renderProductionResources();}
+async function closeResourceImageGallery(){if(resourceImageDirty&&!await askCard({title:'放弃未保存的图片信息？',okText:'放弃修改'}))return;resourceImageDirty=false;resourceImageGeneration=null;++resourceImageRequest;$('resourceImageOverlay').classList.add('hidden');if(inspectorTab==='images'&&productionSelected)await renderResourceImageInspector();}
 async function viewResourceImage(id){try{window.open(await resourceImageUrl(id),'_blank','noopener');}catch(e){showToast(e.message,'err');}}
 function chooseResourceImageUpload(){if(resourceImageDirty){showToast('请先保存图片信息','err');return;}$('resourceImageUpload').click();}
 async function uploadResourceImages(files){
@@ -180,15 +237,71 @@ function addResourceImageInspectorTab(){
 async function renderResourceImageInspector(){
   const selected=productionSelected, panel=$('productionInspectorBody').querySelector('[data-inspector-panel="images"]');
   if(!selected||!panel)return;
+  if(resourceImageInline&&resourceImageTarget?.type===selected.type&&resourceImageTarget?.id===selected.item.id&&panel.contains($('resourceImageEditor')))return;
+  ensureResourceImageGallery();detachResourceImageEditor();
+  const request=++resourceImageRequest;
   panel.innerHTML='<span class="muted">读取图片…</span>';
-  try{const data=await api(`/api/works/${currentWorkId}/resource-images?target_type=${selected.type}&target_id=${selected.item.id}`,{method:'GET'});if(productionSelected!==selected||!panel.isConnected)return;
-    panel.innerHTML=`<div class="resource-image-inspector-actions"><button onclick="openResourceImageGalleryFromInspector()">${svg('image')}管理图片</button><button onclick="openResourceImageGallery()">待归类与全书图库</button></div><div class="resource-image-grid compact">${(data.items||[]).map(image=>resourceImageTile(image,true)).join('')||'<div class="empty">暂无图片</div>'}</div>`;hydrateResourceImages(panel);
+  try{const data=await api(`/api/works/${currentWorkId}/resource-images?target_type=${selected.type}&target_id=${selected.item.id}`,{method:'GET'});if(request!==resourceImageRequest||productionSelected!==selected||!panel.isConnected)return;
+    resourceImageInline=true;resourceImageTarget={type:selected.type,id:selected.item.id};resourceImageDocument=null;resourceImageWorkId=currentWorkId;resourceImageItems=data.items||[];resourceImageSelected=null;resourceImageDirty=false;
+    resourceImageTargets=productionResourceItems().map(item=>({type:item.resource_type,id:item.id,name:item.name,category:productionCategoryLabels[item.category]}));
+    panel.innerHTML=`<div class="resource-image-inspector-actions"><button onclick="chooseResourceImageUpload()">${svg('upload')}上传图片</button><button onclick="showResourceImageGenerator()">${svg('sparkles')}生成图片</button></div><div class="resource-image-grid compact"></div><div class="resource-image-inline-detail"></div>`;
+    panel.querySelector('.resource-image-inline-detail').append($('resourceImageEditor'));
+    panel.append($('resourceImageMessage'));$('resourceImageEditor').classList.add('hidden');$('resourceImageMessage').textContent='';
+    renderResourceImageGallery();
   }catch(e){if(panel.isConnected)panel.textContent=e.message;}
+}
+async function showResourceImageGenerator(regenerate=false){
+  if(resourceImageGenerating)return;
+  if(resourceImageDirty){showToast('请先保存图片信息','err');return;}
+  if(!resourceImageTarget){showToast('请先选择人物或设定','err');return;}
+  const source=regenerate?resourceImageSelected:null;
+  const target=resourceImageTargets.find(item=>item.type===resourceImageTarget.type&&item.id===resourceImageTarget.id);
+  resourceImageGeneration={workId:resourceImageWorkId,target:{...resourceImageTarget},sourceId:source?.id||null};
+  const editor=$('resourceImageEditor');editor.classList.remove('hidden');
+  editor.innerHTML=`<div class="resource-image-editor-head"><b>${regenerate?'重新生成':'生成图片'} · ${esc(target?.name||'设定')}</b><button class="ic" title="取消生成" aria-label="取消生成" onclick="cancelResourceImageGeneration()">${svg('x')}</button></div>
+    ${source?`<div class="resource-image-large"><img data-resource-image="${source.id}" alt="${esc(source.label)}"></div>`:''}
+    <div class="resource-image-form"><label>生成要求<textarea id="resourceGeneratePrompt" rows="5" maxlength="6000">${esc(source?.description||'')}</textarea></label>
+    <label>图片类型<select id="resourceGenerateVariant">${Object.entries(resourceImageVariants).map(([kind,label])=>`<option value="${kind}" ${kind===(source?.variant_kind||'base')?'selected':''}>${label}</option>`).join('')}</select></label>
+    <label>关联章节<select id="resourceGenerateChapter"><option value="">全书参考</option>${chapters.map(chapter=>`<option value="${chapter.id}" ${chapter.id===source?.chapter_id?'selected':''}>第${chapter.ord}章 ${esc(chapter.title)}</option>`).join('')}</select></label>
+    <label>尺寸<select id="resourceGenerateSize"><option value="">使用生图设置</option><option value="1024x1024">1024 × 1024</option><option value="1024x1536">1024 × 1536</option><option value="1536x1024">1536 × 1024</option></select></label></div>
+    <div class="resource-image-editor-actions"><button id="resourceGenerateBtn" onclick="generateProductionResourceImage()">${svg('sparkles')}生成预览</button><button onclick="cancelResourceImageGeneration()">取消</button></div>`;
+  $('resourceImageMessage').textContent='';hydrateResourceImages(editor);
+  editor.scrollIntoView({block:'nearest'});
+}
+function cancelResourceImageGeneration(){if(resourceImageGenerating)return;resourceImageGeneration=null;if(resourceImageSelected)selectResourceImage(resourceImageSelected.id);else $('resourceImageEditor').classList.add('hidden');}
+async function generateProductionResourceImage(){
+  if(resourceImageGenerating||!resourceImageGeneration)return;
+  const generation=resourceImageGeneration, requestToken=token;
+  const body={target_type:generation.target.type,target_id:generation.target.id,parent_image_id:generation.sourceId,prompt:$('resourceGeneratePrompt').value.trim(),variant_kind:$('resourceGenerateVariant').value,chapter_id:+$('resourceGenerateChapter').value||null,size:$('resourceGenerateSize').value};
+  const button=$('resourceGenerateBtn');resourceImageGenerating=true;busy(button,true,'生成中');
+  let generated=false;
+  try{
+    const saved=await api(`/api/works/${generation.workId}/resource-images/generate`,{body});
+    generated=true;
+    if(token!==requestToken||currentWorkId!==generation.workId)return;
+    await loadProductionResourceImages();renderProductionResources();
+    if(resourceImageGeneration!==generation||resourceImageWorkId!==generation.workId||resourceImageTarget?.type!==generation.target.type||resourceImageTarget?.id!==generation.target.id){showToast('图片已生成，保留在对应资源下','ok');return;}
+    await loadResourceImageGallery();await selectResourceImage(saved.id);
+    $('resourceImageMessage').textContent='新图已保存，尚未替换主图';
+    // Preview first; replacement never overwrites or deletes the previous image file.
+    if(await askCard({title:'选用这张新图作为主图？',msg:'旧图仍然保留。取消则只保留新图，不替换主图。',okText:'确认选用'})){
+      if(token!==requestToken||currentWorkId!==generation.workId)return;
+      await api(`/api/resource-images/${saved.id}/select`,{body:{}});
+      await loadProductionResourceImages();renderProductionResources();
+      if(resourceImageTarget?.type===generation.target.type&&resourceImageTarget?.id===generation.target.id){await loadResourceImageGallery();await selectResourceImage(saved.id);$('resourceImageMessage').textContent='已选用新主图，旧图保留';}
+      clearEntityImageCache();await loadWikiEntities();
+    }
+  }catch(e){if(button.isConnected)$('resourceImageMessage').textContent='生成失败：'+e.message;else showToast('生成失败：'+e.message,'err');}
+  finally{resourceImageGenerating=false;if(generated&&resourceImageGeneration===generation)resourceImageGeneration=null;if(button.isConnected)busy(button,false,'生成预览');}
 }
 function openResourceImageGalleryFromInspector(imageId=null){if(productionSelected)openResourceImageGallery(productionSelected.type,productionSelected.item.id,null,imageId);}
 async function refreshResourceImageSurfaces(){
   clearEntityImageCache();await loadWikiEntities();
-  if(inspectorTab==='images'&&productionSelected)await renderResourceImageInspector();
+  await loadProductionResourceImages();renderProductionResources();
+  if(inspectorTab==='images'&&productionSelected&&(!$('resourceImageOverlay')||$('resourceImageOverlay').classList.contains('hidden'))){
+    if(resourceImageInline&&!resourceImageDirty&&!resourceImageGeneration){const selectedId=resourceImageSelected?.id;await loadResourceImageGallery();if(selectedId)await selectResourceImage(selectedId);}
+    else if(!resourceImageInline)await renderResourceImageInspector();
+  }
   if(!$('characterStateOverlay').classList.contains('hidden'))await loadCharacterState();
 }
 async function downloadCreativePackage(){

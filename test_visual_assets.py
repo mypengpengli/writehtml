@@ -149,6 +149,45 @@ with zipfile.ZipFile(io.BytesIO(archived_export.content)) as archive:
     assert any(item['id']==chapter['chapter_id'] for item in manifest['deleted_chapters'])
     assert main._tool_import_document_chapter(uid,None,cfg,{'document_id':doc_id,'section_index':1}).get('error')
 assert any(skill['name']=='document-visual-import' for skill in db.list_agent_skills(uid))
+# Generation creates candidates, including props and logos, without changing the current primary.
+original_generate = main.image_generation.generate_image
+original_provider = main._image_provider_settings
+generation_calls = []
+async def fake_generate(base_url, api_key, model, prompt, size):
+    generation_calls.append((prompt, size))
+    return png('purple'), 'image/png'
+main.image_generation.generate_image = fake_generate
+main._image_provider_settings = lambda _: {'base_url':'http://test/v1','api_key':'fake','model':'test-image','size':'1024x1024'}
+try:
+    endpoint = f'/api/works/{wid}/resource-images/generate'
+    assert client.post(endpoint,headers=other_headers,json={'target_type':'character','target_id':entity['id']}).status_code==400
+    assert client.post(endpoint,headers=headers,json={'target_type':'character','target_id':cross['id']}).status_code==400
+    assert client.post(endpoint,headers=headers,json={'target_type':'card','target_id':prop['id'],'parent_image_id':first['id']}).status_code==400
+    assert not generation_calls
+    previous = db.get_entity_image_record(entity['id'],uid)['image_path']
+    response=client.post(endpoint,headers=headers,json={'target_type':'character','target_id':entity['id'],
+        'parent_image_id':first['id'],'variant_kind':'form','prompt':'战斗形态'})
+    assert response.status_code==200,response.text
+    generated=response.json()
+    assert not generated['selected'] and generated['parent_image_id']==first['id']
+    assert generated['model']=='test-image' and '林晚' in generated['prompt']
+    assert db.get_entity_image_record(entity['id'],uid)['image_path']==previous
+    assert db.get_entity_image_asset(generated['legacy_image_id'],uid)['prompt']==generated['prompt']
+    assert client.post(f"/api/resource-images/{generated['id']}/select",headers=headers,json={}).status_code==200
+    assert not visual_assets.get_image(first['id'],uid)['selected']
+    assert client.get(f"/api/resource-images/{first['id']}/content",headers=headers).status_code==200
+    visual_assets.select_image(first['id'],uid)
+    visual_assets.delete_image(generated['id'],uid)
+    for target in (prop,org):
+        response=client.post(endpoint,headers=headers,json={'target_type':'card','target_id':target['id'],'prompt':'完整参考图'})
+        assert response.status_code==200,response.text
+        candidate=response.json()
+        assert candidate['target_id']==target['id'] and not candidate['selected'] and target['name'] in candidate['prompt']
+        visual_assets.delete_image(candidate['id'],uid)
+finally:
+    main.image_generation.generate_image=original_generate
+    main._image_provider_settings=original_provider
+
 db.init_db()
 assert len(visual_assets.list_images(wid,uid))==4
 assert db.delete_work(wid,uid)

@@ -74,7 +74,7 @@ def migrate(conn):
 def _target(conn, uid, wid, target_type, target_id):
     if not db._work_owned(conn, wid, uid):
         raise VisualAssetError("作品不存在")
-    if target_type not in {"character", "card"} or not isinstance(target_id, int) or isinstance(target_id, bool):
+    if not isinstance(target_type, str) or target_type not in {"character", "card"} or not isinstance(target_id, int) or isinstance(target_id, bool):
         raise VisualAssetError("请选择人物或设定卡")
     if target_type == "character":
         row = conn.execute("SELECT name,'character' AS category FROM entities WHERE id=? AND work_id=? AND kind='人物'", (target_id, wid)).fetchone()
@@ -158,10 +158,11 @@ def add_image(wid, uid, data, values=None):
                 raise VisualAssetError("作品不存在")
             path, _ = image_generation.save_image(uid, 0, data)
             now = time.time()
-            cur = conn.execute("INSERT INTO resource_images(user_id,work_id,image_path,label,source_name,source_context,document_id,source_index,content_hash,width,height,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            cur = conn.execute("INSERT INTO resource_images(user_id,work_id,image_path,label,source_name,source_context,document_id,source_index,content_hash,width,height,prompt,model,size,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (uid, wid, path, str(values.get("label") or "图片")[:200], str(values.get("source_name") or "")[:240],
                  str(values.get("source_context") or "")[:2000], values.get("document_id"), values.get("source_index"),
-                 hashlib.sha256(data).hexdigest(), width, height, now, now))
+                 hashlib.sha256(data).hexdigest(), width, height, str(values.get('prompt') or '')[:8000],
+                 str(values.get('model') or '')[:200], str(values.get('size') or '')[:32], now, now))
             image_id = cur.lastrowid
             if values.get("target_type"):
                 bind_image(image_id, uid, values)
@@ -210,7 +211,7 @@ def bind_image(image_id, uid, values):
         legacy_id = row["legacy_image_id"]
         if target_type == "character" and legacy_id is None:
             now = time.time()
-            cur = conn.execute("INSERT INTO entity_images(user_id,work_id,entity_id,image_path,prompt,selected,created_at,updated_at) VALUES(?,?,?,?,?,0,?,?)", (uid, row["work_id"], target_id, row["image_path"], description, now, now))
+            cur = conn.execute("INSERT INTO entity_images(user_id,work_id,entity_id,image_path,prompt,model,size,selected,created_at,updated_at) VALUES(?,?,?,?,?,?,?,0,?,?)", (uid, row["work_id"], target_id, row["image_path"], row['prompt'] or description, row['model'], row['size'], now, now))
             legacy_id = cur.lastrowid
             # Keep the document image's stable ID; the legacy insert trigger creates a temporary mirror.
             conn.execute("DELETE FROM resource_images WHERE legacy_image_id=?", (legacy_id,))

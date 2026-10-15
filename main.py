@@ -1622,6 +1622,54 @@ async def resource_image_content(image_id: int, request: Request):
     return FileResponse(path, media_type=image_generation.image_media_type(path), headers={'Cache-Control': 'private, no-store'})
 
 
+@app.post('/api/works/{wid}/resource-images/generate')
+async def generate_resource_image(wid: int, request: Request):
+    uid = _auth(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, '图片生成参数无效')
+    try:
+        target_type, target_id = body.get('target_type'), body.get('target_id')
+        with db.get_conn() as conn:
+            target = visual_assets._target(conn, uid, wid, target_type, target_id)
+            chapter_id = body.get('chapter_id')
+            if chapter_id is not None and (not isinstance(chapter_id, int) or isinstance(chapter_id, bool) or not db._chapter_for_work(conn, chapter_id, wid)):
+                raise visual_assets.VisualAssetError('章节不属于当前作品')
+        parent_id = body.get('parent_image_id')
+        parent = visual_assets.get_image(parent_id, uid) if isinstance(parent_id, int) and not isinstance(parent_id, bool) else None
+        if parent_id is not None and (not parent or (parent['work_id'], parent['target_type'], parent['target_id']) != (wid, target_type, target_id)):
+            raise visual_assets.VisualAssetError('衍生原图必须属于同一个人物或设定')
+        variant = body.get('variant_kind', 'base')
+        if not isinstance(variant, str) or variant not in visual_assets.VARIANT_KINDS:
+            raise visual_assets.VisualAssetError('衍生类型无效')
+        user_prompt = body.get('prompt') or ''
+        if not isinstance(user_prompt, str) or len(user_prompt) > 6000:
+            raise visual_assets.VisualAssetError('生图提示词无效或过长')
+        if target_type == 'character':
+            entity = db.get_entity_image_record(target_id, uid)
+            overview = db.get_entity_state_overview(target_id, uid, chapter_id) if chapter_id else None
+            prompt = _compose_character_image_prompt(entity, (overview or {}).get('current_state'), user_prompt, '')
+        else:
+            card = db.get_production_card(target_id, uid, chapter_id)
+            prompt = '\n'.join(['Create a reference illustration for a fictional setting.',
+                f"Category: {target['category']}. Name: {target['name']}.",
+                str(card.get('summary') or ''), str(card.get('detail') or ''),
+                json.dumps({'attributes':card.get('attributes') or {}, 'current_state':card.get('current_state') or {}},ensure_ascii=False)])[:5000]
+            prompt += '\nAdditional author direction:\n' + user_prompt[:2900]
+        provider = _image_provider_settings(uid)
+        size = body.get('size') or provider['size']
+        if not isinstance(size, str) or len(size) > 32:
+            raise visual_assets.VisualAssetError('图片尺寸无效')
+        data, _ = await image_generation.generate_image(provider['base_url'], provider['api_key'], provider['model'], prompt, size)
+        # Generation only creates a candidate; selecting a primary is a separate explicit operation.
+        return await asyncio.to_thread(visual_assets.add_image, wid, uid, data, {
+            'target_type': target_type, 'target_id': target_id, 'label': target['name'] + ' · ' + visual_assets.VARIANT_KINDS[variant],
+            'variant_kind': variant, 'parent_image_id': parent_id, 'chapter_id': chapter_id,
+            'description': user_prompt[:4000], 'prompt': prompt, 'model': provider['model'], 'size': size})
+    except (visual_assets.VisualAssetError, image_generation.ImageGenerationError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.put('/api/resource-images/{image_id}')
 async def bind_resource_image(image_id: int, request: Request):
     try:
