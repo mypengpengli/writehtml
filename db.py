@@ -1179,6 +1179,11 @@ def _migration_story_plan_refinement(conn):
     conn.execute("UPDATE story_plan_nodes SET status='committed' WHERE status='realized'")
 
 
+def _migration_resource_images(conn):
+    import visual_assets
+    visual_assets.migrate(conn)
+
+
 _MIGRATIONS = (
     (1, "baseline_schema", lambda conn: None),
     (2, "story_memory_and_provenance", _migration_story_memory_and_provenance),
@@ -1198,6 +1203,7 @@ _MIGRATIONS = (
     (16, "model_runtime_options", _migration_model_runtime_options),
     (17, "story_plan", _migration_story_plan),
     (18, "story_plan_refinement", _migration_story_plan_refinement),
+    (19, "document_resource_images", _migration_resource_images),
 )
 
 
@@ -2068,6 +2074,9 @@ def admin_delete_user(user_id):
         conn.execute("DELETE FROM work_material_settings WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM work_revisions WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM entity_images WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM document_chapter_imports WHERE document_id IN (SELECT id FROM document_imports WHERE user_id=?)", (user_id,))
+        conn.execute("DELETE FROM resource_images WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM document_imports WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM entities WHERE work_id IN (SELECT id FROM works WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE user_id=?)", (user_id,))
         conn.execute("DELETE FROM agent_skills WHERE user_id=?", (user_id,))
@@ -2366,6 +2375,9 @@ def delete_work(wid, user_id):
         conn.execute("DELETE FROM work_material_settings WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM work_revisions WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entity_images WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM document_chapter_imports WHERE document_id IN (SELECT id FROM document_imports WHERE work_id=?)", (wid,))
+        conn.execute("DELETE FROM resource_images WHERE work_id=?", (wid,))
+        conn.execute("DELETE FROM document_imports WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM entities WHERE work_id=?", (wid,))
         conn.execute("DELETE FROM agent_skill_resources WHERE skill_id IN (SELECT id FROM agent_skills WHERE work_id=?)", (wid,))
         conn.execute("DELETE FROM agent_skills WHERE work_id=?", (wid,))
@@ -4512,8 +4524,9 @@ def list_entity_image_paths(eid, user_id):
         if not _entity_owned(conn, eid, user_id):
             return None
         return [row["image_path"] for row in conn.execute(
-            "SELECT image_path FROM entity_images WHERE entity_id=? AND user_id=? AND image_path<>''",
-            (eid, user_id),
+            "SELECT image_path FROM entity_images WHERE entity_id=? AND user_id=? AND image_path<>'' UNION "
+            "SELECT image_path FROM resource_images WHERE target_type='character' AND target_id=? AND user_id=?",
+            (eid, user_id, eid, user_id),
         )]
 
 
@@ -4605,7 +4618,8 @@ def list_work_entity_image_paths(wid, user_id):
             return None
         return list(dict.fromkeys(row["image_path"] for row in conn.execute(
             "SELECT image_path FROM entity_images WHERE work_id=? AND image_path<>'' UNION ALL "
-            "SELECT image_path FROM entities WHERE work_id=? AND image_path<>''", (wid, wid),
+            "SELECT image_path FROM entities WHERE work_id=? AND image_path<>'' UNION ALL "
+            "SELECT image_path FROM resource_images WHERE work_id=?", (wid, wid, wid),
         )))
 
 
@@ -4620,6 +4634,7 @@ def delete_entity(eid, user_id):
         conn.execute("DELETE FROM entity_state_proposals WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entity_relations WHERE from_entity_id=? OR to_entity_id=?", (eid, eid))
         conn.execute("DELETE FROM entity_images WHERE entity_id=?", (eid,))
+        conn.execute("DELETE FROM resource_images WHERE target_type='character' AND target_id=?", (eid,))
         conn.execute("DELETE FROM story_memory_entity_refs WHERE entity_id=?", (eid,))
         conn.execute("DELETE FROM entities WHERE id=?", (eid,))
         for memory_id in memory_ids:

@@ -6,3 +6,4 @@ python-docx
 pypdf
 httpx
 PyYAML
+Pillow

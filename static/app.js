@@ -389,6 +389,7 @@ async function doLogout() {
   if (!await flushEditorSave()) return;
   try { await api("/api/logout"); } catch (e) {}
   clearEntityImageCache();
+  if(typeof resetResourceImageGallery==='function')resetResourceImageGallery();
   token = ""; localStorage.removeItem("token");
   agentSessions = []; currentAgentSessionId = null; agentMsgs = [];
   agentConversationSummary = ""; agentSessionScopeKey = ""; currentUsername = "";
@@ -402,6 +403,7 @@ async function init() {
   const me = await api("/api/me", { method: "GET" });
   if (currentUsername && currentUsername !== me.username) {
     clearEntityImageCache();
+    if(typeof resetResourceImageGallery==='function')resetResourceImageGallery();
     agentSkills = []; agentSkillsWorkId = undefined; activeAgentSkillIds = new Set();
     agentSessions = []; currentAgentSessionId = null; agentMsgs = [];
     agentConversationSummary = ""; agentSessionScopeKey = "";
@@ -969,7 +971,9 @@ function renderAgentDocuments() {
     <div class="agent-document-chip" title="${esc(document.name)}">
       ${svg("paperclip")}
       <span>${esc(document.name)}</span>
-      <small>${document.chars.toLocaleString()} 字${document.truncated ? " · 已截取" : ""}</small>
+      <small>${document.chars.toLocaleString()} 字${document.truncated ? " · 已截取" : ""}${document.images?.length ? ` · ${document.images.length} 图` : ''}</small>
+      ${document.document_id ? `<button onclick="openResourceImageGallery(null,null,${document.document_id})">查看图片</button>` : ''}
+      ${document.document_id ? `<button onclick="askAgentToImportDocument(${index})" ${agentBusy?'disabled':''}>AI 归档</button>` : ''}
       ${currentWorkId ? `<button class="agent-document-save" onclick="saveAgentDocumentAsMaterial(${index})" title="保存后可在以后回合按需召回">存为长期</button>` : ""}
       <button class="ic" onclick="removeAgentDocument(${index})" title="移除附件">${svg("x")}</button>
     </div>`).join("");
@@ -979,6 +983,13 @@ function removeAgentDocument(index) {
   if (agentBusy) return;
   pendingAgentDocuments.splice(index, 1);
   renderAgentDocuments();
+}
+
+function askAgentToImportDocument(index) {
+  const document = pendingAgentDocuments[index];
+  if(!document || agentBusy)return;
+  $('agentInput').value=`请使用 Word 图文资料归档能力，仅整理《${document.name}》（文档编号 ${document.document_id}）到当前作品。未来大纲进入剧情规划，人物和其他设定进入对应正式卡片，已写正文按原文新建章节，图片绑定正确对象并保留衍生版本。先读取已有资料；同名内容有冲突时先问我，不覆盖原稿；归属不明确的图片保持待归类。完成后列出实际保存结果和待确认项。`;
+  sendAgent();
 }
 
 async function saveAgentDocumentAsMaterial(index) {
@@ -1008,6 +1019,7 @@ async function addAgentDocuments(fileList) {
         headers: {
           "Content-Type": file.type || "application/octet-stream",
           "X-File-Name": encodeURIComponent(file.name),
+          ...(currentWorkId ? {'X-Work-Id':String(currentWorkId)} : {}),
           ...(token ? { Authorization: "Bearer " + token } : {}),
         },
         body: file,
@@ -1020,6 +1032,7 @@ async function addAgentDocuments(fileList) {
       else pendingAgentDocuments.push(document);
       renderAgentDocuments();
       showToast(`${document.name} 已加入本轮资料${document.truncated ? "（内容较长，已截取）" : ""}`, "ok");
+      if(document.warnings?.length)showToast(`文档有 ${document.warnings.length} 项图片读取提示，请在图片素材中核对`,'err');
     }
   } catch (e) {
     showToast("添加附件失败：" + e.message, "err");
@@ -3285,7 +3298,7 @@ async function applyAgentResult(r, selection, baseMessages = null) {
     await loadAgentSessions(false);
   }
   if (r.compacted) showToast("已按上下文预算压缩早期对话", "ok");
-  let contentChanged = false, sidebarDirty = false, entitiesDirty = false, productionDirty = false, sandboxDirty = false;
+  let contentChanged = false, sidebarDirty = false, entitiesDirty = false, productionDirty = false, sandboxDirty = false, imagesDirty = false;
   let sandboxChangedId = null;
   const changedChapterIds = new Set();
   for (const m of resultMessages) {
@@ -3295,6 +3308,7 @@ async function applyAgentResult(r, selection, baseMessages = null) {
       if (rr.sidebar_dirty) sidebarDirty = true;
       if (rr.entities_dirty) entitiesDirty = true;
       if (rr.production_dirty) productionDirty = true;
+      if (rr.images_dirty) imagesDirty = true;
       if (rr.sandbox_dirty) {
         sandboxDirty = true;
         if (Number.isInteger(rr.sandbox_id)) sandboxChangedId = rr.sandbox_id;
@@ -3320,6 +3334,7 @@ async function applyAgentResult(r, selection, baseMessages = null) {
     else renderSandboxList();
   }
   await notifyStoryUpdates(r);
+  if(imagesDirty){clearEntityImageCache();if(inspectorTab==='images'&&productionSelected)await renderResourceImageInspector();if($('resourceImageOverlay')&&!$('resourceImageOverlay').classList.contains('hidden')&&!resourceImageDirty)await loadResourceImageGallery();}
   if (!$('characterStateOverlay').classList.contains('hidden') && characterStateChapterId === currentChapterId) {
     await loadCharacterState();
   }
@@ -3343,7 +3358,7 @@ async function sendAgent(guideAction = null) {
   if (agentBusy) return;
   const el = $("agentInput");
   let text = el.value.trim();
-  const documents = pendingAgentDocuments.map(({ name, text: content }) => ({ name, text: content }));
+  const documents = pendingAgentDocuments.map(({ name, text: content, document_id }) => ({ name, text: content, document_id }));
   if (!text && documents.length) text = "请阅读并根据本轮附件协助我。";
   if (!text) return;
   const conversationMode = agentConversationMode;
@@ -3713,7 +3728,7 @@ async function sendAgentAudio(blob) {
       session_id: currentAgentSessionId, conversation_mode: conversationMode,
       ...(activeAgentSkillIds.size ? { skill_ids: [...activeAgentSkillIds] } : {}),
       ...(pendingAgentDocuments.length ? {
-        documents: pendingAgentDocuments.map(({ name, text }) => ({ name, text })),
+        documents: pendingAgentDocuments.map(({ name, text, document_id }) => ({ name, text, document_id })),
       } : {}),
     };
     const result = await streamAgent(body, updateAgentReplyStream, "/api/agent/audio/stream");
@@ -3978,6 +3993,7 @@ function clearEntityImageCache() {
   entityImageObjectUrls.clear();
   imageAssetObjectUrls.forEach(url => URL.revokeObjectURL(url));
   imageAssetObjectUrls.clear();
+  if(typeof clearResourceImageCache==='function')clearResourceImageCache();
 }
 function entityPortraitHtml(entity, large = false) {
   return `<button type="button" class="character-portrait${large ? " character-portrait-lg" : ""}" onclick="openEntityImage(${entity.id})" title="打开 ${esc(entity.name)} 的形象与图库">
@@ -5373,7 +5389,7 @@ async function loadAgentContext() {
       session_id: currentAgentSessionId, use_history: agentConversationMode === "standard",
       selection: agentSelection,
       skill_ids: activeAgentSkillIds.size ? [...activeAgentSkillIds] : [], text: $("agentInput")?.value || "",
-      documents: pendingAgentDocuments.map(({ name, text }) => ({ name, text })),
+      documents: pendingAgentDocuments.map(({ name, text, document_id }) => ({ name, text, document_id })),
     }});
     renderAgentContext(data);
   } catch (e) { $("contextMeta").textContent = e.message; }
@@ -7094,6 +7110,7 @@ function installInspectorChrome() {
     if (type !== 'card') footer.querySelector('[data-save-kind="state"]').classList.add('hidden');
   }
   renderProductionBreadcrumb();
+  addResourceImageInspectorTab();
 }
 
 async function selectInspectorTab(tab) {
@@ -7101,7 +7118,7 @@ async function selectInspectorTab(tab) {
   if (['card','character'].includes(productionSelected?.type)) {
     const category = productionSelected.type === 'character' ? '人物' : productionCategoryLabels[productionSelected.item.category];
     const chapter = chapters.find(item => item.id === productionChapterId);
-    $('productionInspectorMeta').textContent = `${category} · ${tab === 'history' ? '历史记录' : tab === 'base' ? '全书基础' : `${productionSelected.point === 'before' ? '章前' : '章后'} · ${chapter ? `第${chapter.ord}章《${chapter.title}》` : '未选择章节'}`}`;
+    $('productionInspectorMeta').textContent = `${category} · ${tab === 'images' ? '图片与衍生版本' : tab === 'history' ? '历史记录' : tab === 'base' ? '全书基础' : `${productionSelected.point === 'before' ? '章前' : '章后'} · ${chapter ? `第${chapter.ord}章《${chapter.title}》` : '未选择章节'}`}`;
   }
   $('productionInspectorBody').querySelectorAll('[data-inspector-panel]').forEach(panel => panel.classList.toggle('hidden', panel.dataset.inspectorPanel !== tab));
   $('productionInspectorTabs').querySelectorAll('button').forEach(button => {
@@ -7114,6 +7131,7 @@ async function selectInspectorTab(tab) {
     actions.innerHTML = `${tab === 'state' && productionSelected.point !== 'before' ? '<button onclick="saveProductionCardStateFromInspector()">记录本章状态</button>' : tab === 'base' ? '<button onclick="saveProductionCardFromInspector()">同步设定</button>' : ''}<button onclick="handoffProductionObjectToAI('card',${id})">交给 AI</button>`;
   }
   $('productionInspectorBody').scrollTop = 0;
+  if(tab==='images'){await renderResourceImageInspector();return;}
   if (tab === 'history') await loadInspectorHistory();
 }
 
@@ -7391,6 +7409,7 @@ async function inspectProductionCharacter(entityId, point = "after") {
     </div>`);
   $('productionInspectorTabs').innerHTML = ['base','state','history'].map((tab, index) => `<button role="tab" data-inspector-tab="${tab}" onclick="selectInspectorTab('${tab}')">${['基础设定','本章状态','历史版本'][index]}</button>`).join('');
   $('productionInspectorTabs').classList.remove('hidden');
+  addResourceImageInspectorTab();
   selectInspectorTab(point === 'before' ? 'state' : 'base');
 }
 

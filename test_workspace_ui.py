@@ -1,5 +1,7 @@
 """Isolated browser regression for layout, inspector saves and navigation."""
 import json
+import io
+import zipfile
 import os
 from pathlib import Path
 import socket
@@ -10,11 +12,23 @@ import urllib.request
 import uuid
 
 from playwright.sync_api import expect, sync_playwright
+from docx import Document
+from PIL import Image
 
 
 root = Path(__file__).resolve().parent
 output = root / '.smoke_tmp' / ('workspace-ui-' + uuid.uuid4().hex[:8])
 output.mkdir(parents=True)
+word = Document()
+word.add_heading('人物：林晚', level=1)
+word.add_paragraph('冬季制服参考')
+picture = io.BytesIO()
+Image.new('RGB', (180, 240), '#bb3344').save(picture, format='PNG')
+word.add_picture(io.BytesIO(picture.getvalue()))
+word.add_heading('规则：潮汐', level=1)
+word.add_paragraph('潮汐规则示意图')
+word.add_picture(io.BytesIO(picture.getvalue()))
+word.save(output / 'visual-import.docx')
 os.environ.update(DB_PATH=str(output / 'test.db'), WRITEHTML_ADMIN_PASSWORD='UiTestPass123!',
                   INSPIRATION_WORKER_ENABLED='false', PYTHONUTF8='1')
 import db
@@ -142,8 +156,50 @@ try:
         expect(root_item).to_be_focused()
         tree.locator('[data-folder="skill"] .production-resource-tree-toggle').click()
         page.screenshot(path=str(output / 'resource-tree-1440.png'), animations='disabled')
+        page.locator('#agentDocumentFiles').set_input_files(str(output / 'visual-import.docx'))
+        expect(page.locator('.agent-document-chip')).to_contain_text('2 图')
+        page.locator('.agent-document-chip').get_by_role('button', name='查看图片', exact=True).click()
+        expect(page.locator('#resourceImageGrid .resource-image-tile')).to_have_count(2)
+        with db.get_conn() as connection:
+            image_id = connection.execute('SELECT id FROM resource_images WHERE source_index=1').fetchone()[0]
+        page.locator(f'#resourceImageGrid [data-resource-image-id="{image_id}"]').click()
+        page.locator('#resourceImageOwner').select_option(f'character:{entity["id"]}')
+        page.locator('#resourceImageLabel').fill('林晚·冬季制服')
+        page.locator('#resourceImageVariant').select_option('outfit')
+        page.get_by_role('button', name='保存绑定', exact=True).click()
+        expect(page.locator('#resourceImageMessage')).to_have_text('已保存')
+        page.get_by_role('button', name='设为主图', exact=True).click()
+        expect(page.locator('#resourceImageEditor')).not_to_contain_text('设为主图')
+        page.locator('#resourceImageEditor').get_by_role('button', name='复制', exact=True).click()
+        expect(page.locator('#resourceImageOwner')).to_have_value('')
+        page.locator('#resourceImageOwner').select_option(f'character:{entity["id"]}')
+        expect(page.locator(f'#resourceImageParent option[value="{image_id}"]')).to_have_count(1)
+        page.locator('#resourceImageParent').select_option(str(image_id))
+        page.locator('#resourceImageLabel').fill('林晚·夏季制服')
+        page.locator('#resourceImageVariant').select_option('outfit')
+        page.get_by_role('button', name='保存绑定', exact=True).click()
+        expect(page.locator('#resourceImageMessage')).to_have_text('已保存')
+        for width in (1440, 1024, 390):
+            page.set_viewport_size({'width': width, 'height': 844})
+            expect(page.locator('#resourceImageEditor')).to_be_visible()
+            assert page.evaluate('document.body.scrollWidth <= innerWidth')
+            editor = page.locator('#resourceImageEditor').bounding_box()
+            assert editor['x'] >= 0 and editor['x'] + editor['width'] <= width + 1
+            page.screenshot(path=str(output / f'visual-gallery-{width}.png'), animations='disabled')
+        page.get_by_role('button', name='关闭图片素材库', exact=True).click()
+        page.set_viewport_size({'width': 1440, 'height': 900})
+        with page.expect_download() as downloaded:
+            page.locator('#productionWorkspace button[title="导出创作素材包"]').click()
+        downloaded.value.save_as(output / 'creative-package.zip')
+        with zipfile.ZipFile(output / 'creative-package.zip') as package:
+            manifest = json.loads(package.read('manifest.json'))
+            assert len(manifest['images']) == 3
+            assert any(image['parent_image_ref'] == f'image:{image_id}' for image in manifest['images'])
         tree.locator(f'[data-tree-key="card:{card["id"]}"]').click()
         expect(page.locator('#productionCardName')).to_be_visible()
+        page.locator('#productionInspectorTabs').get_by_role('tab', name='图片', exact=True).click()
+        expect(page.locator('[data-inspector-panel="images"]')).to_contain_text('管理图片')
+        page.locator('#productionInspectorTabs').get_by_role('tab', name='基础设定', exact=True).click()
         expect(page.locator('#productionCardScope')).to_be_hidden()
         page.locator('#productionCardName').fill('潮汐规则修订')
         page.get_by_role('tab', name='本章状态', exact=True).click()

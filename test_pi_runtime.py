@@ -1,5 +1,6 @@
 """Pi Coding Agent integration smoke test using a local OpenAI-compatible SSE server."""
 import base64
+import io
 import json
 import os
 import shutil
@@ -19,6 +20,8 @@ os.environ["ALLOW_SIGNUP"] = "true"
 from fastapi.testclient import TestClient
 import db
 import main
+import visual_assets
+from PIL import Image
 
 
 def ok(condition, message):
@@ -55,6 +58,7 @@ class FakeOpenAI(BaseHTTPRequestHandler):
     requests = []
     skill_id = None
     writing_skill_id = None
+    visual_image_id = None
 
     def do_POST(self):
         size = int(self.headers.get("content-length", "0"))
@@ -70,7 +74,13 @@ class FakeOpenAI(BaseHTTPRequestHandler):
             and any(part.get("type") == "input_audio" for part in message["content"] if isinstance(part, dict))
             for message in payload.get("messages", []) if isinstance(message, dict)
         )
-        if "WRITING_PACK_PROBE" in prompt_text:
+        if 'VISUAL_IMAGE_PROBE' in prompt_text:
+            has_view = any(message.get('role') == 'tool' and message.get('tool_call_id') == 'visual_inspect' for message in payload.get('messages', []))
+            if not has_view:
+                chunks = [sse_chunk({'role':'assistant','tool_calls':[{'index':0,'id':'visual_inspect','type':'function','function':{'name':'inspect_resource_image','arguments':json.dumps({'image_id':type(self).visual_image_id})}}]}),sse_chunk({},'tool_calls')]
+            else:
+                chunks = [sse_chunk({'role':'assistant','content':'Pi received the image preview.'}),sse_chunk({},'stop')]
+        elif "WRITING_PACK_PROBE" in prompt_text:
             steps = [
                 ("pack_activate", "activate_skill", {"skill_id": type(self).writing_skill_id}),
                 ("pack_list", "list_skill_resources", {"skill_id": type(self).writing_skill_id}),
@@ -187,6 +197,17 @@ try:
     pack_history = db.get_conversation(uid, pack_chapter["id"])
     ok(page_excerpt not in "\n".join(main._pi_text(item.get("content")) for item in pack_history["messages"]),
        "Reference pages stay out of persistent chat history")
+    image_bytes=io.BytesIO();Image.new('RGB',(64,64),'green').save(image_bytes,format='PNG')
+    image=visual_assets.add_image(work['id'],uid,image_bytes.getvalue(),{'label':'视觉工具测试'})
+    FakeOpenAI.visual_image_id=image['id']
+    image_chapter=db.create_chapter(work['id'],uid,'Image tools chapter')
+    visual_response=client.post('/api/agent',json={'text':'VISUAL_IMAGE_PROBE','chapter_id':image_chapter['id']},headers={'Authorization':'Bearer '+token})
+    ok(visual_response.status_code==200 and visual_response.json()['reply']=='Pi received the image preview.','Pi visual inspection tool turn succeeds')
+    ok('data:image/jpeg;base64,' in json.dumps(FakeOpenAI.requests[-1]),'Pi sends actual image content to the compatible model')
+    visual_history=db.get_conversation(uid,image_chapter['id'])
+    ok('data:image' not in json.dumps(visual_history) and '_pi_images' not in json.dumps(visual_history)
+       and not any(part.get('type')=='image' for message in visual_history['messages'] for part in (message.get('content') or []) if isinstance(part,dict)),
+       'Image previews stay out of persisted conversation history')
     stream_chapter = db.create_chapter(work["id"], uid, "Streaming Pi chapter")
     stream_status, stream_headers, stream_events = post_stream_events(
         client, "/api/agent/stream",

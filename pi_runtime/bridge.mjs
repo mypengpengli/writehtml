@@ -87,7 +87,13 @@ function publicToolResult(result) {
   const copy = { ...result };
   delete copy._pi_system;
   delete copy._writehtmlBridge;
+  delete copy._pi_images;
   return copy;
+}
+
+function writingToolContent(result) {
+  const images = Array.isArray(result?._pi_images) ? result._pi_images : [];
+  return [...textContent(publicToolResult(result)), ...images];
 }
 
 function workspacePath(request) {
@@ -153,6 +159,11 @@ function toOpenAIMessageParams(context) {
         tool_call_id: message.toolCallId,
         content: contentText(message.content) || JSON.stringify(message.details || {}),
       });
+      const images = (message.content || []).filter(part => part?.type === 'image');
+      if (images.length) messages.push({role: 'user', content: [
+        {type: 'text', text: 'Image previews returned by the preceding tool.'},
+        ...images.map(part => ({type: 'image_url', image_url: {url: `data:${part.mimeType};base64,${part.data}`}})),
+      ]});
     }
   }
   return messages;
@@ -292,7 +303,7 @@ function createWritingTool(spec) {
       const details = result && typeof result === "object" && !Array.isArray(result)
         ? { ...result, _writehtmlBridge: true }
         : { value: result, _writehtmlBridge: true };
-      return { content: textContent(publicToolResult(result)), details };
+      return { content: writingToolContent(result), details };
     },
   });
 }
@@ -314,7 +325,7 @@ function installWritingToolLifecycle(session) {
     }
     const publicDetails = publicToolResult(details);
     return {
-      content: textContent(publicDetails),
+      content: writingToolContent(details),
       details: publicDetails,
       isError: Boolean(publicDetails && typeof publicDetails === "object" && publicDetails.error),
     };
@@ -444,9 +455,10 @@ async function run() {
     }
 
     const messages = session.agent.state.messages.map((message) => {
-      if (!message || typeof message !== "object" || !message._writehtmlAudio) return message;
+      if (!message || typeof message !== "object") return message;
       const clean = { ...message };
       delete clean._writehtmlAudio;
+      if (message.role === 'toolResult' && message.toolName === 'inspect_resource_image') clean.content = (message.content || []).filter(part => part?.type !== 'image');
       return clean;
     });
     const finalAssistant = [...messages].reverse().find((message) => message.role === "assistant");

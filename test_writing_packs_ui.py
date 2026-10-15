@@ -7,6 +7,7 @@ import sys
 import tempfile
 
 from playwright.sync_api import expect, sync_playwright
+import builtin_skills
 
 
 base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9138"
@@ -31,7 +32,7 @@ with sync_playwright() as playwright:
     page.wait_for_load_state("networkidle")
     page.evaluate("openSkillPicker()")
     expect(page.locator("#skillPickerList")).to_contain_text("人物设计")
-    expect(page.locator("#skillPickerList .skill-pick-row")).to_have_count(12)
+    expect(page.locator("#skillPickerList .skill-pick-row")).to_have_count(len(builtin_skills.load_builtin_skills()))
     page.locator("#skillPickerSearch").fill("人物卡")
     expect(page.locator("#skillPickerList .skill-pick-choice")).to_have_count(1)
     page.locator("#skillPickerSearch").fill("修订与去模板感")
