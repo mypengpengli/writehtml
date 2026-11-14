@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=canvas-navigation-20261015-1">
-  <link rel="stylesheet" href="workspace.css?v=canvas-navigation-20261015-1">
+  <link rel="stylesheet" href="style.css?v=ux-patch-20261114-1">
+  <link rel="stylesheet" href="workspace.css?v=ux-patch-20261114-1">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -138,6 +138,7 @@
           </select>
           <button class="ic" data-ic="pen" data-label="改写" onclick="processSelection('改写', $('rwStyle').value)" title="把选中的段落换成上面的风格"></button>
         </span>
+        <span id="wcMini" class="wc-mini"></span>
       </div>
 
       <div id="findBar" class="findbar hidden">
@@ -147,7 +148,7 @@
         <button class="ic" onclick="doReplace()">替换</button>
         <button class="ic" onclick="replaceAll()">全部</button>
         <span id="findInfo" class="find-info"></span>
-        <button class="ic" data-ic="x" onclick="toggleFind()"></button>
+        <button class="ic" data-ic="x" onclick="toggleFind()" title="关闭查找"></button>
       </div>
 
       <div id="notesBar" class="notesbar hidden">
@@ -572,7 +573,7 @@
         </section>
 
         <section class="material-section">
-          <div class="settings-section-head"><b>长期参考资料</b><button class="ic" data-ic="paperclip" onclick="chooseMaterialDocument()">上传文档</button></div>
+          <div class="settings-section-head"><b>长期参考资料</b><button class="ic" data-ic="paperclip" onclick="chooseMaterialDocument()" title="选择文档上传">上传文档</button></div>
           <p class="set-hint">TXT、Markdown、Word、PDF 可保存为本书长期资料。AI 聊天框里的附件仍默认只用一轮，可在附件条上点“存为长期”。</p>
           <input id="materialDocumentFile" class="hidden" type="file" accept=".txt,.md,.docx,.pdf,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf" onchange="addMaterialDocument(this.files?.[0])">
           <div id="materialDocumentList" class="material-list"></div>
@@ -583,7 +584,7 @@
 
   <div id="materialDocumentPreviewOverlay" class="overlay hidden" onclick="if(event.target===this)closeMaterialDocumentPreview()">
     <div class="overlay-card material-preview-card">
-      <div class="overlay-head"><span id="materialDocumentPreviewTitle">长期资料</span><button class="ic" data-ic="x" onclick="closeMaterialDocumentPreview()"></button></div>
+      <div class="overlay-head"><span id="materialDocumentPreviewTitle">长期资料</span><button class="ic" data-ic="x" onclick="closeMaterialDocumentPreview()" title="关闭"></button></div>
       <pre id="materialDocumentPreviewContent"></pre>
     </div>
   </div>
@@ -609,7 +610,7 @@
   <!-- 阅读视图 -->
   <div id="reader" class="reader hidden">
     <div class="reader-top">
-      <button class="ic" data-ic="x" onclick="toggleRead()"></button>
+      <button class="ic" data-ic="x" onclick="toggleRead()" title="退出阅读模式"></button>
       <button class="ic" data-ic="chevL" data-label="上章" onclick="readerPrev()"></button>
       <span id="readerTitle" class="r-title"></span>
       <button class="ic" data-ic="chevR" data-label="下章" onclick="readerNext()"></button>
@@ -631,7 +632,7 @@
         <span class="overlay-head-actions">
           <button class="ic" data-ic="bookmark" onclick="saveNamedRevision()" title="保存命名章节版本"></button>
           <button class="ic" data-ic="book" onclick="saveNamedWorkRevision()" title="保存整本版本"></button>
-          <button class="ic" data-ic="x" onclick="closeRevisions()"></button>
+          <button class="ic" data-ic="x" onclick="closeRevisions()" title="关闭"></button>
         </span>
       </div>
       <div class="revision-columns">
@@ -664,13 +665,24 @@
           <div class="sandbox-panel-title"><b>沙盘</b><button class="ic" data-ic="plus" onclick="newOutlineSandbox()" title="新建沙盘"></button></div>
           <div id="sandboxList" class="sandbox-list"></div>
           <p class="set-hint">一棵沙盘探索一个假设，沙盘内容不会直接改正文。</p>
+          <p class="set-hint">Ctrl/⌘ + 滚轮缩放，拖空白处平移，按 0 适应画布。</p>
         </aside>
-        <main id="sandboxViewport" class="sandbox-viewport">
-          <div id="sandboxWorld" class="sandbox-world">
-            <svg id="sandboxEdges" class="sandbox-edges" width="2400" height="1600" aria-hidden="true"></svg>
-            <div id="sandboxNodes"></div>
+        <div class="sandbox-canvas">
+          <main id="sandboxViewport" class="sandbox-viewport">
+            <div id="sandboxStage" class="sandbox-stage">
+              <div id="sandboxWorld" class="sandbox-world">
+                <svg id="sandboxEdges" class="sandbox-edges" width="2400" height="1600" aria-hidden="true"></svg>
+                <div id="sandboxNodes"></div>
+              </div>
+            </div>
+          </main>
+          <div class="sandbox-zoombar" role="group" aria-label="画布缩放">
+            <button type="button" onclick="zoomSandbox(1/1.2)" title="缩小（-）" aria-label="缩小">−</button>
+            <button type="button" id="sandboxZoomLabel" onclick="setSandboxZoom(1)" title="恢复 100%">100%</button>
+            <button type="button" onclick="zoomSandbox(1.2)" title="放大（+）" aria-label="放大">+</button>
+            <button type="button" onclick="fitSandbox()" title="缩放到刚好装下所有节点（0）">适应</button>
           </div>
-        </main>
+        </div>
         <aside class="sandbox-inspector">
           <div id="sandboxEmptyInspector" class="sandbox-empty-inspector">
             <b>从一个情节点开始</b>
@@ -713,7 +725,7 @@
     <div class="overlay-card disassembly-card">
       <div class="overlay-head">
         <span>拆书引擎</span>
-        <span class="overlay-head-actions"><button class="ic" data-ic="x" onclick="closeDisassembly()"></button></span>
+        <span class="overlay-head-actions"><button class="ic" data-ic="x" onclick="closeDisassembly()" title="关闭"></button></span>
       </div>
       <div class="disassembly-body">
         <section class="disassembly-prepare">
@@ -751,7 +763,7 @@
   <!-- 版本对比 -->
   <div id="diffOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
-      <div class="overlay-head"><span id="diffTitle">版本对比（历史 → 当前）</span><span class="overlay-head-actions"><button id="diffRestoreBtn" class="hidden" onclick="applyPendingRestore()">确认恢复</button><button class="ic" data-ic="x" onclick="closeDiff()"></button></span></div>
+      <div class="overlay-head"><span id="diffTitle">版本对比（历史 → 当前）</span><span class="overlay-head-actions"><button id="diffRestoreBtn" class="hidden" onclick="applyPendingRestore()">确认恢复</button><button class="ic" data-ic="x" onclick="closeDiff()" title="关闭"></button></span></div>
       <div id="diffSub" class="set-hint" style="padding:8px 14px 0"></div>
       <div id="diffBody" class="diff-body"></div>
     </div>
@@ -760,7 +772,7 @@
   <!-- 回收站 -->
   <div id="trashOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>回收站</span><button class="ic" data-ic="x" onclick="closeTrash()"></button></div>
+      <div class="overlay-head"><span>回收站</span><button class="ic" data-ic="x" onclick="closeTrash()" title="关闭"></button></div>
       <div id="trashList" class="rev-list"></div>
     </div>
   </div>
@@ -777,7 +789,7 @@
   <!-- 实体卡片 wiki -->
   <div id="wikiOverlay" class="overlay hidden">
     <div class="overlay-card chat-card">
-      <div class="overlay-head"><span>人物 / 设定</span><button class="ic" data-ic="x" onclick="closeWiki()"></button></div>
+      <div class="overlay-head"><span>人物 / 设定</span><button class="ic" data-ic="x" onclick="closeWiki()" title="关闭"></button></div>
       <div class="set-form">
         <div id="wikiList" class="wiki-list"></div>
         <hr class="sep">
@@ -830,8 +842,8 @@
                 <span id="characterBaseMsg" class="msg"></span>
               </div>
               <div class="character-profile-actions">
-                <button class="ic" data-ic="edit" onclick="editCharacterBaseProfile()">编辑人物设定</button>
-                <button class="ic" data-ic="image" onclick="switchCharacterDetailTab('images')">查看形象</button>
+                <button class="ic" data-ic="edit" onclick="editCharacterBaseProfile()" title="编辑基础档案">编辑人物设定</button>
+                <button class="ic" data-ic="image" onclick="switchCharacterDetailTab('images')" title="角色图片">查看形象</button>
               </div>
             </div>
           </div>
@@ -870,7 +882,7 @@
               <div class="entity-image-preview-hint">人物主形象 · 点击查看大图</div>
             </div>
             <div class="entity-image-controls">
-              <div class="entity-image-prompt-head"><b>生成这个人物的新形象</b><span class="entity-image-prompt-actions"><button class="ic" onclick="refreshEntityImagePromptFromLatest(true)">读取最新设定</button><button id="entityImagePolishBtn" class="ic" data-ic="sparkles" onclick="polishEntityImagePrompt()">AI 整理英文生图词</button></span></div>
+              <div class="entity-image-prompt-head"><b>生成这个人物的新形象</b><span class="entity-image-prompt-actions"><button class="ic" onclick="refreshEntityImagePromptFromLatest(true)">读取最新设定</button><button id="entityImagePolishBtn" class="ic" data-ic="sparkles" onclick="polishEntityImagePrompt()" title="AI 润色图片提示词">AI 整理英文生图词</button></span></div>
               <textarea id="entityImagePrompt" rows="9" maxlength="8000" oninput="markEntityImagePromptCustom()" placeholder="自动读取最新人物设定和当前状态；也可以补充构图与画风要求…"></textarea>
               <div id="entityImagePromptStatus" class="entity-image-prompt-status">已读取最新人物设定</div>
               <label>补充画风<input id="entityImageStyle" maxlength="1000" placeholder="例如：电影感写实、东方奇幻、柔和侧光"></label>
@@ -899,7 +911,7 @@
     <div class="overlay-card image-library-card">
       <div class="overlay-head">
         <span>全书角色图库</span>
-        <span class="overlay-head-actions"><button class="ic" data-ic="refresh" onclick="loadCharacterImageLibrary()"></button><button class="ic" data-ic="x" onclick="closeCharacterImageLibrary()"></button></span>
+        <span class="overlay-head-actions"><button class="ic" data-ic="refresh" onclick="loadCharacterImageLibrary()" title="刷新图库"></button><button class="ic" data-ic="x" onclick="closeCharacterImageLibrary()" title="关闭"></button></span>
       </div>
       <div class="image-library-toolbar">
         <button class="active" data-image-filter="all" onclick="setCharacterImageFilter('all')">全部</button>
@@ -930,14 +942,14 @@
         <span>写作技能与专家</span>
         <span class="overlay-head-actions">
           <button class="ic" data-ic="upload" onclick="chooseSkillImport()" title="导入 SKILL.md 或 Skill ZIP 包"></button>
-          <button class="ic" data-ic="x" onclick="closeSkills()"></button>
+          <button class="ic" data-ic="x" onclick="closeSkills()" title="关闭"></button>
         </span>
       </div>
       <div class="set-form">
         <input id="skillManagerSearch" type="search" placeholder="搜索技能、专家或用途" aria-label="搜索全部技能" oninput="renderSkillList()">
         <div class="skill-import-bar">
           <div><b>导入新 Skill</b><small>ZIP 中须且只能包含一个 SKILL.md；文本 references 会一并导入，脚本不会执行。</small></div>
-          <span><select id="skillImportScope" class="ic" title="导入范围"><option value="global">所有作品可用</option><option value="work">仅当前作品</option></select><button class="ic" data-ic="upload" onclick="chooseSkillImport()">选择 ZIP / SKILL.md</button></span>
+          <span><select id="skillImportScope" class="ic" title="导入范围"><option value="global">所有作品可用</option><option value="work">仅当前作品</option></select><button class="ic" data-ic="upload" onclick="chooseSkillImport()" title="导入技能">选择 ZIP / SKILL.md</button></span>
         </div>
         <input id="skillImportInput" class="hidden" type="file" accept=".md,.zip,text/markdown,application/zip" onchange="importSkillFile()">
         <div id="skillList" class="skill-list"></div>
@@ -965,7 +977,7 @@
         <span>写作技能与专家</span>
         <span class="overlay-head-actions">
           <button class="ic" data-ic="settings" onclick="closeSkillPicker();openSkills()" title="管理 Skills"></button>
-          <button class="ic" data-ic="x" onclick="closeSkillPicker()"></button>
+          <button class="ic" data-ic="x" onclick="closeSkillPicker()" title="关闭"></button>
         </span>
       </div>
       <div class="set-form">
@@ -999,7 +1011,7 @@
   <!-- 模型与联网设置 -->
   <div id="setOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>模型与联网设置</span><button class="ic" data-ic="x" onclick="closeSettings()"></button></div>
+      <div class="overlay-head"><span>模型与联网设置</span><button class="ic" data-ic="x" onclick="closeSettings()" title="关闭"></button></div>
       <div class="set-form">
         <p class="set-hint">文字模型用于 AI 助手和改稿，可填写你的 OpenAI 兼容中转站。勾选“直接发送语音”时，录音会原样交给当前模型；不勾选才使用下方转写服务。</p>
         <label>文字 / Agent Base URL</label>
@@ -1085,7 +1097,7 @@
   <!-- 作者的全书创作要求 -->
   <div id="wnOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>创作总则</span><button class="ic" data-ic="x" onclick="closeWorkNotes()"></button></div>
+      <div class="overlay-head"><span>创作总则</span><button class="ic" data-ic="x" onclick="closeWorkNotes()" title="关闭"></button></div>
       <div class="set-form">
         <p class="set-hint">记录叙事视角、文风、基调和写作禁忌。人物与世界事实放在“世界设定”，未来事件放在“剧情规划”。</p>
         <textarea id="wnText" rows="14" placeholder="叙事视角：……&#10;文风与基调：……&#10;写作禁忌：……"></textarea>
@@ -1101,7 +1113,7 @@
   <!-- AI 写作工具（校验/摘要，不污染正文） -->
   <div id="aiOverlay" class="overlay hidden">
     <div class="overlay-card">
-      <div class="overlay-head"><span>AI 写作工具</span><button class="ic" data-ic="x" onclick="closeAITools()"></button></div>
+      <div class="overlay-head"><span>AI 写作工具</span><button class="ic" data-ic="x" onclick="closeAITools()" title="关闭"></button></div>
       <div class="set-form">
         <p class="set-hint">基于世界设定、创作总则和本章正文。校验只列问题不改字；摘要会填进备注，成为后续 AI 上下文。</p>
         <div class="set-actions">
@@ -1139,7 +1151,7 @@
   <!-- 通用询问卡（替代 prompt/confirm） -->
   <div id="askOverlay" class="overlay hidden">
     <div class="overlay-card ask-card">
-      <div class="overlay-head"><span id="askTitle"></span><button class="ic" data-ic="x" onclick="closeAsk(false)"></button></div>
+      <div class="overlay-head"><span id="askTitle"></span><button class="ic" data-ic="x" onclick="closeAsk(false)" title="关闭"></button></div>
       <div class="set-form">
         <p id="askMsg" class="set-hint"></p>
         <input id="askInput" class="ask-input hidden" onkeydown="if(event.key==='Enter'){event.preventDefault();closeAsk(true)}">
@@ -1151,7 +1163,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=canvas-navigation-20261015-1"></script>
-  <script src="resource-images.js?v=canvas-navigation-20261015-1"></script>
+  <script src="app.js?v=ux-patch-20261114-1"></script>
+  <script src="resource-images.js?v=ux-patch-20261114-1"></script>
 </body>
 </html>

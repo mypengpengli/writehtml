@@ -235,7 +235,7 @@ function closeAsk(ok) {
   const fn = _askResolve; _askResolve = null; fn(r);
 }
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape" && _askResolve) {
+  if (e.key === "Escape" && !e.isComposing && e.keyCode !== 229 && _askResolve && topModalOverlay()?.id === "askOverlay") {
     e.preventDefault();
     e.stopImmediatePropagation();
     closeAsk(false);
@@ -531,6 +531,7 @@ async function selectChapter(cid) {
 
 async function loadChapter() {
   if (!currentChapterId) return;
+  resetEditorReplaceHistory();
   const c = await api(`/api/chapters/${currentChapterId}`, { method: "GET" });
   $("chapTitle").value = c.title || "";
   $("content").value = c.content || "";
@@ -711,6 +712,7 @@ async function handleEditorConflict(snapshot, server) {
   stashEditorDraft(snapshot);
   const action = await waitForEditorConflict(snapshot, server || {});
   if (action === "server") {
+    resetEditorReplaceHistory();
     $("chapTitle").value = server.title || "";
     $("content").value = server.content || "";
     $("notes").value = server.notes || "";
@@ -814,7 +816,12 @@ function updateWC() {
   const cur = chapters.find(c => c.id === currentChapterId);
   if (cur) total = total - (cur.chars || 0) + live;
   $("wc").textContent = `本章 ${live} 字 · 全文 ${total} 字`;
+  const mini = $("wcMini");
+  if (mini) { mini.textContent = `本章 ${live} 字`; mini.title = `全文 ${total} 字`; }
 }
+// 顶栏宽度 ≤780px 时（与 workspace.css 里隐藏 .wc 的容器查询同一阈值）给 #app 打标记，让编辑工具条里的迷你字数显示出来
+new ResizeObserver(([entry]) => $("app").classList.toggle("topbar-narrow", entry.contentRect.width <= 780))
+  .observe(document.querySelector(".topbar"));
 
 /* ---------- 模式 ---------- */
 
@@ -1165,6 +1172,7 @@ async function undo() {
   if (!currentChapterId) return;
   if (!await flushEditorSave()) return;
   const c = await api(`/api/chapters/${currentChapterId}/undo`, { method: "POST" });
+  resetEditorReplaceHistory();
   $("content").value = c.content || "";
   onContentInput();
   flash("已撤销最近一段");
@@ -1198,18 +1206,50 @@ function showMatch() {
   ta.scrollTop = (linesBefore - 1) * 28;
 }
 function findNext() { if (!findPos.length) { doFind(); return; } findIdx = (findIdx + 1) % findPos.length; showMatch(); }
+// 给 textarea.value 赋值会清空浏览器原生撤销栈（实测：全部替换后 Ctrl+Z 无效；工具条上的“撤销”走服务端 /undo，管不到替换）。
+// 试过用 execCommand('insertText') 保住原生撤销栈，但 4.8 万字章节要 6.9 秒，不可用。
+// 这里改用轻量快照栈：替换前存一份，Ctrl+Z 时若正文还停在替换结果上，就直接还原。
+const replaceUndoStack = [];
+let editorReplaceGeneration = 0;
+function resetEditorReplaceHistory() {
+  replaceUndoStack.length = 0;
+  editorReplaceGeneration += 1;
+}
+function editorReplaceScope() {
+  return `${currentUsername}:${currentWorkId}:${currentChapterId}:${editorReplaceGeneration}`;
+}
+function applyEditorReplace(ta, next) {
+  if (!currentChapterId || next === ta.value) return;
+  replaceUndoStack.push({ scope: editorReplaceScope(), before: ta.value, after: next, caret: ta.selectionStart, top: ta.scrollTop });
+  if (replaceUndoStack.length > 20) replaceUndoStack.shift();
+  ta.value = next;
+}
+$("content").addEventListener("keydown", e => {
+  if (e.isComposing || !(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key.toLowerCase() !== "z") return;
+  const ta = e.currentTarget, top = replaceUndoStack.at(-1);
+  if (!top || top.scope !== editorReplaceScope() || ta.value !== top.after) return;
+  e.preventDefault(); replaceUndoStack.pop();
+  ta.value = top.before; ta.setSelectionRange(top.caret, top.caret); ta.scrollTop = top.top;
+  onContentInput(); flash("已撤销替换");
+});
+// 普通输入使用浏览器的撤销历史，不能随后重新启用过期的替换快照。
+$("content").addEventListener("input", resetEditorReplaceHistory);
 function doReplace() {
   if (findIdx < 0) return;
   const ta = $("content"), q = $("findInput").value, r = $("replaceInput").value;
+  if (!q) return;
   const start = findPos[findIdx];
-  ta.value = ta.value.slice(0, start) + r + ta.value.slice(start + q.length);
+  if (ta.value.slice(start, start + q.length) !== q) { doFind(); return; }
+  applyEditorReplace(ta, ta.value.slice(0, start) + r + ta.value.slice(start + q.length));
   onContentInput(); doFind();
 }
 function replaceAll() {
   const ta = $("content"), q = $("findInput").value, r = $("replaceInput").value;
   if (!q) return;
-  ta.value = ta.value.split(q).join(r);
-  onContentInput(); doFind(); flash("已全部替换");
+  const next = ta.value.split(q).join(r);
+  if (next === ta.value) { flash("没有可替换的内容"); return; }
+  applyEditorReplace(ta, next);
+  onContentInput(); doFind(); flash("已全部替换（Ctrl+Z 可撤销）");
 }
 
 /* ---------- 备注 / 拆分 ---------- */
@@ -1345,6 +1385,7 @@ async function applyPendingRestore() {
   if (pendingRevisionRestore) {
     const rid = pendingRevisionRestore;
     const c = await api(`/api/chapters/${currentChapterId}/revisions/${rid}/restore`, { method: "POST" });
+    resetEditorReplaceHistory();
     $("content").value = c.content || ""; $("chapTitle").value = c.title || "";
     dirty = false; updateSaveStat(""); updateWC();
     closeDiff(); closeRevisions();
@@ -1617,6 +1658,8 @@ let sandboxAiCandidates = [];
 const sandboxSaveQueue = new SerialSaveQueue();
 let sandboxEditVersion = 0;
 let sandboxUnsaved = false;
+let sandboxZoom = 1;   // 画布缩放比例：世界坐标不变，只缩放显示
+let sandboxPan = null; // 拖空白处平移时的临时状态
 
 function sandboxNodeId(prefix = "plot") {
   return `${prefix}-${globalThis.crypto?.randomUUID?.() || (Date.now().toString(36) + Math.random().toString(36).slice(2))}`;
@@ -1654,7 +1697,8 @@ async function closeOutlineSandbox() {
     return false;
   }
   $("outlineOverlay").classList.add("hidden");
-  sandboxDrag = null;
+  sandboxDrag = null; sandboxPan = null;
+  $("sandboxViewport").classList.remove("panning");
   return true;
 }
 async function loadOutlineSandbox(sid) {
@@ -1670,6 +1714,7 @@ async function loadOutlineSandbox(sid) {
     node_count: currentSandbox.data?.nodes?.length || 0, edge_count: currentSandbox.data?.edges?.length || 0 });
   selectedSandboxNodeId = currentSandbox.data?.nodes?.[0]?.id || null; sandboxAiCandidates = [];
   renderSandboxList(); renderOutlineSandbox(); renderSandboxInspector();
+  fitSandbox(.6); // 打开/切换沙盘先看全貌（最小 60%，再小就看不清字了）
   return true;
 }
 function renderSandboxList() {
@@ -1854,6 +1899,7 @@ function renderOutlineSandbox() {
   const maxY = Math.max(1400, ...data.nodes.map(node => (+node.y || 0) + 260));
   world.style.width = `${maxX}px`; world.style.height = `${maxY}px`;
   edgeHost.setAttribute("width", maxX); edgeHost.setAttribute("height", maxY);
+  applySandboxZoom();
   nodesHost.innerHTML = visibleNodes.map(node => `
     <article class="sandbox-node kind-${esc(node.kind)} ${sandboxDirectionClass(node.direction)} ${node.id === selectedSandboxNodeId ? "selected" : ""}"
       data-node-id="${esc(node.id)}" style="left:${+node.x || 0}px;top:${+node.y || 0}px">
@@ -1945,27 +1991,102 @@ function updateSelectedSandboxNode() {
   scheduleSandboxSave();
 }
 
+/* ---- 沙盘画布：避让 / 缩放 / 平移 / 适应 ---- */
+const SANDBOX_NODE_W = 220, SANDBOX_COL = 290, SANDBOX_GAP = 16, SANDBOX_FALLBACK_H = 150;
+const SANDBOX_ZOOM_MIN = .3, SANDBOX_ZOOM_MAX = 1.6;
+// 卡片真实高度随标题/摘要行数变化（实测 123–207px），所以版面一律读 DOM 高度，不再用固定行距
+function sandboxNodeHeights() {
+  const heights = new Map();
+  $("sandboxNodes").querySelectorAll(".sandbox-node").forEach(el => heights.set(el.dataset.nodeId, el.offsetHeight));
+  return heights;
+}
+// 从 (x, y) 开始往下找一个不压住任何已有卡片的位置
+function findFreeSandboxSpot(x, y, height = SANDBOX_FALLBACK_H, excludeId = null) {
+  const heights = sandboxNodeHeights(), hidden = sandboxHiddenNodeIds();
+  const nodes = sandboxData().nodes.filter(node => node.id !== excludeId && !hidden.has(node.id));
+  const hitAt = () => nodes.find(n => {
+    const nx = +n.x || 0, ny = +n.y || 0, nh = heights.get(n.id) || SANDBOX_FALLBACK_H;
+    return x < nx + SANDBOX_NODE_W + SANDBOX_GAP && nx < x + SANDBOX_NODE_W + SANDBOX_GAP
+      && y < ny + nh + SANDBOX_GAP && ny < y + height + SANDBOX_GAP;
+  });
+  for (let i = 0, hit; i <= nodes.length && (hit = hitAt()); i++) y = (+hit.y || 0) + (heights.get(hit.id) || SANDBOX_FALLBACK_H) + SANDBOX_GAP;
+  return { x: Math.round(x), y: Math.round(y) };
+}
+function settleNewSandboxNode(node) {
+  const height = sandboxNodeHeights().get(node.id) || SANDBOX_FALLBACK_H;
+  Object.assign(node, findFreeSandboxSpot(node.x, node.y, height, node.id));
+  renderOutlineSandbox();
+  selectSandboxNode(node.id);
+  revealSandboxNode(node);
+}
+function applySandboxZoom() {
+  const world = $("sandboxWorld"), stage = $("sandboxStage");
+  if (!world || !stage) return;
+  // stage 撑出缩放后的滚动区域；world 用 transform 缩放（transform-origin 已是左上角）
+  stage.style.width = `${(parseFloat(world.style.width) || 2200) * sandboxZoom}px`;
+  stage.style.height = `${(parseFloat(world.style.height) || 1400) * sandboxZoom}px`;
+  world.style.transform = sandboxZoom === 1 ? "" : `scale(${sandboxZoom})`;
+  const label = $("sandboxZoomLabel"); if (label) label.textContent = `${Math.round(sandboxZoom * 100)}%`;
+}
+// 以 (clientX, clientY) 为锚点缩放，锚点下的内容保持不动；不传锚点就以视窗中心
+function setSandboxZoom(next, clientX, clientY) {
+  const vp = $("sandboxViewport"), old = sandboxZoom;
+  next = Math.min(SANDBOX_ZOOM_MAX, Math.max(SANDBOX_ZOOM_MIN, next));
+  if (Math.abs(next - old) < .001) return;
+  const rect = vp.getBoundingClientRect();
+  const ax = (clientX ?? rect.left + rect.width / 2) - rect.left, ay = (clientY ?? rect.top + rect.height / 2) - rect.top;
+  const wx = (vp.scrollLeft + ax) / old, wy = (vp.scrollTop + ay) / old;
+  sandboxZoom = next; applySandboxZoom();
+  vp.scrollLeft = wx * next - ax; vp.scrollTop = wy * next - ay;
+}
+function zoomSandbox(factor) { setSandboxZoom(sandboxZoom * factor); }
+// 适应画布：缩放到刚好装下所有可见节点（不放大超过 100%；minZoom 限制最小缩放）
+function fitSandbox(minZoom = SANDBOX_ZOOM_MIN) {
+  const vp = $("sandboxViewport");
+  if (!currentSandbox || !vp || !vp.clientWidth) return;
+  const hidden = sandboxHiddenNodeIds(), heights = sandboxNodeHeights();
+  const nodes = sandboxData().nodes.filter(n => !hidden.has(n.id));
+  if (!nodes.length) { sandboxZoom = 1; applySandboxZoom(); return; }
+  const minX = Math.min(...nodes.map(n => +n.x || 0)), minY = Math.min(...nodes.map(n => +n.y || 0));
+  const maxX = Math.max(...nodes.map(n => (+n.x || 0) + SANDBOX_NODE_W));
+  const maxY = Math.max(...nodes.map(n => (+n.y || 0) + (heights.get(n.id) || SANDBOX_FALLBACK_H)));
+  const pad = 32;
+  sandboxZoom = Math.max(minZoom, Math.min(1, (vp.clientWidth - pad * 2) / (maxX - minX), (vp.clientHeight - pad * 2) / (maxY - minY)));
+  applySandboxZoom();
+  vp.scrollLeft = Math.max(0, minX * sandboxZoom - pad); vp.scrollTop = Math.max(0, minY * sandboxZoom - pad);
+}
+// 新建节点后把它滚进视野（以前新节点可能落在屏幕外，用户要自己去找）
+function revealSandboxNode(node) {
+  const vp = $("sandboxViewport"), z = sandboxZoom, m = 28;
+  const h = sandboxNodeHeights().get(node.id) || SANDBOX_FALLBACK_H;
+  const left = (+node.x || 0) * z, top = (+node.y || 0) * z, right = left + SANDBOX_NODE_W * z, bottom = top + h * z;
+  if (left < vp.scrollLeft + m) vp.scrollLeft = Math.max(0, left - m);
+  else if (right > vp.scrollLeft + vp.clientWidth - m) vp.scrollLeft = right - vp.clientWidth + m;
+  if (top < vp.scrollTop + m) vp.scrollTop = Math.max(0, top - m);
+  else if (bottom > vp.scrollTop + vp.clientHeight - m) vp.scrollTop = bottom - vp.clientHeight + m;
+}
 function addSandboxRoot() {
   if (!currentSandbox) return;
   const viewport = $("sandboxViewport");
+  const spot = findFreeSandboxSpot(viewport.scrollLeft / sandboxZoom + 70, viewport.scrollTop / sandboxZoom + 80);
   const node = { id: sandboxNodeId("root"), title: "新的情节起点", summary: "", kind: "plot", direction: "",
-    characters: "", chapter_id: null, context_chapter_id: null,
-    x: viewport.scrollLeft + 70, y: viewport.scrollTop + 80, collapsed: false };
-  sandboxData().nodes.push(node); renderOutlineSandbox(); selectSandboxNode(node.id); scheduleSandboxSave();
+    characters: "", chapter_id: null, context_chapter_id: null, x: spot.x, y: spot.y, collapsed: false };
+  sandboxData().nodes.push(node); renderOutlineSandbox(); settleNewSandboxNode(node); scheduleSandboxSave();
 }
 function addSandboxBranch(candidate = null) {
   const parent = selectedSandboxNode();
   if (!parent) { showToast("先选择一个父节点", "err"); return; }
   parent.collapsed = false;
-  const siblings = sandboxData().edges.filter(edge => edge.from === parent.id).length;
+  // 第一个子节点与父节点对齐，后面的兄弟顺着往下排；碰到别的卡片就绕开（旧算法只数兄弟个数，不检查碰撞）
+  const spot = findFreeSandboxSpot((+parent.x || 0) + SANDBOX_COL, +parent.y || 0);
   const node = { id: sandboxNodeId("branch"), title: candidate?.title || "新的分支", summary: candidate?.summary || "",
     kind: "choice", direction: candidate?.direction || "发散", characters: candidate?.characters || "",
     chapter_id: null, context_chapter_id: parent.context_chapter_id !== undefined
       ? parent.context_chapter_id : (parent.chapter_id || null),
-    x: (+parent.x || 0) + 290, y: (+parent.y || 0) + siblings * 135, collapsed: false };
+    x: spot.x, y: spot.y, collapsed: false };
   sandboxData().nodes.push(node);
   sandboxData().edges.push({ id: sandboxNodeId("edge"), from: parent.id, to: node.id, label: node.direction });
-  sandboxAiCandidates = []; renderOutlineSandbox(); selectSandboxNode(node.id); scheduleSandboxSave();
+  sandboxAiCandidates = []; renderOutlineSandbox(); settleNewSandboxNode(node); scheduleSandboxSave();
   return node;
 }
 async function deleteSelectedSandboxNode() {
@@ -2008,17 +2129,32 @@ function syncSandboxChapters(feedback = true) {
 }
 function autoLayoutSandbox(feedback = true) {
   if (!currentSandbox) return;
-  const data = sandboxData(), byId = new Map(data.nodes.map(node => [node.id, node]));
+  renderOutlineSandbox(); // 先渲染一遍，才能读到每张卡片的真实高度（同步章节刚加的节点还没有 DOM）
+  const data = sandboxData(), byId = new Map(data.nodes.map(node => [node.id, node])), heights = sandboxNodeHeights();
+  const heightOf = node => heights.get(node.id) || SANDBOX_FALLBACK_H;
   const children = new Map(data.nodes.map(node => [node.id, []])), incoming = new Set();
   data.edges.forEach(edge => { if (byId.has(edge.from) && byId.has(edge.to)) { children.get(edge.from).push(edge.to); incoming.add(edge.to); } });
-  const roots = data.nodes.filter(node => !incoming.has(node.id)); let row = 0; const placed = new Set();
+  const placed = new Set(); let cursor = 70; // cursor：下一个叶子的 y
+  // 整齐树：叶子从上到下依次排开，父节点 y = 首尾子节点的中点 → 父子连线大多是水平的，
+  // 整棵树的高度 = 叶子数 × 行高，而不是旧算法的「节点数 × 135」
   function place(node, depth) {
-    if (!node || placed.has(node.id)) return;
-    placed.add(node.id); node.x = 70 + depth * 290; node.y = 70 + row * 135; row++;
-    (children.get(node.id) || []).forEach(id => place(byId.get(id), depth + 1));
+    placed.add(node.id); node.x = 70 + depth * SANDBOX_COL;
+    const kids = [];
+    for (const id of children.get(node.id)) if (!placed.has(id)) kids.push(place(byId.get(id), depth + 1));
+    if (kids.length) node.y = (kids[0].y + kids[kids.length - 1].y) / 2;
+    else { node.y = cursor; cursor += heightOf(node) + SANDBOX_GAP; }
+    return node;
   }
-  roots.forEach(node => place(node, 0)); data.nodes.forEach(node => place(node, 0));
-  renderOutlineSandbox(); scheduleSandboxSave(); if (feedback) showToast("布局已整理", "ok");
+  data.nodes.filter(node => !incoming.has(node.id)).forEach(root => { place(root, 0); cursor += SANDBOX_GAP * 2; }); // 多棵树之间留空
+  data.nodes.forEach(node => { if (!placed.has(node.id)) place(node, 0); }); // 环路等异常结构的兜底
+  // 兜底：同一列里高度不同的卡片仍可能互相压住，自上而下把压住的往下推
+  const columns = new Map();
+  data.nodes.forEach(node => columns.set(node.x, [...(columns.get(node.x) || []), node]));
+  columns.forEach(col => {
+    let bottom = -Infinity;
+    col.sort((a, b) => a.y - b.y).forEach(node => { node.y = Math.round(Math.max(node.y, bottom + SANDBOX_GAP)); bottom = node.y + heightOf(node); });
+  });
+  renderOutlineSandbox(); fitSandbox(.6); scheduleSandboxSave(); if (feedback) showToast("布局已整理", "ok");
 }
 function startSandboxDrag(event) {
   if (event.button !== 0) return;
@@ -2026,19 +2162,61 @@ function startSandboxDrag(event) {
   if (!node) return;
   selectSandboxNode(node.id);
   sandboxDrag = { element, node, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY,
-    x: +node.x || 0, y: +node.y || 0 };
+    x: +node.x || 0, y: +node.y || 0, moved: false };
   element.setPointerCapture?.(event.pointerId);
 }
 document.addEventListener("pointermove", event => {
   if (!sandboxDrag || event.pointerId !== sandboxDrag.pointerId) return;
-  sandboxDrag.node.x = Math.max(0, sandboxDrag.x + event.clientX - sandboxDrag.startX);
-  sandboxDrag.node.y = Math.max(0, sandboxDrag.y + event.clientY - sandboxDrag.startY);
+  const dx = event.clientX - sandboxDrag.startX, dy = event.clientY - sandboxDrag.startY;
+  if (!sandboxDrag.moved && Math.hypot(dx, dy) < 4) return; // 单击选中不算拖动：不位移、也不触发保存
+  sandboxDrag.moved = true;
+  // 屏幕位移要除以缩放比例才是画布坐标，否则放大后卡片跑得比鼠标慢、缩小后比鼠标快
+  sandboxDrag.node.x = Math.max(0, Math.round(sandboxDrag.x + dx / sandboxZoom));
+  sandboxDrag.node.y = Math.max(0, Math.round(sandboxDrag.y + dy / sandboxZoom));
   sandboxDrag.element.style.left = `${sandboxDrag.node.x}px`; sandboxDrag.element.style.top = `${sandboxDrag.node.y}px`;
   renderSandboxEdges();
 });
-document.addEventListener("pointerup", event => {
+function finishSandboxDrag(event) {
   if (!sandboxDrag || event.pointerId !== sandboxDrag.pointerId) return;
-  sandboxDrag = null; scheduleSandboxSave();
+  const moved = sandboxDrag.moved; sandboxDrag = null;
+  if (moved) scheduleSandboxSave();
+}
+document.addEventListener("pointerup", finishSandboxDrag);
+document.addEventListener("pointercancel", finishSandboxDrag);
+// Ctrl/⌘ + 滚轮（含触控板双指捏合）缩放；普通滚轮仍然是滚动
+$("sandboxViewport").addEventListener("wheel", event => {
+  if (!(event.ctrlKey || event.metaKey)) return;
+  event.preventDefault();
+  const delta = Math.max(-60, Math.min(60, event.deltaMode === 1 ? event.deltaY * 20 : event.deltaY));
+  setSandboxZoom(sandboxZoom * Math.exp(-delta * .002), event.clientX, event.clientY);
+}, { passive: false });
+// 拖空白处平移画布（触屏本来就能直接滑动，不接管）
+$("sandboxViewport").addEventListener("pointerdown", event => {
+  const vp = event.currentTarget;
+  if (event.button !== 0 || event.pointerType === "touch" || event.target.closest(".sandbox-node, .sandbox-zoombar")) return;
+  const rect = vp.getBoundingClientRect();
+  if (event.clientX - rect.left > vp.clientWidth || event.clientY - rect.top > vp.clientHeight) return; // 点在滚动条上
+  sandboxPan = { id: event.pointerId, x: event.clientX, y: event.clientY, left: vp.scrollLeft, top: vp.scrollTop };
+  vp.setPointerCapture?.(event.pointerId); vp.classList.add("panning");
+});
+$("sandboxViewport").addEventListener("pointermove", event => {
+  if (!sandboxPan || event.pointerId !== sandboxPan.id) return;
+  const vp = event.currentTarget;
+  vp.scrollLeft = sandboxPan.left - (event.clientX - sandboxPan.x); vp.scrollTop = sandboxPan.top - (event.clientY - sandboxPan.y);
+});
+["pointerup", "pointercancel"].forEach(type => $("sandboxViewport").addEventListener(type, event => {
+  if (!sandboxPan || event.pointerId !== sandboxPan.id) return;
+  sandboxPan = null; event.currentTarget.classList.remove("panning");
+}));
+// 沙盘打开时的快捷键：+ / - 缩放，0 适应画布（在输入框里不响应）
+document.addEventListener("keydown", event => {
+  if ($("outlineOverlay").classList.contains("hidden") || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName) || event.target.isContentEditable) return;
+  if (event.key === "+" || event.key === "=") zoomSandbox(1.2);
+  else if (event.key === "-") zoomSandbox(1 / 1.2);
+  else if (event.key === "0") fitSandbox();
+  else return;
+  event.preventDefault();
 });
 async function expandSandboxNode() {
   let node = selectedSandboxNode();
@@ -8268,12 +8446,30 @@ function typewriterCenter() {
 
 /* ---------- 全局事件 ---------- */
 
+// Esc 关闭最上层弹层。直接点它自己的 × 按钮，所以保存沙盘、确认放弃等收尾逻辑和手点 × 完全一致；
+// 没有 × 的弹层（如“检测到其他设备的新版本”）必须让用户做选择，不响应 Esc。
+const modalOpenOrder = new WeakMap();
+let modalOpenSequence = 0;
+function topModalOverlay() {
+  return [...document.querySelectorAll(".overlay:not(.hidden), #imageLightbox:not(.hidden)")]
+    .filter(el => el.getClientRects().length)
+    .sort((a, b) => (+getComputedStyle(a).zIndex || 0) - (+getComputedStyle(b).zIndex || 0)
+      || (modalOpenOrder.get(a) || 0) - (modalOpenOrder.get(b) || 0)).at(-1);
+}
+function closeTopOverlay() {
+  const top = topModalOverlay();
+  if (!top) return false;
+  if (top.id === "imageLightbox") { closeImageLightbox(); return true; }
+  const closeBtn = top.querySelector(".overlay-head [data-ic='x'], .overlay-head [aria-label^='关闭'], .overlay-head [title^='关闭']");
+  // 无关闭按钮的冲突对话框也消费 Esc，避免关掉其背后的工作区。
+  closeBtn?.click();
+  return true;
+}
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    const dialogs = [["skillResourceOverlay", closeSkillResources], ["writingQualityOverlay", closeWritingQualityReview],
-      ["skillPickerOverlay", closeSkillPicker], ["skillsOverlay", closeSkills]];
-    const open = dialogs.find(([id]) => !$(id).classList.contains("hidden"));
-    if (open) { e.preventDefault(); open[1](); return; }
+  if (e.isComposing || e.keyCode === 229) return;
+  // 中文输入法组词时 Esc 是“取消组词”，不能当成关弹层
+  if (e.key === "Escape" && !e.isComposing && e.keyCode !== 229) {
+    if (closeTopOverlay()) { e.preventDefault(); return; } // 其余弹层以前按 Esc 没反应
   }
   const inspirationOpen = !$("inspirationWorkspace")?.classList.contains("hidden");
   const productionOpen = $("app")?.classList.contains("production-open");
@@ -8305,6 +8501,75 @@ document.addEventListener("keydown", (e) => {
     else closeProductionCanvas();
   }
 });
+/* 弹层无障碍：补 role=dialog / aria-modal / 名称；打开时把焦点移进弹层，Tab 不会跑到背后；
+   关闭后焦点还给原来的按钮。靠观察 .hidden 的切换实现，不用改各弹层自己的开/关函数。 */
+(function initOverlayA11y() {
+  const FOCUSABLE = "button:not([disabled]), input:not([disabled]):not([type=hidden]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])";
+  const states = new Map();
+  let lastFocused = document.activeElement, previousFocused = null;
+  const visible = el => el?.isConnected && el.getClientRects().length && !el.closest(".hidden");
+  document.addEventListener("focusin", event => {
+    previousFocused = lastFocused;
+    lastFocused = event.target;
+    // focusin 同步触发，比 MutationObserver 更早，保留真正的打开者。
+    states.forEach((state, overlay) => {
+      if (state.wasHidden && !overlay.classList.contains("hidden") && overlay.contains(event.target)) {
+        if (!overlay.contains(previousFocused)) state.opener = previousFocused;
+      }
+    });
+  });
+  function registerOverlay(overlay) {
+    if (states.has(overlay)) return;
+    const card = overlay.querySelector(":scope > .overlay-card, :scope > .sandbox-shell, :scope > .image-lightbox-card") || overlay;
+    if (!overlay.hasAttribute("role")) overlay.setAttribute("role", "dialog");
+    if (!overlay.hasAttribute("aria-modal")) overlay.setAttribute("aria-modal", "true");
+    const title = overlay.querySelector(".overlay-head > span:first-child, .overlay-head > b:first-child, #imageLightboxTitle");
+    if (title && !overlay.hasAttribute("aria-label") && !overlay.hasAttribute("aria-labelledby")) {
+      if (!title.id) title.id = `${overlay.id}Title`;
+      overlay.setAttribute("aria-labelledby", title.id);
+    }
+    card.setAttribute("tabindex", "-1");
+    const state = { opener: null, wasHidden: true };
+    states.set(overlay, state);
+    function syncVisibility() {
+      const hidden = overlay.classList.contains("hidden");
+      if (hidden === state.wasHidden) return;
+      state.wasHidden = hidden;
+      if (!hidden) {
+        state.opener ||= overlay.contains(document.activeElement) ? previousFocused : document.activeElement;
+        modalOpenOrder.set(overlay, ++modalOpenSequence);
+        if (topModalOverlay() === overlay && !overlay.contains(document.activeElement)) card.focus({ preventScroll: true });
+      } else {
+        const top = topModalOverlay(), opener = state.opener;
+        state.opener = null;
+        if (visible(opener) && opener !== document.body && (!top || top.contains(opener))) {
+          opener.focus({ preventScroll: true });
+        } else if (top) {
+          (top.querySelector("[tabindex='-1']") || top).focus({ preventScroll: true });
+        }
+      }
+    }
+    new MutationObserver(syncVisibility).observe(overlay, { attributes: true, attributeFilter: ["class"] });
+    syncVisibility();
+    overlay.addEventListener("keydown", e => {
+      if (e.key !== "Tab" || topModalOverlay() !== overlay) return;
+      const items = [...overlay.querySelectorAll(FOCUSABLE)].filter(visible);
+      if (!items.length) { e.preventDefault(); card.focus(); return; }
+      const first = items[0], last = items.at(-1), active = document.activeElement;
+      if (e.shiftKey && (active === first || active === card)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (active === last || active === card)) { e.preventDefault(); first.focus(); }
+    });
+  }
+  document.querySelectorAll(".overlay, #imageLightbox").forEach(registerOverlay);
+  // 资源图库是按需创建的，同样接入键盘与焦点管理。
+  new MutationObserver(records => {
+    records.forEach(record => record.addedNodes.forEach(node => {
+      if (node.nodeType !== 1) return;
+      if (node.matches(".overlay, #imageLightbox")) registerOverlay(node);
+      node.querySelectorAll(".overlay, #imageLightbox").forEach(registerOverlay);
+    }));
+  }).observe(document.body, { childList: true, subtree: true });
+})();
 $("content").addEventListener("input", onContentInput);
 $("content").addEventListener("scroll", syncSemanticEditor, { passive: true });
 $("content").addEventListener("keyup", () => { typewriterCenter(); updateSelectionTools(); });

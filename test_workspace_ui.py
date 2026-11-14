@@ -16,6 +16,133 @@ from docx import Document
 from PIL import Image
 
 
+def check_ux_optimization(page, output):
+    """Regress real editor persistence, modal nesting and measured sandbox geometry."""
+    page.set_viewport_size({'width': 1440, 'height': 900})
+    page.reload()
+    expect(page.locator('#content')).to_be_visible()
+    page.evaluate("""async () => {
+      await flushEditorSave();
+      $('content').value = '替换前的段落'; onContentInput(); await flushEditorSave();
+      $('findInput').value = '替换前'; $('replaceInput').value = '替换后'; doFind(); replaceAll();
+    }""")
+    page.locator('#content').press('ControlOrMeta+z')
+    expect(page.locator('#content')).to_have_value('替换前的段落')
+    second = page.evaluate("""async () => {
+      await flushEditorSave();
+      const c = await api(`/api/works/${currentWorkId}/chapters`, {body:{title:'撤销隔离测试'}});
+      await api(`/api/chapters/${c.id}`, {method:'PUT',body:{content:'替换后的段落'}});
+      $('findInput').value = '替换前'; $('replaceInput').value = '替换后'; doFind(); replaceAll();
+      await flushEditorSave(); await selectChapter(c.id); return c.id;
+    }""")
+    page.locator('#content').press('ControlOrMeta+z')
+    expect(page.locator('#content')).to_have_value('替换后的段落')
+    stored = page.evaluate("""async cid => {
+      await flushEditorSave(); return (await api(`/api/chapters/${cid}`,{method:'GET'})).content;
+    }""", second)
+    assert stored == '替换后的段落', 'Undo crossed a chapter boundary'
+
+    page.locator('#moreMenu').evaluate("el => el.classList.add('hidden')")
+    page.locator('#aiToggleBtn').focus()
+    page.evaluate("""() => {
+      $('setOverlay').classList.remove('hidden');
+      $('setOverlay').querySelector('input').focus();
+    }""")
+    expect(page.locator('#setOverlay')).to_be_visible()
+    page.keyboard.press('Shift+Tab')
+    assert page.evaluate("$('setOverlay').contains(document.activeElement)")
+    page.keyboard.press('Escape')
+    expect(page.locator('#setOverlay')).to_be_hidden()
+    expect(page.locator('#aiToggleBtn')).to_be_focused()
+
+    page.evaluate('openSkills()')
+    expect(page.locator('#skillsOverlay')).to_be_visible()
+    page.evaluate('openSettings()')
+    expect(page.locator('#setOverlay')).to_be_visible()
+    page.keyboard.press('Escape')
+    expect(page.locator('#setOverlay')).to_be_hidden()
+    expect(page.locator('#skillsOverlay')).to_be_visible()
+    page.keyboard.press('Escape')
+    expect(page.locator('#skillsOverlay')).to_be_hidden()
+
+    page.evaluate("() => { askCard({title:'组词保护测试',input:'标题'}); }")
+    expect(page.locator('#askOverlay')).to_be_visible()
+    page.locator('#askInput').dispatch_event('keydown', {'key': 'Escape', 'isComposing': True})
+    expect(page.locator('#askOverlay')).to_be_visible()
+    page.keyboard.press('Escape')
+    expect(page.locator('#askOverlay')).to_be_hidden()
+    page.evaluate('openInspirationLibrary()')
+    expect(page.locator('#inspirationWorkspace')).to_be_visible()
+    page.locator('#inspirationWorkspace').dispatch_event('keydown', {'key':'Escape','isComposing':True})
+    expect(page.locator('#inspirationWorkspace')).to_be_visible()
+    page.keyboard.press('Escape')
+    expect(page.locator('#inspirationWorkspace')).to_be_hidden()
+
+    page.evaluate("""() => {
+      ensureResourceImageGallery(); $('resourceImageOverlay').classList.remove('hidden');
+    }""")
+    expect(page.locator('#resourceImageOverlay')).to_have_attribute('role', 'dialog')
+    page.keyboard.press('Escape')
+    expect(page.locator('#resourceImageOverlay')).to_be_hidden()
+
+    page.evaluate("() => { if($('app').classList.contains('ai-open')) toggleAISide(); }")
+    page.evaluate('openOutlineSandbox()')
+    expect(page.locator('#outlineOverlay')).to_be_visible()
+    page.evaluate("""() => {
+      currentSandbox.data = {nodes:[
+        {id:'ux-root',title:'起点',kind:'plot',x:70,y:70},
+        {id:'ux-existing',title:'已有节点',kind:'choice',x:360,y:250}
+      ],edges:[{id:'ux-edge',from:'ux-root',to:'ux-existing'}]};
+      sandboxZoom=1; selectedSandboxNodeId='ux-root'; renderOutlineSandbox();
+      addSandboxBranch({title:'长标题'.repeat(18),summary:'长摘要'.repeat(50),direction:'发散'});
+    }""")
+    def overlaps():
+        return page.evaluate("""() => {
+          const rects=[...$('sandboxNodes').children].map(el=>el.getBoundingClientRect());
+          return rects.some((a,i)=>rects.slice(i+1).some(b=>
+            a.left<b.right-1 && b.left<a.right-1 && a.top<b.bottom-1 && b.top<a.bottom-1));
+        }""")
+    assert not overlaps(), 'Measured new card overlaps an existing card'
+    page.evaluate("""() => {
+      for(let i=0;i<11;i++) {
+        selectedSandboxNodeId=i%2?'ux-root':sandboxData().nodes.at(-1).id;
+        addSandboxBranch({title:'情节分支'+i,summary:'不同长度的摘要'.repeat(i%4+1)});
+      }
+      autoLayoutSandbox();
+    }""")
+    assert not overlaps(), 'Auto layout overlaps nodes'
+    page.evaluate('setSandboxZoom(.6)')
+    assert page.evaluate("$('sandboxViewport').scrollWidth <= Math.max($('sandboxViewport').clientWidth, $('sandboxStage').offsetWidth) + 2")
+    node = page.locator('[data-node-id="ux-root"]')
+    # Use the card title, not its collapse button, to exercise real pointer capture.
+    title = node.locator('.sandbox-node-title').bounding_box()
+    start = node.bounding_box()
+    page.mouse.move(title['x'] + 12, title['y'] + 4)
+    page.mouse.down()
+    page.mouse.move(title['x'] + 112, title['y'] + 4, steps=5)
+    page.mouse.up()
+    assert abs(node.bounding_box()['x'] - start['x'] - 100) < 2
+    saved_x = page.evaluate("sandboxData().nodes.find(n=>n.id==='ux-root').x")
+    node.locator('.sandbox-node-title').click()
+    assert page.evaluate("sandboxData().nodes.find(n=>n.id==='ux-root').x") == saved_x
+    page.evaluate('autoLayoutSandbox()')
+    for theme in ('dark', 'light'):
+        page.evaluate('theme => applyTheme(theme)', theme)
+        page.screenshot(path=str(output / f'sandbox-{theme}.png'))
+    page.set_viewport_size({'width':390,'height':844})
+    page.evaluate('fitSandbox(.6)')
+    assert page.evaluate('document.body.scrollWidth <= innerWidth')
+    expect(page.locator('.sandbox-zoombar')).to_be_visible()
+    page.screenshot(path=str(output / 'sandbox-mobile.png'))
+    page.evaluate('closeOutlineSandbox()')
+    expect(page.locator('#outlineOverlay')).to_be_hidden()
+    expect(page.locator('#wcMini')).to_be_visible()
+    page.set_viewport_size({'width':1100,'height':900})
+    page.evaluate("() => { if(!$('app').classList.contains('ai-open')) toggleAISide(); }")
+    expect(page.locator('#wcMini')).to_be_visible()
+    print('UX checks passed: scoped undo, modal focus/IME, sandbox layout/drag and narrow word count')
+
+
 root = Path(__file__).resolve().parent
 output = root / '.smoke_tmp' / ('workspace-ui-' + uuid.uuid4().hex[:8])
 output.mkdir(parents=True)
@@ -64,9 +191,10 @@ log = (output / 'server.log').open('w', encoding='utf-8')
 server = subprocess.Popen([sys.executable, '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1',
                            '--port', str(port), '--log-level', 'warning'], cwd=root, stdout=log, stderr=log)
 try:
+    local_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     for _ in range(150):
         try:
-            urllib.request.urlopen(base, timeout=.5).close()
+            local_http.open(base, timeout=.5).close()
             break
         except OSError:
             if server.poll() is not None:
@@ -366,6 +494,7 @@ try:
         composer = page.locator('#agentInput').bounding_box()
         assert composer['width'] >= 350
         assert page.locator('#agentMicBtn').bounding_box()['y'] >= composer['y'] + composer['height']
+        check_ux_optimization(page, output)
         assert not errors, errors
         browser.close()
     print('Workspace UI checks passed. Screenshots:', output)
