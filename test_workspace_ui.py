@@ -14,6 +14,7 @@ import uuid
 from playwright.sync_api import expect, sync_playwright
 from docx import Document
 from PIL import Image
+from test_workspace_tools_ui import run_checks as check_workspace_tools
 
 
 def check_ux_optimization(page, output):
@@ -495,6 +496,7 @@ try:
         assert composer['width'] >= 350
         assert page.locator('#agentMicBtn').bounding_box()['y'] >= composer['y'] + composer['height']
         check_ux_optimization(page, output)
+        check_workspace_tools(page, output)
         assert not errors, errors
         browser.close()
     print('Workspace UI checks passed. Screenshots:', output)

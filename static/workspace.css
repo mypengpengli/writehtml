@@ -1,4 +1,47 @@
 /* Shared workspace layout and reading scale. */
+.c-more { flex: 0 0 auto; min-width: 30px; min-height: 30px; padding: 2px 5px; border: 0; background: transparent; color: var(--muted); font-size: 20px; }
+.c-more:hover, .c-more:focus-visible { background: var(--side-bg); }
+.chapter-menu { position: fixed; inset: auto; z-index: 110; min-width: 175px; max-width: calc(100vw - 16px); max-height: calc(100dvh - 16px); height: auto; transform: none; overflow: auto; }
+.chapter-menu::before { display: none; }
+.chapter-menu .danger { color: var(--danger); }
+.chapter-menu .menu-label { white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 240px; }
+.production-stage-shell { position: relative; }
+.production-canvas-viewport { cursor: grab; }
+.production-canvas-viewport.panning { cursor: grabbing; user-select: none; }
+.production-zoombar { position: absolute; right: 16px; bottom: 16px; z-index: 7; display: flex; gap: 3px; padding: 4px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel); box-shadow: var(--shadow-sm); }
+.production-stage-shell:has(> .production-canvas-viewport.hidden) > .production-zoombar { display: none; }
+.production-zoombar button { min-width: 36px; min-height: 36px; padding: 4px 8px; border: 0; font-size: 13px; }
+#productionZoomLabel { min-width: 54px; }
+#commandOverlay { z-index: 110; align-items: flex-start; padding-top: min(12vh, 80px); }
+.command-card { max-width: 580px; max-height: calc(var(--vp-h, 100dvh) - 100px); }
+#commandInput { margin: 10px; width: calc(100% - 20px); font-size: 16px; }
+#commandList { min-height: 30px; overflow: auto; padding: 6px; }
+.command-item { display: flex; align-items: center; gap: 12px; padding: 9px 10px; min-height: 44px; border-radius: var(--r-sm); cursor: pointer; }
+.command-item small { color: var(--muted); flex: 0 0 5em; font-size: 12px; }
+.command-item span { overflow-wrap: anywhere; }
+.command-item.active { background: var(--side-bg); box-shadow: inset 3px 0 var(--accent); }
+.command-hint { padding: 8px 12px; color: var(--muted); }
+.wc-mini { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.relation-map { position: relative; }
+.relation-map svg { display: block; width: 100%; height: auto; }
+.rg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.rg-head label { display: flex; align-items: center; gap: 5px; margin-left: auto; min-width: 0; font-size: 12px; }
+.rg-head select { max-width: 145px; font-size: 13px; }
+.rg-summary { color: var(--muted); font-size: 12px; margin: 5px 0; }
+.rg-node rect { fill: var(--panel); stroke: var(--accent); stroke-width: 1.5; }
+.rg-node text { fill: var(--ink); text-anchor: middle; dominant-baseline: central; font-size: 13px; pointer-events: none; }
+.rg-edge { cursor: pointer; }
+.rg-edge > path { fill: none; stroke: var(--muted); stroke-width: 1.5; }
+.rg-edge text { fill: var(--accent-text); text-anchor: middle; dominant-baseline: central; font-size: 12px; paint-order: stroke; stroke: var(--panel); stroke-width: 4px; }
+.rg-edge.inactive > path { stroke-dasharray: 5 3; }
+.rg-edge:hover > path, .rg-edge:focus > path { stroke: var(--accent); stroke-width: 3; }
+.rg-edge:focus text { text-decoration: underline; }
+.relation-map marker path { fill: var(--muted); }
+.relation-map svg.dim .rg-node:not(.hl), .relation-map svg.dim .rg-edge:not(.hl) { opacity: .18; }
+.relation-graph-card { max-width: min(1300px, 95vw); height: min(850px, 92dvh); max-height: 92dvh; }
+#relationGraphExpanded { flex: 1; min-height: 0; overflow: auto; padding: 12px; }
+@media (max-width: 700px), (pointer: coarse) { .c-more, .chapter-menu button { min-width: 44px; min-height: 44px; } }
+@media (max-width: 700px) { .production-zoombar { display: none; } .command-hint { font-size: 12px; } }
 .agent-document-chip { display: flex; flex-wrap: wrap; max-width: 100%; width: 100%; }
 .agent-document-chip > span { flex: 1; min-width: 80px; }
 .agent-document-chip > button { padding: 4px 6px; font-size: 12px; }
@@ -69,8 +112,11 @@ body:has(#resourceImageOverlay:not(.hidden)) #askOverlay { z-index: 95; }
 .c-number { flex: 0 0 24px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .c-title { font-size: 14px; }
 .chap-stage, .chap-analysis { font-size: 12px; }
-.chap { flex-wrap: wrap; }
-.chap .c-title { min-width: 70px; }
+.chap { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 3px 6px; }
+.chap .c-number { grid-column: 1; grid-row: 1; }
+.chap .c-title { grid-column: 2; grid-row: 1; min-width: 0; }
+.chap .c-more { grid-column: 3; grid-row: 1 / span 2; }
+.chapter-meta { grid-column: 2; grid-row: 2; min-width: 0; display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
 .chap .c-wc { margin-left: auto; }
 .topbar { container-type: inline-size; }
 .title-input { min-width: 0; }

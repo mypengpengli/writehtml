@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 let token = localStorage.getItem("token") || "";
 let works = [];
 let chapters = [];
+let chaptersLoadedWorkId = null;
 let currentWorkId = null;
 let currentChapterId = null;
 let mode = "转写";
@@ -431,7 +432,8 @@ function renderTree() {
   tree.innerHTML = works.map(w => {
     const open = w.id === currentWorkId;
     const items = open ? filteredChapters().map(c => `
-      <div class="chap ${c.id === currentChapterId ? "cur" : ""}" draggable="true"
+      <div class="chap ${c.id === currentChapterId ? "cur" : ""}" draggable="true" tabindex="0" role="button" aria-label="第${c.ord}章 ${esc(c.title)}"
+           onkeydown="if(event.target===this&&!event.isComposing&&(event.key==='Enter'||event.key===' ')){event.preventDefault();selectChapter(${c.id})}"
            onclick="selectChapter(${c.id})"
            ondragstart="dragStart(event,${c.id})"
            ondragover="dragOver(event)"
@@ -439,11 +441,13 @@ function renderTree() {
            ondrop="dragDrop(event,${c.id})">
         <span class="c-number" title="第${c.ord}章">${c.ord}</span>
         <span class="c-title" title="${esc(c.title)}">${esc(c.title) || "(无标题)"}</span>
+        <span class="chapter-meta">
         ${c.branch_of_chapter_id ? `<span class="chap-branch" title="从历史版本创建的分支稿">${svg("branch")}</span>` : ""}
         <span class="chap-stage stage-${esc(c.workflow_status || "drafting")}" title="章节阶段">${esc(workflowLabel(c.workflow_status))}</span>
         ${c.analysis_status === "needs_review" ? '<span class="chap-analysis" title="正文已变化，派生资料需要重新分析">需复核</span>' : ""}
         <span class="c-wc">${(c.chars || 0)}字</span>
-        <button class="c-del" onclick="event.stopPropagation();delChapter(${c.id})" title="删除">${svg("x")}</button>
+        </span>
+        <button class="c-more" data-chapter-menu="${c.id}" aria-haspopup="menu" aria-label="第${c.ord}章操作" title="章节操作" onclick="event.stopPropagation();openChapterMenu(${c.id},this)">⋯</button>
       </div>`).join("") : "";
     return `
       <div class="work ${open ? "open" : ""}">
@@ -493,12 +497,17 @@ async function selectWork(wid) {
 }
 
 async function loadChapters() {
+  chaptersLoadedWorkId = null;
   if (!currentWorkId) {
     chapters = []; renderTree(); updateWC();
     await Promise.all([loadAgentSkills(), loadAgentSessions()]);
     return;
   }
-  chapters = await api(`/api/works/${currentWorkId}/chapters`, { method: "GET" });
+  const loadingWorkId = currentWorkId;
+  const loaded = await api(`/api/works/${loadingWorkId}/chapters`, { method: "GET" });
+  if (currentWorkId !== loadingWorkId) return;
+  chapters = loaded;
+  chaptersLoadedWorkId = loadingWorkId;
   if (!chapters.find(c => c.id === currentChapterId)) {
     currentChapterId = chapters.length ? chapters[chapters.length - 1].id : null;
   }
@@ -615,7 +624,10 @@ async function purgeFromTrash(cid) {
 
 /* ---------- 拖拽排序 ---------- */
 
-function dragStart(ev, cid) { dragCid = cid; ev.dataTransfer.effectAllowed = "move"; }
+function dragStart(ev, cid) {
+  if (chapterOrderBusy.has(currentWorkId) || ev.target.closest('button')) { ev.preventDefault(); return; }
+  dragCid = cid; ev.dataTransfer.effectAllowed = "move";
+}
 function dragOver(ev) { ev.preventDefault(); ev.dataTransfer.dropEffect = "move"; ev.currentTarget.classList.add("drag-over"); }
 function dragLeave(ev) { ev.currentTarget.classList.remove("drag-over"); }
 async function dragDrop(ev, targetCid) {
@@ -624,11 +636,10 @@ async function dragDrop(ev, targetCid) {
   if (dragCid === null || dragCid === targetCid) { dragCid = null; return; }
   const ids = chapters.map(c => c.id);
   const from = ids.indexOf(dragCid), to = ids.indexOf(targetCid);
+  if (from < 0 || to < 0) { dragCid = null; return; }
   ids.splice(from, 1); ids.splice(to, 0, dragCid);
   dragCid = null;
-  chapters.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
-  renderTree();
-  await api(`/api/works/${currentWorkId}/reorder`, { body: { ids } });
+  await commitChapterOrder(ids);
 }
 
 /* ---------- 自动保存 + 字数 ---------- */
@@ -810,14 +821,16 @@ async function flushEditorSave() {
 }
 function saveTitle() { markEditorDirty(); saveNow(); }
 function updateSaveStat(s) { $("saveStat").textContent = s; }
-function updateWC() {
+function updateWC({recordProgress = true} = {}) {
   const live = charCount($("content").value);
   let total = chapters.reduce((s, c) => s + (c.chars || 0), 0);
   const cur = chapters.find(c => c.id === currentChapterId);
   if (cur) total = total - (cur.chars || 0) + live;
-  $("wc").textContent = `本章 ${live} 字 · 全文 ${total} 字`;
+  const daily = typeof dailyWords === 'function' ? dailyWords(recordProgress) : null;
+  const progress = daily == null ? '' : ` · 本机今日净增 +${daily}`;
+  $("wc").textContent = `本章 ${live} 字 · 全文 ${total} 字${progress}`;
   const mini = $("wcMini");
-  if (mini) { mini.textContent = `本章 ${live} 字`; mini.title = `全文 ${total} 字`; }
+  if (mini) { mini.textContent = `本章 ${live} 字${progress}`; mini.title = `全文 ${total} 字；本机今日净增按本浏览器今日首次读取的章节字数计算，含 AI 改稿，不跨设备统计`; }
 }
 // 顶栏宽度 ≤780px 时（与 workspace.css 里隐藏 .wc 的容器查询同一阈值）给 #app 打标记，让编辑工具条里的迷你字数显示出来
 new ResizeObserver(([entry]) => $("app").classList.toggle("topbar-narrow", entry.contentRect.width <= 780))
@@ -5445,15 +5458,7 @@ function renderRelationForm() {
   $("relationCancelBtn").classList.toggle("hidden", !current);
 }
 function renderRelations() {
-  const nodes = new Map();
-  entityRelations.forEach(item => {
-    nodes.set(item.from_entity_id, item.from_name);
-    nodes.set(item.to_entity_id, item.to_name);
-  });
-  $("relationMap").innerHTML = entityRelations.length ? `
-    <div class="relation-map-nodes">${[...nodes].map(([id, name]) => `<span class="relation-node" title="人物关系节点">${esc(name)}</span>`).join("")}</div>
-    <div class="relation-map-links">${entityRelations.map(item => `<div><span>${esc(item.from_name)}</span><b>${esc(item.relation)}</b><span>${esc(item.to_name)}</span></div>`).join("")}</div>`
-    : '<div class="empty">尚未记录人物关系</div>';
+  renderRelationGraph($("relationMap"), entityRelations);
   $("relationList").innerHTML = entityRelations.length ? entityRelations.map(item => `
     <div class="relation-row">
       <div><b>${esc(item.from_name)}</b><span>${esc(item.relation)}</span><b>${esc(item.to_name)}</b>${item.status && item.status !== "active" ? `<small>${esc(item.status)}</small>` : ""}</div>
@@ -6826,11 +6831,11 @@ function renderProductionCanvas() {
   const impacts = data.impacts || [];
   const confirmedDiffRows = productionDiffRows(data);
   const beforeRows = [
-    ...beforeCharacters.slice(0, 8).map(item => productionNodeRow({
+    ...beforeCharacters.map(item => productionNodeRow({
       icon: "users", title: item.name, summary: productionStateBrief(item.current_state),
       onclick: `inspectProductionCharacter(${item.id},'before')`,
     })),
-    ...beforeCards.filter(item => item.current_state).slice(0, 8).map(item => productionNodeRow({
+    ...beforeCards.filter(item => item.current_state).map(item => productionNodeRow({
       icon: productionCategoryIcons[item.category], title: item.name,
       summary: productionStateBrief(item.current_state?.state), onclick: `inspectProductionCard(${item.id},'before')`,
     })),
@@ -6868,11 +6873,6 @@ function renderProductionCanvas() {
     onclick: `inspectProductionCard(${item.id})`,
   })).join("");
   $("productionCanvas").innerHTML = `
-    <div class="production-canvas-toolbar">
-      <button class="ic" onclick="setProductionZoom(-0.1)" title="缩小">−</button>
-      <button class="ic" onclick="setProductionZoom(0.1)" title="放大">＋</button>
-      <button class="ic" data-ic="focus" onclick="resetProductionView()" title="复位视图"></button>
-    </div>
     <svg class="production-links" aria-hidden="true">
       <path data-from="rules" data-to="scenes"></path><path data-from="before" data-to="scenes"></path>
       <path data-from="scenes" data-to="after"></path><path data-from="changes" data-to="after"></path>
@@ -6897,7 +6897,8 @@ function renderProductionCanvas() {
       <div class="production-node-head"><span class="production-node-title"><span>${svg("check")}</span><div><b>章后状态</b><small>截至本章结束</small></div></span></div>
       <div class="production-node-body production-state-grid">${afterRows || `<div class="production-empty"><span>暂无章后状态</span></div>`}</div>
     </section>`;
-  $("productionCanvas").style.zoom = productionZoom;
+  $("productionCanvas").style.zoom = window.innerWidth <= 700 ? 1 : productionZoom;
+  syncProductionZoomLabel();
   applyIcons();
   initProductionNodeDrag();
   requestAnimationFrame(updateProductionLinks);
@@ -6982,14 +6983,38 @@ async function flushProductionLayoutSave() {
 }
 
 function setProductionZoom(delta) {
-  productionZoom = Math.max(.65, Math.min(1.25, +(productionZoom + delta).toFixed(2)));
-  $("productionCanvas").style.zoom = productionZoom;
+  setProductionZoomAt(productionZoom + delta);
 }
 
 function resetProductionView() {
-  productionZoom = window.innerWidth < 1200 ? .8 : 1;
-  $("productionCanvasViewport").scrollTo({ left: 0, top: 0, behavior: "smooth" });
-  $("productionCanvas").style.zoom = productionZoom;
+  fitProductionCanvas();
+}
+
+function syncProductionZoomLabel() {
+  $("productionZoomLabel").textContent = `${Math.round(productionZoom * 100)}%`;
+}
+function setProductionZoomAt(next, clientX, clientY) {
+  if (window.innerWidth <= 700 || !Number.isFinite(next)) return;
+  const vp = $("productionCanvasViewport"), canvas = $("productionCanvas");
+  if (!vp.clientWidth) return;
+  next = Math.max(.4, Math.min(1.6, next));
+  const rect = vp.getBoundingClientRect(), before = canvas.getBoundingClientRect();
+  const displayedZoom = parseFloat(canvas.style.zoom) || 1;
+  const ax = clientX ?? rect.left + rect.width / 2, ay = clientY ?? rect.top + rect.height / 2;
+  const px = (ax - before.left) / displayedZoom, py = (ay - before.top) / displayedZoom;
+  productionZoom = next; canvas.style.zoom = next;
+  const after = canvas.getBoundingClientRect();
+  vp.scrollLeft += after.left + px * next - ax; vp.scrollTop += after.top + py * next - ay;
+  syncProductionZoomLabel();
+}
+function fitProductionCanvas() {
+  const vp = $("productionCanvasViewport"), canvas = $("productionCanvas");
+  const nodes = [...canvas.querySelectorAll('.production-node')];
+  if (!nodes.length || !vp.clientWidth || window.innerWidth <= 700) return;
+  const width = Math.max(...nodes.map(node => node.offsetLeft + node.offsetWidth)) + 20;
+  const height = Math.max(...nodes.map(node => node.offsetTop + node.offsetHeight)) + 20;
+  setProductionZoomAt(Math.min(1, vp.clientWidth / width, (vp.clientHeight - $("chapterPlanSummary").offsetHeight) / height));
+  vp.scrollTo({left: 0, top: 0});
 }
 
 function productionPairsText(value) {

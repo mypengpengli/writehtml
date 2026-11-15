@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>写作</title>
   <!-- 入口 HTML 不缓存，资源 URL 带版本号，避免发布后新 DOM 误用浏览器中的旧 CSS/JS。 -->
-  <link rel="stylesheet" href="style.css?v=ux-patch-20261114-1">
-  <link rel="stylesheet" href="workspace.css?v=ux-patch-20261114-1">
+  <link rel="stylesheet" href="style.css?v=workspace-tools-20261115-1">
+  <link rel="stylesheet" href="workspace.css?v=workspace-tools-20261115-1">
   <style>
     /* 资源更新中的故障保护：旧样式短暂命中缓存时，工作台也绝不能参与主布局。 */
     #storyDrawer { position: fixed; z-index: 46; top: 0; right: 0; width: min(520px, calc(100vw - 280px)); height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); transform: translateX(104%); }
@@ -83,8 +83,9 @@
         <button class="ic top-inspiration" data-ic="bulb" onclick="openInspirationLibrary()" title="灵感库"></button>
         <button class="ic top-ai" id="aiToggleBtn" data-ic="bot" data-label="AI 助手" onclick="toggleAISide()" title="AI 助手（对话即操作）"></button>
         <div class="menu-wrap">
-          <button class="ic" data-ic="more" onclick="toggleMoreMenu(event)" title="更多"></button>
+          <button class="ic" data-ic="more" onclick="toggleMoreMenu(event)" title="更多（Ctrl/⌘+K 搜索操作）"></button>
           <div id="moreMenu" class="menu hidden">
+            <button id="commandPaletteBtn" data-ic="search" data-label="搜索操作 / 章节" onclick="openCommandPalette()"></button>
             <div class="menu-label">视图</div>
             <button id="themeBtn" data-ic="moon" data-label="明暗主题" onclick="toggleTheme();closeMoreMenu()"></button>
             <button id="fontBtn" data-ic="type" data-label="衬线字体" onclick="toggleFont();closeMoreMenu()"></button>
@@ -232,6 +233,12 @@
           <div id="productionCanvasViewport" class="production-canvas-viewport hidden">
             <div id="chapterPlanSummary" class="chapter-plan-summary"></div>
             <div id="productionCanvas" class="production-canvas"></div>
+          </div>
+          <div class="production-zoombar" role="group" aria-label="章节画布缩放">
+            <button onclick="setProductionZoom(-.1)" aria-label="缩小章节画布">−</button>
+            <button id="productionZoomLabel" onclick="setProductionZoomAt(1)" title="恢复 100%">100%</button>
+            <button onclick="setProductionZoom(.1)" aria-label="放大章节画布">＋</button>
+            <button onclick="fitProductionCanvas()" title="适应章节画布">适应</button>
           </div>
           <div id="storyPlanWorkspace" class="story-plan-workspace hidden">
             <div id="storyPlanHealth" class="story-plan-health"></div>
@@ -1146,6 +1153,20 @@
   </div>
 
   <!-- toast 通知层（替代 alert） -->
+  <div id="commandOverlay" class="overlay hidden" onclick="if(event.target===this)closeCommandPalette()" aria-label="搜索操作和章节">
+    <div class="overlay-card command-card">
+      <div class="overlay-head"><span>搜索操作和章节</span><button class="ic" data-ic="x" onclick="closeCommandPalette()" title="关闭搜索"></button></div>
+      <input id="commandInput" type="search" placeholder="输入操作或章节名称…" autocomplete="off" aria-label="搜索操作或章节" role="combobox" aria-expanded="true" aria-autocomplete="list" aria-controls="commandList">
+      <div id="commandList" role="listbox" aria-label="匹配的操作和章节"></div>
+      <small class="command-hint">↑↓ 选择 · Enter 执行 · Esc 关闭</small>
+    </div>
+  </div>
+  <div id="relationGraphOverlay" class="overlay hidden" aria-label="放大人物关系图">
+    <div class="overlay-card relation-graph-card">
+      <div class="overlay-head"><span>人物关系图</span><button class="ic" data-ic="x" onclick="closeRelationGraph()" title="关闭关系图"></button></div>
+      <div id="relationGraphExpanded" class="relation-map expanded"></div>
+    </div>
+  </div>
   <div id="toast"></div>
 
   <!-- 通用询问卡（替代 prompt/confirm） -->
@@ -1163,7 +1184,8 @@
     </div>
   </div>
 
-  <script src="app.js?v=ux-patch-20261114-1"></script>
-  <script src="resource-images.js?v=ux-patch-20261114-1"></script>
+  <script src="app.js?v=workspace-tools-20261115-1"></script>
+  <script src="resource-images.js?v=workspace-tools-20261115-1"></script>
+  <script src="workspace-tools.js?v=workspace-tools-20261115-1"></script>
 </body>
 </html>

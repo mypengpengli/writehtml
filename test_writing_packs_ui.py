@@ -78,7 +78,7 @@ with sync_playwright() as playwright:
     page.evaluate("closeSkillPicker()")
     text = "他很紧张。\n他推开车站那扇生锈的铁门。\n他推开车站那扇生锈的铁门。\n【自检报告】内容完整。"
     page.locator("#content").fill(text)
-    page.locator('.topbar button[title="更多"]').click()
+    page.locator('.topbar button[data-ic="more"]').click()
     page.locator("#writingScanBtn").click()
     expect(page.locator("#writingQualityBody")).to_contain_text("待复核候选")
     expect(page.locator("#writingQualityBody")).to_contain_text("交付杂质候选")
